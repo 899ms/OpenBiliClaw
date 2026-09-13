@@ -215,7 +215,7 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.221 (2026-09-11)**
+📌 Latest: **v0.3.222 (2026-09-11)**
 
 - **Watch Later / Favorites no longer rejected for protocol-relative covers (issue #237)** — Bilibili `//i2.hdslb.com/...` covers are normalized to `https://...` at the backend, so the desktop / mobile web and Flutter clients save successfully.
 - **Steadier Bilibili video stats** — a new backend video-info endpoint falls back to WBI signing when the plain endpoint is rate-limited (412), so the mobile player's description and likes / coins / favorites / comments no longer go missing.
