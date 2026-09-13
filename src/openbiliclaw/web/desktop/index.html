@@ -285,6 +285,11 @@
             <h2>聊聊口味</h2>
             <p class="video-meta">告诉阿B你的偏好、边界和最近想看的方向。</p>
           </div>
+          <label class="reshuffle-toggle chat-pending-badge-toggle" title="开启后「聊聊口味」标签上显示待聊数量红点；关闭则始终隐藏。默认关闭。">
+            <input id="chatPendingBadgeToggle" type="checkbox">
+            <span class="reshuffle-switch" aria-hidden="true"></span>
+            <span id="chatPendingBadgeToggleText">标签红点</span>
+          </label>
         </div>
         <div class="dialogue-pending">
           <button id="desktopPendingToggle" type="button" aria-expanded="false" aria-controls="desktopPendingConfirmations">
@@ -1449,13 +1454,13 @@
               <span id="autoLoadOnScrollSettingText">开启</span>
             </span>
           </label>
-          <label class="settings-field full settings-switch-field" title="开启：「聊聊口味」按钮旁显示待聊未读数字；关闭：始终隐藏。">
+          <label class="settings-field full settings-switch-field" title="开启：「聊聊口味」按钮旁显示待聊未读数字；关闭：始终隐藏。默认关闭。">
             <span>显示待聊未读数</span>
-            <span class="settings-switch-copy">开启：「聊聊口味」按钮旁显示待聊未读数字；关闭：始终隐藏。</span>
+            <span class="settings-switch-copy">开启：「聊聊口味」按钮旁显示待聊未读数字；关闭：始终隐藏。默认关闭。</span>
             <span class="reshuffle-toggle settings-toggle-inline">
-              <input id="showPendingChatCountSetting" type="checkbox" checked>
+              <input id="showPendingChatCountSetting" type="checkbox">
               <span class="reshuffle-switch" aria-hidden="true"></span>
-              <span id="showPendingChatCountSettingText">开启</span>
+              <span id="showPendingChatCountSettingText">关闭</span>
             </span>
           </label>
           <p class="settings-note-inline">后端地址、端口、外观主题、色彩引擎、自动加载和待聊未读数偏好保存在当前浏览器；惊喜推荐加载数量会随保存配置写入后端，供桌面 Web、移动 Web 和插件共享。</p>

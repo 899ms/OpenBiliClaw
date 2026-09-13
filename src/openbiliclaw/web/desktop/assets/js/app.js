@@ -895,7 +895,9 @@
     const AUTO_LOAD_ROOT_MARGIN_PX = 50;
     const DESKTOP_EAGER_COVER_COUNT = 4;
     state.autoLoadOnScroll = storageGet(AUTO_LOAD_ON_SCROLL_KEY) !== "0";
-    state.showPendingChatCount = storageGet(SHOW_PENDING_CHAT_COUNT_KEY) !== "0";
+    // Default off: the pending-confirmation red dot only shows after the user
+    // explicitly opts in from the chat tab switch (or the frontend settings).
+    state.showPendingChatCount = storageGet(SHOW_PENDING_CHAT_COUNT_KEY) === "1";
     const THEME_STORAGE_KEY = "obc.theme";
     const THEME_HUE_STORAGE_KEY = "obc.themeHue";
     const THEME_OPTIONS = ["auto", "light", "dark"];
@@ -4036,12 +4038,16 @@ ${savedCardFeedbackBarHtml(listKind)}
       if (persist) storageSet(SHOW_PENDING_CHAT_COUNT_KEY, state.showPendingChatCount ? "1" : "0");
       renderShowPendingChatCountToggle();
       renderDesktopPendingConfirmations();
-      if (toast) showToast(state.showPendingChatCount ? "待聊未读数会显示在「聊聊口味」旁" : "已隐藏「聊聊口味」旁的待聊未读数");
+      if (toast) showToast(state.showPendingChatCount ? "「聊聊口味」标签上会显示待聊红点" : "已隐藏「聊聊口味」标签上的待聊红点");
     }
 
     function renderShowPendingChatCountToggle() {
-      const toggle = $("#showPendingChatCountSetting");
-      if (toggle && toggle.checked !== state.showPendingChatCount) toggle.checked = state.showPendingChatCount;
+      // The frontend settings row and the quick switch on the chat tab share
+      // the same preference; keep both checkboxes mirrored.
+      for (const id of ["#showPendingChatCountSetting", "#chatPendingBadgeToggle"]) {
+        const toggle = $(id);
+        if (toggle && toggle.checked !== state.showPendingChatCount) toggle.checked = state.showPendingChatCount;
+      }
       const settingText = $("#showPendingChatCountSettingText");
       if (settingText) settingText.textContent = state.showPendingChatCount ? "开启" : "关闭";
     }
@@ -12006,6 +12012,9 @@ ${cardFeedbackBarHtml()}`;
       setAutoLoadOnScroll(Boolean(event.target.checked), { toast: true });
     });
     safeBind("#showPendingChatCountSetting", "change", (event) => {
+      setShowPendingChatCount(Boolean(event.target.checked), { toast: true });
+    });
+    safeBind("#chatPendingBadgeToggle", "change", (event) => {
       setShowPendingChatCount(Boolean(event.target.checked), { toast: true });
     });
     window.addEventListener("scroll", scheduleAutoLoadCheck, { passive: true });

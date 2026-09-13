@@ -350,6 +350,7 @@ const elements = {
   chatPendingCount: document.getElementById("chatPendingCount"),
   chatPendingList: document.getElementById("chatPendingList"),
   chatPendingTabCount: document.getElementById("chatPendingTabCount"),
+  chatPendingBadgeToggle: document.getElementById("chatPendingBadgeToggle"),
   chatForm: document.getElementById("chatForm"),
   chatInput: document.getElementById("chatInput"),
   chatSendButton: document.getElementById("chatSendButton"),
@@ -5762,6 +5763,36 @@ async function selectDialogueContext(turnId, preview = null) {
   }
 }
 
+const CHAT_PENDING_BADGE_STORAGE_KEY = "openbiliclaw.popup.showChatPendingBadge";
+// Default off: the pending-confirmation red dot on the 「对话」 tab only shows
+// after the user opts in with the quick switch at the top of that tab.
+let showChatPendingBadge = false;
+
+function storedShowChatPendingBadge() {
+  try { return localStorage.getItem(CHAT_PENDING_BADGE_STORAGE_KEY) === "1"; }
+  catch { return false; }
+}
+
+function persistShowChatPendingBadge(enabled) {
+  try { localStorage.setItem(CHAT_PENDING_BADGE_STORAGE_KEY, enabled ? "1" : "0"); }
+  catch { /* unavailable */ }
+}
+
+function renderChatPendingBadgeToggle() {
+  if (elements.chatPendingBadgeToggle instanceof HTMLInputElement) {
+    if (elements.chatPendingBadgeToggle.checked !== showChatPendingBadge) {
+      elements.chatPendingBadgeToggle.checked = showChatPendingBadge;
+    }
+  }
+}
+
+function setShowChatPendingBadge(enabled) {
+  showChatPendingBadge = Boolean(enabled);
+  persistShowChatPendingBadge(showChatPendingBadge);
+  renderChatPendingBadgeToggle();
+  renderPendingConfirmations();
+}
+
 function renderPendingConfirmations() {
   const { count, items, expanded } = state.pendingConfirmations;
   const countText = count > 99 ? "99+" : String(Math.max(0, count));
@@ -5770,7 +5801,7 @@ function renderPendingConfirmations() {
   }
   if (elements.chatPendingTabCount instanceof HTMLElement) {
     elements.chatPendingTabCount.textContent = countText;
-    elements.chatPendingTabCount.hidden = count <= 0;
+    elements.chatPendingTabCount.hidden = !showChatPendingBadge || count <= 0;
   }
   if (elements.chatPendingToggle instanceof HTMLButtonElement) {
     elements.chatPendingToggle.setAttribute("aria-expanded", String(expanded));
@@ -7958,6 +7989,13 @@ async function handlePendingConfirmationOpen(button) {
 }
 
 function bindDialogueConfirmations() {
+  showChatPendingBadge = storedShowChatPendingBadge();
+  renderChatPendingBadgeToggle();
+  if (elements.chatPendingBadgeToggle instanceof HTMLInputElement) {
+    elements.chatPendingBadgeToggle.addEventListener("change", () => {
+      setShowChatPendingBadge(elements.chatPendingBadgeToggle.checked);
+    });
+  }
   if (elements.chatPendingToggle instanceof HTMLButtonElement) {
     elements.chatPendingToggle.addEventListener("click", () => {
       state.pendingConfirmations.expanded = !state.pendingConfirmations.expanded;

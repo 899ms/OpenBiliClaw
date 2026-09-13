@@ -974,6 +974,12 @@
     .profile-page-actions { margin-top: var(--space-5); justify-content: start; }
     .chat-page { width: min(100%, 920px); height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
     .chat-page .content-page-head { margin-bottom: var(--space-5); }
+    /* Quick switch at the top of the 「聊聊口味」 tab: controls whether the
+       pending-confirmation red dot appears next to the nav entry. Default off. */
+    .chat-pending-badge-toggle { min-height: 34px; padding: 0 var(--space-2) 0 5px; gap: 7px; font-size: 12px; font-weight: 700; }
+    .chat-pending-badge-toggle .reshuffle-switch { width: 30px; height: 18px; }
+    .chat-pending-badge-toggle .reshuffle-switch::after { top: 3px; left: 3px; width: 12px; height: 12px; }
+    .chat-pending-badge-toggle input:checked + .reshuffle-switch::after { transform: translateX(12px); }
     .dialogue-pending { min-height: 0; max-height: min(32vh, 300px); display: flex; flex-direction: column; margin-bottom: var(--space-2); border: 1px solid color-mix(in oklab, var(--accent), var(--border-soft) 78%); border-radius: var(--radius-lg); background: linear-gradient(180deg, color-mix(in oklab, var(--surface), var(--accent-subtle) 15%), var(--surface)); overflow: hidden; }
     #desktopPendingToggle { width: 100%; flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 11px; border: 0; border-radius: inherit; background: transparent; color: var(--fg); font: inherit; font-size: 12px; font-weight: 800; text-align: left; cursor: pointer; transition: background var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard); }
     #desktopPendingToggle:hover { background: color-mix(in oklab, var(--accent-subtle), transparent 48%); }

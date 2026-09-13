@@ -710,29 +710,39 @@ def test_migration_request_id_final_fallback_is_rfc4122_uuid(
     )
 
 
-def test_pending_chat_count_toggle_hides_badge(
+def test_pending_chat_count_badge_defaults_off_and_quick_switch_shows_it(
     settings_save_server: tuple[str, SettingsSaveStub],
     chromium_page: Page,
 ) -> None:
-    """Issue #217: 关闭「显示待聊未读数」后 chatPendingCountBadge 始终隐藏。"""
+    """Default off; the chat-tab quick switch and the settings row share the opt-in."""
     base_url, _stub = settings_save_server
     page = chromium_page
     page.goto(f"{base_url}/web/")
 
+    # Default off: no red dot even though the backend reports 3 pending items.
     badge = page.locator("#chatPendingCountBadge")
-    expect(badge).to_have_text("3")
+    expect(badge).to_be_hidden()
 
+    # Quick switch at the top of the 「聊聊口味」 tab turns it on.
+    page.locator("#chatBtn").click()
+    quick = page.locator("#chatPendingBadgeToggle")
+    expect(quick).not_to_be_checked()
+    page.locator(".chat-pending-badge-toggle").click()
+    expect(quick).to_be_checked()
+    expect(badge).to_have_text("3")
+    assert page.evaluate("localStorage.getItem('openbiliclaw.webui.showPendingChatCount')") == "1"
+
+    # The frontend settings row mirrors the same preference and can turn it off.
     page.get_by_role("button", name="设置", exact=True).click()
     page.get_by_role("tab", name="前端").click()
-    toggle = page.locator("#showPendingChatCountSetting")
-    expect(toggle).to_be_checked()
-
-    toggle.uncheck(force=True)
+    setting = page.locator("#showPendingChatCountSetting")
+    expect(setting).to_be_checked()
+    page.locator("label:has(#showPendingChatCountSetting)").click()
+    expect(setting).not_to_be_checked()
     expect(badge).to_be_hidden()
     assert page.evaluate("localStorage.getItem('openbiliclaw.webui.showPendingChatCount')") == "0"
 
     page.reload()
-    page.get_by_role("button", name="设置", exact=True).click()
-    page.get_by_role("tab", name="前端").click()
-    expect(page.locator("#showPendingChatCountSetting")).not_to_be_checked()
+    page.locator("#chatBtn").click()
+    expect(page.locator("#chatPendingBadgeToggle")).not_to_be_checked()
     expect(page.locator("#chatPendingCountBadge")).to_be_hidden()
