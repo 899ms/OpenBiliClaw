@@ -314,7 +314,7 @@ npm run package:firefox        # 额外打成未签名 openbiliclaw-extension-v*
 - 当前桌面安装包 release：`desktop-v*`，同版本桌面 channel 完成后会附可用的 `.dmg` / `.exe`；缺失 channel 显示未发布，不回填上一版资产
 
 - **macOS**：从发布页下载与你的 Mac 匹配的 DMG：Apple 芯片用 `OpenBiliClaw-macos-v*-arm64.dmg`；Intel 用 `OpenBiliClaw-macos-v*-x64.dmg`（如发布页提供）。打开后推荐双击 `安装并启动 Install OpenBiliClaw.command`：它会校验新包、退出旧实例、原子替换「应用程序」中的 app，再启动刚安装的版本；传统拖拽仍可用，但升级时需先退出旧版并在替换后手动重开。
-- **Windows**：下载 `OpenBiliClaw-windows-*-Setup.exe`，双击安装。安装或升级成功后，安装器会结束旧实例并从安装目录自动启动刚安装的新版本（静默安装也一样）。
+- **Windows**：下载 `OpenBiliClaw-windows-*-Setup.exe`，双击安装。向导最后一页提供默认勾选的「Launch OpenBiliClaw」复选框，点「完成」才会启动刚安装的新版本（升级时安装器会先结束旧实例，正常点「完成」即完成新旧交接，取消勾选则不启动）；`/SILENT` / `/VERYSILENT` 静默安装没有向导界面，安装成功后仍会自动启动新版本。
 
 macOS 主应用继续以 10.15+ 为兼容目标；只有 Go 1.26.6 构建的可选 Tailnet helper 实测要求
 macOS 12+。10.15 / 11 会只降级远程 Tailnet，本机应用功能仍照常。

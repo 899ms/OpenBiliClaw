@@ -310,7 +310,7 @@ Grab the installer for your OS from the `openbiliclaw-v*` aggregate [Latest Rele
 - Current desktop installer release: `desktop-v*`, with available `.dmg` / `.exe` assets when the same-version desktop channel has shipped; missing channels are shown as unpublished instead of being backfilled from a previous release
 
 - **macOS**: download the DMG that matches your Mac: `OpenBiliClaw-macos-v*-arm64.dmg` for Apple silicon, or `OpenBiliClaw-macos-v*-x64.dmg` for Intel when the release provides it. The recommended path is to double-click `安装并启动 Install OpenBiliClaw.command`: it verifies the new bundle, quits the old instance, atomically replaces the app in Applications, and launches the version just installed. Traditional drag-and-drop remains available, but upgrades must quit the old version first and reopen the replacement manually.
-- **Windows**: download `OpenBiliClaw-windows-*-Setup.exe` — double-click to install. After a successful install or upgrade, Setup stops the old instance and automatically launches the newly installed version from the installation directory (including silent installs).
+- **Windows**: download `OpenBiliClaw-windows-*-Setup.exe` — double-click to install. The final wizard page offers a checked "Launch OpenBiliClaw" checkbox; the newly installed version starts only when you click Finish (upgrades stop the old instance first — clicking Finish hands off to the new version, and unchecking skips the launch). `/SILENT` / `/VERYSILENT` installs have no wizard pages and still launch the new version automatically once Setup succeeds.
 
 The macOS app still targets 10.15+. Only the optional Tailnet helper built with Go 1.26.6 has a
 measured minimum of macOS 12; on 10.15 / 11 the local app continues normally while this remote edge

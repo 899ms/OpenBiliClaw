@@ -4,6 +4,12 @@
 
 ---
 
+## 未发布：Windows 交互安装改为点「完成」后启动
+
+- **修复 Windows 交互安装未点 Finish 程序就抢跑启动**：`packaging/openbiliclaw.iss` 的 `[Run]` 段此前是单条无条件条目——文件复制一完成、向导还停在最后一页时 `OpenBiliClaw.exe` 就已被拉起。这是 v0.3.182 为修静默升级「杀旧进程后无人拉起新进程」而引入的行为：更早那条 `postinstall nowait skipifsilent` 在 `/SILENT` / `/VERYSILENT` 下被 `skipifsilent` 整个跳过，静默升级因此杀掉旧进程却无人接管（注意 `postinstall` 条目在静默安装里同样会执行——向导会自动点过隐藏的 Finish 页复选框，「没有 Finish 页」并不足以拦住它），改成无条件条目修好了静默路径，副作用是全新交互安装也在用户点「完成」前启动。现拆为两条模式互斥的条目：交互安装走 `postinstall nowait skipifsilent`，Finish 页显示默认勾选的「Launch OpenBiliClaw」复选框，点「完成」才启动且可取消勾选（交互升级仍是杀旧实例→点「完成」→新版本接管）；静默安装/升级保留 `nowait skipifnotsilent` 自动拉起新版本，升级交接语义不变（两条条目必须靠各自的 skip 标志保持互斥：删掉 `skipifsilent` 会让静默安装启动两次）；windows-latest CI 既有的 `/VERYSILENT` 安装步骤继续覆盖静默交接，且交接断言已从空管道 no-op（进程没出现也会通过）改为等待安装器拉起的实例写出 profile 标记 `config.toml`（selftest 实例装配完后端即退出，直接查存活进程会与退出竞态；实测该实例确实写出了 profile / SQLite / 日志），没写标记即报错，见 `build-installers.yml` / `release-desktop.yml`。新增 `tests/test_installer_script.py` 契约测试锁定「恰好一条 postinstall + 一条 silent-only、禁止无条件条目」；另用本地 marker 假应用装置（替换 AppId / 应用名 / exe 名隔离真实安装，`[Run]` 段逐字节不变）编译 1.0.0 / 2.0.0 两个测试安装器跑通 5 场景矩阵：全新交互 Finish 前无进程、点「完成」后启动；取消勾选不启动；交互升级旧 PID 被杀、点「完成」后新版本接管；`/SILENT` 全新安装自动启动；`/VERYSILENT` 升级自动交接。
+
+---
+
 ## 未发布：推荐接口反代入口上下文修复
 
 - **修复网页「加载更多 / 换一批」固定 403（推荐接口反代丢失 Host）**：四进程模式下主 API 把 `/api/recommendations/*` 反代给独立推荐进程，转发前剔除了 `Host`，httpx 于是按后端地址自行生成 `Host: localhost`（Unix socket 路径）或 `127.0.0.1:<port>`（Windows 回环 TCP 路径），而 `Origin` 原样转发 —— 推荐进程内同一套认证中间件的 CSRF 同源校验比较的正是 `Origin` 与 effective host，于是同源判定永不成立，三端 Web 的写请求（`append` / `reshuffle` / `refresh`）在使用会话 cookie 时固定返回 `403 {"error":"csrf"}`；浏览器扩展走 Bearer 豁免 CSRF，因此只有网页受影响，且非 `recommendations` 的写接口照常可用。现在反代保留浏览器原始 `Host`（`content-length` / `connection` 等传输层头部仍不转发），推荐进程的 CSRF 判定与入口恢复到同一口径。新增 `tests/test_recommendation_proxy_headers.py`：覆盖 Unix socket 与回环 TCP 两条传输的 Host / Origin 透传、hop 头剔除，以及「反代后的请求能通过推荐进程 CSRF」的契约断言，并含把 `Host` 重新剔除后即失败的回归守卫。
