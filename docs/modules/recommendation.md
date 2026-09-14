@@ -105,6 +105,7 @@ HTTPS URL。
 | v0.3.x dislike 即时输出一致性 | ✅ | 单卡 dislike 继续同步标记 processed；已确认主题写入后，历史推荐、1 秒 API snapshot、reshuffle/append、OpenClaw fallback/新生成结果和主动通知都会在最终边界读取最新 effective dislikes。snapshot 命中同时要求 dislike digest 一致；多卡模糊全灭沿用 exact-safe 恢复，单条 push 禁止恢复。普通 dislike 不阻断 discovery 搜索，异步语义清池只优化库存。 |
 | v0.3.x 画像输入上限放宽 | ✅ | `_recommendation_profile_summary()` 兴趣 tag 上限 10 → 30 → 64 → 256 且按 weight 降序排序后截断；`disliked_topics` 5 → 16 → 64 → 128（与存储上限对齐，避雷项不再截断）；`_select_relevant_interests()` 的 embedding 候选池按 weight 排序取前 256（与画像兴趣上限对齐，让头部之外的小众兴趣在语义最匹配时也能被选中；`top_k=5` 不变，故注入 prompt 的数量不变；fallback「top-K by weight」语义与实现一致） |
 | v0.3.x 文案 / delight 候选 description 对齐 | ✅ | 推荐重评估和批量文案表达的候选 `description` 截断统一对齐到 400 字符（此前 200 / 300 / 280 混用），与 discovery 评估输入一致，避免中文简介在关键句中途被砍。Delight score 当前复用 Evo 结果，不再单独构造候选评分或 reason prompt；MMR 去重 embedding 文本仍保持 `[:160]/[:200]`（它是缓存 key，不动） |
+| v0.3.x 推荐理由时空锚点 | ✅ | 单条实时与批量池文案 prompt 现在把内容 `published_at` / `published_label` 与评估时刻 `evaluated_at`（来自 `DiscoveredContent.temporal_evaluated_at`，不是生成文案时的 wall clock）一起放进 user_prompt；静态 system prompt 新增规则，只允许对照这两个字段判断新旧，禁止根据标题年份、“最新/今天”等词、模型知识或其它字段推断时效，字段缺失时不得使用时效词或猜测年龄。时间字段位于可变 user payload，系统前缀仍保持字节静态 |
 | v0.3.123 推荐画像输入与 discovery 统一 | ✅ | `_recommendation_profile_summary()` 改为直接委托 discovery 的 `build_profile_summary()`，推荐与发现喂给 LLM 的是**同一份**结构化画像；推荐侧因此补齐了之前缺的字段（`values` / `cognitive_style` / `motivational_drivers` / `current_phase` / `life_stage` / `source_platform_mix` / `recent_awareness` / `mbti` / `interest_domains` 等），并随统一一起不再带 `personality_portrait` 总结。`include_active_insights` 形参移除（统一输入恒含 active_insights）；embedding 选出的相关兴趣经 `interests=` 透传 |
 | v0.3.144+ 推荐画像上下文缓存前缀保护 | ✅ | 批量池文案、单条实时文案和 legacy/recovery 分类 prompt 已经携带结构化画像；调用 `LLMService.complete_structured_task()` 时会在支持路径上设置 `inject_core_memory=False`。v0.3.147+ 起这些画像 prompt 还会复用共享 `profile_prompt_layers()`：稳定 core / interests 层放前，recent 层放后，并用 `PromptLayerRenderCache` 只替换发生变化的层。Delight score 预计算不再单独调用 LLM |
 | v0.3.144 推荐理由双 worker + 默认 30 | ✅ | `_drain_expression_copy()` 不再对所有待生成 batch 一次性 `gather`，而是默认 batch_size=30、用 2 个 worker 顺序领取 batch；真实 provider 并发测试显示 45 条推荐文案偶发 JSON 解析失败，因此推荐理由保持保守批量；批量解析失败会在当前 worker 内先拆半重试，半批仍失败才退到单条兜底；`_expression_lock` 仍串行化多入口，热重载 / shutdown 的 `CancelledError` 不会被当作普通 batch 失败吞掉 |
@@ -159,6 +160,7 @@ items = await engine.generate_recommendations(
 - 每条推荐都会调用 `generate_expression()` 生成 `expression` 和 `topic_label`
 - 推荐表达会先从当前画像、偏好摘要、`disliked_topics` 和近期反馈推断 `ToneProfile`，再生成更贴近用户口味且避开长期雷点的“老B友”式文案；内容 `style_key` 只用于决定从人物、场景、信息点或情绪等角度切入，不再把用户语气动态调轻
 - 推荐表达和推荐池分类 prompt 自身已经包含 compact 结构化 profile；`_recommendation_profile_summary()` 是单一收口点，统一应用 `compact_content_prompt_profile_summary()`，单条表达仍先把内容相关兴趣放进摘要再 compact，保护长尾兴趣。`LLMService` 会关闭额外 core memory 注入，画像按 core / life / interests / style / recent 分层渲染以稳定缓存前缀。Delight score 预计算直接复用 Evo 评分；卡片理由必须等待 `pool_expression / pool_topic_label` 完整并同步，绝不展示 evaluator 的内部判断 reason
+- 单条与批量表达都会把候选的 `published_at` / `published_label` 和评估时刻 `evaluated_at`（`DiscoveredContent.temporal_evaluated_at`）放进 user_prompt。文案判断时效只能对照这两个字段，不能用标题年份、“最新”字样或模型知识猜测；任一字段缺失时不得声称“最新 / 刚发布 / 近期”，也不得猜年龄。这些字段都在可变 user payload，system prompt 仍保持字节静态
 - CLI 展示后会把对应推荐记录标记为 `presented = 1`
 - `feedback` 命令会把 `feedback_type` / `feedback_note` / `feedback_at` 写回推荐记录
 - 多样性回填会分阶段放宽 `style`、`source`、`topic` 约束，只有候选真的不足时才彻底兜底补满
@@ -277,6 +279,7 @@ count = await engine.precompute_pool_copy(
 - 解析批量 LLM 响应时通过共享 JSON helper 接受 `results/items/data/output` 等 wrapper、fenced JSON、JSONL、pretty-printed singleton object 和回显 schema 后的最终结果，但仍要求每条结果具备推荐表达所需字段
 - 批量 prompt 会把每条候选的 `bvid/content_id` 交给 LLM；如果响应带回 ID，写库时按 ID 匹配，不信任数组顺序。响应没有 ID 且数量不完整时会降级到单条生成，避免把后续视频的文案整体前移
 - 批量池文案与单条表达 prompt 保留完整 `body_text`；200+100 head/tail 方案在真实 Reddit 质量门中造成明显排序与准入回归，不能用 token 节省覆盖内容语义
+- 批量表达对每条候选单独带上 `published_at` / `published_label` 与该条自己的评估时刻 `evaluated_at`（同批候选可能在不同轮次完成评估，不能共用一个生成时挂钟）；文案只能据此判断时效，字段缺失时禁止写“最新 / 刚发布 / 近期”，也不得猜年龄
 - 批量调用若命中 provider 限流 / cooldown / quota，不会再逐条调用 LLM；这些候选继续保持文案空值，等待下一轮后台预生成
 - 批量响应解析失败、缺少可验证 ID 或产生跨视频重复文案时，后台 drain 会在当前 worker 内递归拆半重试；只有拆到单条仍失败时才走单条表达兜底，因此默认 30 条 batch 不会因为一次弱模型输出异常直接放大成 30 个并发请求
 - 批量文案和推荐池分类调用复用 prompt 内 compact profile，并在兼容的 LLMService 路径上跳过额外 core memory 注入；这些调用还会复用共享画像分层缓存，画像核心 / 兴趣不变时保持前置 prompt block 完全相同。这只改变 token / prompt-cache 形态，不改变排序、入池 gate、评分 rubric 或文案策略。Delight score 预计算已改为零 LLM 的 Evo 结果复用路径

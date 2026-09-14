@@ -4,6 +4,12 @@
 
 ---
 
+## 未发布：推荐理由补齐发布时间与评估时刻
+
+- **修复推荐理由把 2024 年旧内容说成“最新”**：推荐理由（`expression`）生成链路此前既不传当前时间、也不传内容发布时间，模型只能靠标题年份或自身知识猜测时效。现在单条实时 `_try_generate_expression()` 与批量池 `_precompute_batch()` 都会把候选的 `published_at` / `published_label` 以及该条的评估时刻 `evaluated_at`（`DiscoveredContent.temporal_evaluated_at`，不是生成文案时的 wall clock）放进 user_prompt 的 content payload；单条和批量静态 system prompt 各加一条规则，只允许对照 `evaluated_at` + `published_at` 判断新旧，禁止根据标题年份、“最新/今天”等词、模型知识截止时间或其它字段推断，字段缺失时不得使用时效词或猜测年龄。时间字段位于可变 user payload，system prompt 仍字节静态，prompt cache 前缀不受影响。补单条 / 批量 prompt 与引擎级回归测试。
+
+---
+
 ## v0.3.222：待聊红点开关、BM25 稀疏信号与鉴权补强（2026-09-13）
 
 - **PC Web 与插件新增「对话标签红点」开关（默认关闭）**：桌面 Web「聊聊口味」页顶部与插件 popup「对话」页顶部各加一个小开关，控制是否在对应入口显示待聊确认红点；关闭时红点始终隐藏。PC Web 保留「设置 → 前端 → 显示待聊未读数」并与其双向同步，偏好分别存于浏览器 `localStorage`（`openbiliclaw.webui.showPendingChatCount` / `openbiliclaw.popup.showChatPendingBadge`），默认改为不展示。真实后端回归覆盖默认关闭、开启后展示完整去重积压总数（>99 显示 99+）与关闭后隐藏。

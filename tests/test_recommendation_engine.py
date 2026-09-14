@@ -1271,6 +1271,37 @@ async def test_generate_expression_passes_body_text_for_text_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generate_expression_grounds_copy_in_evaluation_clock() -> None:
+    """Realtime copy must see publication time plus the evaluation clock,
+    never the wall clock from when the expression was generated."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        llm = _DummyLLM()
+        engine = RecommendationEngine(llm=llm, database=db)
+
+        await engine.generate_expression(
+            DiscoveredContent(
+                bvid="BV1TIME",
+                title="2024 年的老片重映",
+                up_name="某UP",
+                published_at="2024-05-01T12:00:00Z",
+                published_label="2024-05-01",
+                temporal_evaluated_at="2026-01-02T03:04:05Z",
+                relevance_score=0.8,
+            ),
+            _build_profile(),
+        )
+
+        user_input = str(llm.calls[0]["user_input"])
+        assert '"published_at": "2024-05-01T12:00:00Z"' in user_input
+        assert '"published_label": "2024-05-01"' in user_input
+        assert '"evaluated_at": "2026-01-02T03:04:05Z"' in user_input
+        # Per-call temporal data stays out of the cached static prefix.
+        assert "2026-01-02T03:04:05Z" not in str(llm.calls[0]["system_instruction"])
+
+
+@pytest.mark.asyncio
 async def test_generate_expression_requests_no_core_memory_injection_when_supported() -> None:
     class _CoreMemoryRecordingLLM:
         def __init__(self) -> None:
@@ -3358,6 +3389,68 @@ async def test_precompute_batch_preserves_full_body_text() -> None:
         assert completed == 1
         batch = _content_batch_from_prompt(llm.user_inputs[0])
         assert batch[0]["body_text"] == body_text
+
+
+@pytest.mark.asyncio
+async def test_precompute_batch_grounds_copy_in_evaluation_clock() -> None:
+    """Recommendation copy must see the source publication time plus the
+    evaluation clock, never the copy-generation wall clock."""
+
+    class _TemporalRecordingBatchLLM:
+        def __init__(self) -> None:
+            self.user_inputs: list[str] = []
+
+        async def complete_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            history: list[dict[str, str]] | None = None,
+            temperature: float = 0.7,
+            max_tokens: int = 4096,
+            caller: str = "",
+            reasoning_effort: str | None = None,
+        ) -> LLMResponse:
+            self.user_inputs.append(user_input)
+            return LLMResponse(
+                content=json.dumps(
+                    [
+                        {
+                            "bvid": "BV_EXPR_TIME",
+                            "expression": "这条老片的价值不靠发布时间撑场。",
+                            "topic_label": "旧片重看",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                provider="test",
+                model="dummy",
+                usage={},
+            )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        item = DiscoveredContent(
+            bvid="BV_EXPR_TIME",
+            title="2024 年的老片重映",
+            up_name="某UP",
+            published_at="2024-05-01T12:00:00Z",
+            published_label="2024-05-01",
+            temporal_evaluated_at="2026-01-02T03:04:05Z",
+            relevance_score=0.82,
+        )
+        _seed_pool(db, [item], precomputed=False)
+        llm = _TemporalRecordingBatchLLM()
+        engine = RecommendationEngine(llm=llm, database=db)
+
+        completed = await engine._precompute_batch([item], _build_profile())
+
+        assert completed == 1
+        batch = _content_batch_from_prompt(llm.user_inputs[0])
+        assert batch[0]["published_at"] == "2024-05-01T12:00:00Z"
+        assert batch[0]["published_label"] == "2024-05-01"
+        assert batch[0]["evaluated_at"] == "2026-01-02T03:04:05Z"
 
 
 @pytest.mark.asyncio

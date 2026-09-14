@@ -2085,6 +2085,11 @@ _RECOMMENDATION_EXPRESSION_SYSTEM_PROMPT = """
 10. 严格遵循 <tone_profile> 里给的密度 / 温度 / 梗感 / 直给度 4 个参数。
 11. 避开 profile_summary.disliked_topics 中的主题或话术模式；如果候选明显命中这些避雷点,
     不要热情背书,只能保守说明差异化理由,且不得把 disliked topic 包装成用户偏好。
+12. content_summary.published_at / published_label 是这条内容的权威发布时间,
+    content_summary.evaluated_at 是评估这条内容时的权威当前时间。只能对照这两个字段判断
+    内容新旧;不得根据标题里的年份、"最新/今天"等词、模型自身知识截止时间或其它内容
+    字段推断发布时间或新鲜度。如果 evaluated_at 或 published_at 缺失、无效,不得使用
+    "最新、刚发布、近期、今天"等时效词,也不得猜测内容年龄,直接描述内容本身的长期价值。
 </rules>
 
 <output_schema>
@@ -2114,6 +2119,12 @@ def build_recommendation_expression_prompt(
     ``user_prompt``. Callers may pass pre-rendered layered profile blocks,
     which are placed before platform / tone / content so the provider cache
     can reuse the stable profile prefix across platform and copy changes.
+
+    Temporal grounding: ``content_summary`` should carry the source-owned
+    ``published_at`` / ``published_label`` plus ``evaluated_at`` — the exact
+    clock from when the item was evaluated.  The static rule forbids the
+    model from inferring freshness from title years, model knowledge, or any
+    other field when those values are missing.
     """
     user_blocks = [
         *_profile_prompt_blocks(profile_summary, profile_blocks),
@@ -2165,6 +2176,11 @@ _BATCH_EXPRESSION_SYSTEM_PROMPT = (
     "9. 严格遵循 <tone_profile> 里给的密度 / 温度 / 梗感 / 直给度 4 个参数。\n"
     "10. 避开 profile_summary.disliked_topics 中的主题或话术模式;如果候选明显命中这些避雷点,"
     "不要热情背书,只能保守说明差异化理由,且不得把 disliked topic 包装成用户偏好。\n"
+    "11. content_batch 中每条候选的 published_at / published_label 是该条内容的权威发布时间,"
+    "evaluated_at 是评估该条内容时的权威当前时间。只能对照该条自己的这两个字段判断内容新旧;"
+    "不得根据标题里的年份、'最新/今天'等词、模型知识截止时间或其它条目推断发布时间或新鲜度。"
+    "如果某条的 evaluated_at 或 published_at 缺失、无效,不得对该条使用'最新、刚发布、近期、"
+    "今天'等时效词,也不得猜测内容年龄,直接描述内容本身的长期价值。\n"
     "</rules>\n\n"
     "<output_schema>\n"
     "[\n"
@@ -2187,6 +2203,11 @@ def build_batch_expression_prompt(
 
     v0.3.28+ cache-friendly: ``system_prompt`` is the module-level
     constant ``_BATCH_EXPRESSION_SYSTEM_PROMPT`` (100% static).
+
+    Temporal grounding: each item should carry its own ``published_at`` /
+    ``published_label`` plus ``evaluated_at`` (the exact clock from that
+    item's evaluation), because rows in one expression batch may have been
+    classified at different times.
     """
     user_blocks = [
         *_profile_prompt_blocks(profile_summary, profile_blocks),

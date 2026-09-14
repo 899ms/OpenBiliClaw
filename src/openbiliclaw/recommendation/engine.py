@@ -3994,6 +3994,13 @@ class RecommendationEngine:
                 "title": item.title,
                 "up_name": item.up_name,
                 "description": (item.description or "")[:400],
+                # Temporal grounding for copy writing. ``evaluated_at`` is the
+                # exact clock from when this row was evaluated (never the copy
+                # generation time), so a freshly generated reason cannot call
+                # old content "latest" from model-knowledge guesses.
+                "published_at": item.published_at,
+                "published_label": item.published_label,
+                "evaluated_at": item.temporal_evaluated_at,
                 "source_strategy": item.source_strategy,
                 "style_key": normalize_style_key(item.style_key),
                 "topic_group": item.topic_group,
@@ -4359,6 +4366,13 @@ class RecommendationEngine:
                 "title": content.title,
                 "up_name": content.up_name,
                 "description": content.description,
+                # Temporal grounding for copy writing. ``evaluated_at`` is the
+                # exact clock from when this row was evaluated (never the copy
+                # generation time), so a freshly generated reason cannot call
+                # old content "latest" from model-knowledge guesses.
+                "published_at": content.published_at,
+                "published_label": content.published_label,
+                "evaluated_at": content.temporal_evaluated_at,
                 "source_strategy": content.source_strategy,
                 "style_key": normalize_style_key(content.style_key),
                 "topic_group": content.topic_group,
