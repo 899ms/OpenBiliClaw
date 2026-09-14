@@ -13,6 +13,8 @@ same-origin browser POST authenticated by session cookie can never match its
 
 from __future__ import annotations
 
+import http.server
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -95,9 +97,17 @@ def _reset_capture() -> None:
 
 
 def _build_proxied_app(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, config: Config | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    config: Config | None = None,
+    fake_httpx: bool = True,
 ) -> Any:
-    """Build the main API app with the recommendation proxy enabled."""
+    """Build the main API app with the recommendation proxy enabled.
+
+    ``fake_httpx=False`` keeps the real async client in place, so the test
+    exercises the actual on-the-wire header assembly.
+    """
     config = config or Config(data_dir=str(tmp_path))
     monkeypatch.setattr("openbiliclaw.config.load_config", lambda *_a, **_kw: config)
     # ``create_app`` persists the whole config when it has to generate a session
@@ -105,8 +115,9 @@ def _build_proxied_app(
     # write can never land in the checkout (or in a real deployment's config).
     monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
     monkeypatch.delenv("OPENBILICLAW_RECOMMENDATION_ONLY", raising=False)
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeAsyncHTTPTransport)
+    if fake_httpx:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+        monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeAsyncHTTPTransport)
     return create_app(
         memory_manager=SimpleNamespace(load_discovery_runtime_state=lambda: {}),
         database=SimpleNamespace(),
@@ -379,3 +390,53 @@ def test_https_scheme_from_trusted_proxy_is_normalised(monkeypatch, tmp_path: Pa
     assert forwarded["origin"] == "http://sushe:8443"
     assert "x-forwarded-proto" not in forwarded
     assert _recommendation_process_gate().csrf_ok(_forwarded_request(forwarded)) is True
+
+
+class _RecordingHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Records the request headers a real httpx client put on the wire."""
+
+    records: list[dict[str, str]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        length = int(self.headers.get("content-length") or 0)
+        self.rfile.read(length)
+        type(self).records.append({key.lower(): value for key, value in self.headers.items()})
+        payload = b'{"items": [], "pool_status": null}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+def test_real_httpx_forwards_explicit_host_over_loopback_tcp(monkeypatch, tmp_path: Path) -> None:
+    """The contract above assumes real httpx keeps a caller-supplied ``Host``.
+
+    Every other test swaps ``httpx.AsyncClient`` for a fake that implements that
+    assumption itself. This one runs the real client against a real loopback
+    server, so a future httpx change cannot silently void the fix while the
+    suite stays green.
+    """
+    _RecordingHTTPHandler.records = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHTTPHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.delenv(RECOMMENDATION_SOCK_ENV, raising=False)
+        monkeypatch.setenv(RECOMMENDATION_PORT_ENV, str(server.server_address[1]))
+        app = _build_proxied_app(monkeypatch, tmp_path, fake_httpx=False)
+
+        response = _post_append(TestClient(app, base_url=_ORIGIN))
+
+        assert response.status_code == 200
+        assert len(_RecordingHTTPHandler.records) == 1
+        received = _RecordingHTTPHandler.records[0]
+        assert received["host"] == "127.0.0.1:8420"
+        assert received["origin"] == _ORIGIN
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
