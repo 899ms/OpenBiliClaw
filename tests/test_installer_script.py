@@ -4,8 +4,8 @@ The installer must never start the app while the interactive wizard is still
 open (regression: it used to launch unconditionally before the Finish page).
 Parsing the .iss here keeps the contract enforced on every platform and every
 push; the real end-to-end behavior is covered by the windows-latest installer
-job (silent install asserts the app auto-launches) and by the local marker-app
-harness described in docs/changelog.md.
+job (which now fails if the silent install never launches the app) and by the
+local marker-app harness described in docs/changelog.md.
 """
 
 from __future__ import annotations
@@ -59,14 +59,19 @@ def test_silent_installs_still_autolaunch_the_new_binary() -> None:
     """/SILENT and /VERYSILENT upgrades must hand off to the freshly written exe.
 
     PrepareToInstall taskkills the running instance, so without this entry a
-    silent upgrade would leave nothing running.
+    silent upgrade would leave nothing running. Note that postinstall entries do
+    run during silent installs (the wizard auto-clicks through the hidden
+    Finished page): the two entries stay mutually exclusive purely through the
+    skipifsilent / skipifnotsilent flags, so both flags are load-bearing.
     """
     silent = [e for e in _run_entries() if "skipifnotsilent" in e["flags"]]
     assert len(silent) == 1, "expected exactly one silent-only [Run] entry"
     entry = silent[0]
     assert entry["filename"] == r"{app}\{#MyAppExeName}"
     assert "nowait" in entry["flags"]
-    assert "postinstall" not in entry["flags"], "postinstall can never fire without a Finish page"
+    assert "postinstall" not in entry["flags"], (
+        "silent handoff must run during install, not as a Finished-page checkbox"
+    )
 
 
 def test_no_run_entry_launches_unconditionally() -> None:

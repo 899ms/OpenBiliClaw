@@ -232,10 +232,22 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP "OpenBiliClaw-installed"
           $env:OPENBILICLAW_PROJECT_ROOT = Join-Path $env:RUNNER_TEMP "OpenBiliClaw-installer-bootstrap"
           $env:OPENBILICLAW_SELFTEST = "1"
+          if (Test-Path $env:OPENBILICLAW_PROJECT_ROOT) { Remove-Item -Recurse -Force $env:OPENBILICLAW_PROJECT_ROOT }
           $process = Start-Process -FilePath $setup -ArgumentList @(
             "/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir"
           ) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
+          # The silent install must hand off to the freshly written exe. The
+          # selftest instance exits as soon as the backend is assembled, so a
+          # plain Get-Process races with that exit; assert on the profile it
+          # creates instead (a Get-Process | Wait-Process with no process is a
+          # silent no-op), then wait out any instance still running.
+          $marker = Join-Path $env:OPENBILICLAW_PROJECT_ROOT "config.toml"
+          $deadline = (Get-Date).AddSeconds(90)
+          while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+          if (-not (Test-Path $marker)) {
+            throw "Silent install did not launch OpenBiliClaw (never wrote $marker)"
+          }
           Get-Process -Name OpenBiliClaw -ErrorAction SilentlyContinue |
             Wait-Process -Timeout 180 -ErrorAction Stop
           $env:OPENBILICLAW_FROZEN_EXE = (Resolve-Path "$installDir\OpenBiliClaw.exe").Path

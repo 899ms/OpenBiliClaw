@@ -71,7 +71,13 @@ def test_inno_installer_sets_numeric_file_version_resource() -> None:
     assert "VersionInfoProductVersion={#MyAppVersionInfoVersion}" in script
 
 
-def test_inno_installer_always_restarts_freshly_installed_executable() -> None:
+def test_inno_installer_silent_upgrade_hands_off_to_fresh_executable() -> None:
+    """Silent installs/upgrades must still hand off to the freshly installed exe.
+
+    Interactive installs are now an opt-in Finish-page checkbox (covered by
+    tests/test_installer_script.py); /SILENT and /VERYSILENT have no wizard, so
+    the unconditional handoff v0.3.182 added must survive on that path.
+    """
     script = (Path(__file__).resolve().parent.parent / "packaging" / "openbiliclaw.iss").read_text(
         encoding="utf-8"
     )
@@ -79,6 +85,7 @@ def test_inno_installer_always_restarts_freshly_installed_executable() -> None:
         line
         for line in script.splitlines()
         if line.startswith('Filename: "{app}\\{#MyAppExeName}"')
+        and "skipifnotsilent" in line
     )
 
     assert 'WorkingDir: "{app}"' in run_entry
