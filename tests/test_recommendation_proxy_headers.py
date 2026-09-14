@@ -24,7 +24,7 @@ from starlette.requests import Request
 
 from openbiliclaw.api.app import create_app
 from openbiliclaw.api.auth import AuthGate
-from openbiliclaw.config import ApiAuthConfig, Config
+from openbiliclaw.config import ApiAuthConfig, ApiConfig, Config
 from openbiliclaw.recommendation_runtime import (
     RECOMMENDATION_PORT_ENV,
     RECOMMENDATION_SOCK_ENV,
@@ -94,10 +94,16 @@ def _reset_capture() -> None:
     _FakeAsyncHTTPTransport.reset()
 
 
-def _build_proxied_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
+def _build_proxied_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, config: Config | None = None
+) -> Any:
     """Build the main API app with the recommendation proxy enabled."""
-    config = Config(data_dir=str(tmp_path))
+    config = config or Config(data_dir=str(tmp_path))
     monkeypatch.setattr("openbiliclaw.config.load_config", lambda *_a, **_kw: config)
+    # ``create_app`` persists the whole config when it has to generate a session
+    # secret for an enabled auth gate. Point the project root at tmp_path so that
+    # write can never land in the checkout (or in a real deployment's config).
+    monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
     monkeypatch.delenv("OPENBILICLAW_RECOMMENDATION_ONLY", raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeAsyncHTTPTransport)
@@ -110,8 +116,14 @@ def _build_proxied_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     )
 
 
-def _forwarded_request(headers: dict[str, str]) -> Request:
-    """Rebuild the request the recommendation process receives from the proxy."""
+def _forwarded_request(
+    headers: dict[str, str], *, client: tuple[str, int] | None = None
+) -> Request:
+    """Rebuild the request the recommendation process receives from the proxy.
+
+    ``client`` defaults to ``None`` (a Unix-socket peer has no address); pass a
+    loopback tuple to model the Windows loopback-TCP transport instead.
+    """
     scope: dict[str, Any] = {
         "type": "http",
         "http_version": "1.1",
@@ -122,22 +134,32 @@ def _forwarded_request(headers: dict[str, str]) -> Request:
         "query_string": b"",
         "root_path": "",
         "headers": [(key.encode(), value.encode()) for key, value in headers.items()],
-        "client": None,  # Unix-socket peers have no client address
+        "client": client,
         "server": ("localhost", 80),
     }
     return Request(scope)
 
 
-def _post_append(client: TestClient) -> Any:
+def _post_append(
+    client: TestClient,
+    *,
+    origin: str = _ORIGIN,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     return client.post(
         _APPEND_PATH,
         json={"excluded_bvids": []},
         headers={
             "X-OBC-Auth": "1",
-            "Origin": _ORIGIN,
+            "Origin": origin,
             "Cookie": "obc_session=test-token",
+            **(extra_headers or {}),
         },
     )
+
+
+def _recommendation_process_gate() -> AuthGate:
+    return AuthGate(ApiAuthConfig(enabled=True, session_secret="test-secret"), None)
 
 
 def test_proxy_forwards_original_host_and_origin(monkeypatch, tmp_path: Path) -> None:
@@ -231,3 +253,129 @@ def test_recommendation_process_csrf_rejects_synthesised_backend_host(
     }
 
     assert gate.csrf_ok(_forwarded_request(broken)) is False
+
+
+_TERMINATOR_HEADERS = {
+    "X-Forwarded-Proto": "https",
+    "X-Forwarded-Host": "sushe:8443",
+    "X-Forwarded-For": "203.0.113.7",
+    "X-Real-IP": "203.0.113.8",
+    "Forwarded": "for=203.0.113.7",
+}
+
+
+def _post_through_external_tls_terminator(app: Any, *, origin: str) -> Any:
+    """A browser request that arrives via Caddy / any external TLS terminator."""
+    return _post_append(
+        TestClient(app, base_url="https://sushe:8443"),
+        origin=origin,
+        extra_headers=_TERMINATOR_HEADERS,
+    )
+
+
+def test_https_origin_is_normalised_for_the_plain_http_hop(monkeypatch, tmp_path: Path) -> None:
+    """An https same-origin page must still pass the plain-HTTP hop's CSRF check."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    app = _build_proxied_app(monkeypatch, tmp_path)
+
+    _post_through_external_tls_terminator(app, origin="https://sushe:8443")
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    assert forwarded["host"] == "sushe:8443"
+    assert forwarded["origin"] == "http://sushe:8443"
+    assert _recommendation_process_gate().csrf_ok(_forwarded_request(forwarded)) is True
+
+
+def test_cross_site_origin_is_never_normalised(monkeypatch, tmp_path: Path) -> None:
+    """Normalisation is gated on the ingress verdict, so CSRF is not weakened."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    app = _build_proxied_app(monkeypatch, tmp_path)
+
+    _post_through_external_tls_terminator(app, origin="https://evil.example")
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    assert forwarded["origin"] == "https://evil.example"
+    assert _recommendation_process_gate().csrf_ok(_forwarded_request(forwarded)) is False
+
+
+def test_origin_with_mismatched_scheme_is_never_normalised(monkeypatch, tmp_path: Path) -> None:
+    """Same authority but a different scheme is not same-origin either."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    app = _build_proxied_app(monkeypatch, tmp_path)
+
+    _post_append(TestClient(app, base_url=_ORIGIN), origin="https://127.0.0.1:8420")
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    assert forwarded["origin"] == "https://127.0.0.1:8420"
+    assert _recommendation_process_gate().csrf_ok(_forwarded_request(forwarded)) is False
+
+
+def test_forwarded_context_headers_are_not_relayed(monkeypatch, tmp_path: Path) -> None:
+    """The hop must not inherit scheme/host claims it cannot verify."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    app = _build_proxied_app(monkeypatch, tmp_path)
+
+    _post_through_external_tls_terminator(app, origin="https://sushe:8443")
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    assert "x-forwarded-proto" not in forwarded
+    assert "x-forwarded-host" not in forwarded
+    # Client identity is deliberately NOT dropped: auth_core treats the presence
+    # of any of these on a loopback peer as fail-closed, and stripping them here
+    # would widen the local-exemption decision on the loopback-TCP transport.
+    assert forwarded["x-forwarded-for"] == "203.0.113.7"
+    assert forwarded["x-real-ip"] == "203.0.113.8"
+    assert forwarded["forwarded"] == "for=203.0.113.7"
+
+
+def test_relayed_client_identity_keeps_loopback_fail_closed(monkeypatch, tmp_path: Path) -> None:
+    """Regression guard: a forwarded client IP must still block the local bypass."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    app = _build_proxied_app(monkeypatch, tmp_path)
+
+    _post_append(
+        TestClient(app, base_url=_ORIGIN),
+        extra_headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    gate = _recommendation_process_gate()
+    loopback_tcp = {"client": ("127.0.0.1", 51000)}
+    assert gate.is_trusted_local(_forwarded_request(forwarded, **loopback_tcp)) is False
+    # Without any forwarding header the same loopback peer is exempt, which is
+    # exactly why these headers have to survive the hop.
+    del forwarded["x-forwarded-for"]
+    assert gate.is_trusted_local(_forwarded_request(forwarded, **loopback_tcp)) is True
+
+
+def test_https_scheme_from_trusted_proxy_is_normalised(monkeypatch, tmp_path: Path) -> None:
+    """High fidelity: https arrives via X-Forwarded-Proto from a trusted peer."""
+    monkeypatch.setenv(RECOMMENDATION_SOCK_ENV, _SOCK_PATH)
+    monkeypatch.delenv(RECOMMENDATION_PORT_ENV, raising=False)
+    config = Config(
+        data_dir=str(tmp_path),
+        api=ApiConfig(
+            auth=ApiAuthConfig(
+                enabled=True,
+                session_secret="test-secret",
+                trusted_proxies=["127.0.0.1"],
+            )
+        ),
+    )
+    app = _build_proxied_app(monkeypatch, tmp_path, config=config)
+
+    _post_append(
+        TestClient(app, base_url="http://sushe:8443", client=("127.0.0.1", 51000)),
+        origin="https://sushe:8443",
+        extra_headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "sushe:8443"},
+    )
+
+    forwarded = _FakeAsyncClient.forwards[0]["headers"]
+    assert forwarded["origin"] == "http://sushe:8443"
+    assert "x-forwarded-proto" not in forwarded
+    assert _recommendation_process_gate().csrf_ok(_forwarded_request(forwarded)) is True

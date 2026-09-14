@@ -357,6 +357,8 @@ popup、移动 Web 与桌面 Web 只有 durable 对话中的假设卡片保留 c
 | 已实现能力 | 接口 |
 | --- | --- |
 | 代理保留原始 Host | socket / loopback TCP 代理原样转发浏览器的 `Host`（不改写其值），推荐进程的 CSRF 同源校验（`Origin` vs effective host）因此与入口口径一致。 |
+| 代理归一化入口 scheme | 转发前用主 API 的 effective 视角（含受信代理与 uvicorn 改写后的 scheme）判定 `Origin`：同源时改写为 `http://<Host>`，与 `tls_proxy` 对内置 TLS 线程的做法一致，使 Caddy 等外部 TLS 终结下 https 页面的写请求也能通过推荐进程的同源校验；跨站或 scheme 不匹配的 `Origin` 原样转发并继续被拒。 |
+| 代理剥离入口上下文头 | 不再向推荐进程转发 `X-Forwarded-Proto` / `X-Forwarded-Host`：Unix socket 对端没有地址、回环 TCP 对端默认被信任，scheme 与 host 锚点必须由主 API 在上游重建。`X-Forwarded-For` / `X-Real-IP` / `Forwarded` 保持透传 —— `auth_core` 视「loopback 对端 + 存在转发头」为 fail-closed，剥离它们会放宽本机免登录判定。 |
 
 ### 惊喜队列的交互隔离（2026-09-08）
 
