@@ -350,6 +350,14 @@ popup、移动 Web 与桌面 Web 只有 durable 对话中的假设卡片保留 c
 
 `pool_status` 示例：`{"pool_available_count":26,"platform_available_counts":{"bilibili":20,"github":6},"pool_status_version":1788750000000}`。两个数量来自同一 canonical 查询；平台没有键即为零。客户端必须保留现有列表和最后一次成功库存，拒绝低版本响应覆盖。失败请求不会返回假推荐 ID 0。手机 Web 读完整 JSON 正文后才清理计时器，换批 / 追加均有 12 秒前端截止时间；失败保留卡片并恢复操作入口。
 
+### 推荐接口反代的入口上下文（2026-09-14）
+
+推荐进程运行同一套认证中间件，因此反代必须让它看到与入口一致的请求上下文，否则 CSRF 同源判定会失败。
+
+| 已实现能力 | 接口 |
+| --- | --- |
+| 代理保留原始 Host | socket / loopback TCP 代理原样转发浏览器的 `Host`（不改写其值），推荐进程的 CSRF 同源校验（`Origin` vs effective host）因此与入口口径一致。 |
+
 ### 惊喜队列的交互隔离（2026-09-08）
 
 已实现：`GET /api/delight/pending-batch` 使用 FastAPI 同步路由在线程池执行动态阈值、候选历史与不喜欢主题的读取，避免手机刷新时旁路请求阻塞主 API 的换批转发。公开参数、队列上限、筛选与 liked/delivered 行处理及响应字段不变；每次仍读取现有数据，不增加陈旧结果缓存。

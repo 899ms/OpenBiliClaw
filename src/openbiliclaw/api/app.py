@@ -2846,9 +2846,12 @@ def create_app(
                 )
         return await call_next(request)
 
-    # Register AFTER the degraded guard so the auth gate is the outermost http
-    # middleware (runs first): unauthenticated requests are rejected before any
-    # downstream handling. CORS stays inner; 401/403 echo a permissive header.
+    # Register AFTER the degraded guard so the auth gate runs ahead of it:
+    # unauthenticated requests are rejected before any downstream handling.
+    # CORS stays inner; 401/403 echo a permissive header. Note that the
+    # recommendation proxy below is registered even later, so it wraps this
+    # gate: /api/recommendations/* is authenticated by the recommendation
+    # process, which is why that hop must preserve the request context.
     app.middleware("http")(make_auth_middleware(_get_auth_gate))
 
     if (
@@ -2861,10 +2864,19 @@ def create_app(
         async def proxy_recommendation_api(request: Request, call_next: Any) -> Any:
             if not request.url.path.startswith("/api/recommendations"):
                 return await call_next(request)
+            # The original Host MUST be forwarded: the recommendation process runs
+            # the same auth middleware, whose CSRF check compares the request
+            # Origin against the effective (scheme, host, port). Dropping Host
+            # makes httpx synthesise it from the backend URL (``localhost`` on the
+            # Unix-socket path, ``127.0.0.1:<port>`` on the TCP path), so a
+            # same-origin browser POST could never match its Origin and every
+            # cookie-authenticated /api/recommendations/* write returned 403
+            # ``csrf``. Bearer-token clients skipped that check, which is why the
+            # extension kept working while the desktop Web UI did not.
             headers = {
                 key: value
                 for key, value in request.headers.items()
-                if key.lower() not in {"host", "content-length", "connection"}
+                if key.lower() not in {"content-length", "connection"}
             }
             body = await request.body()
             recommendation_port = os.environ.get(RECOMMENDATION_PORT_ENV, "").strip()
