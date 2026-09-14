@@ -63,7 +63,8 @@ RestartApplications=no
 ; install-only, and the uninstaller treats locked-file delete errors as
 ; non-fatal — without this gate it stranded the locked files, deleted itself,
 ; and left no way to retry the uninstall. Older installed builds without the
-; mutex fall through to the InitializeUninstall taskkill in [Code].
+; mutex fall through to the CurUninstallStepChanged(usUninstall) taskkill in
+; [Code] (deliberately AFTER the gate — see the ordering note there).
 AppMutex=OpenBiliClaw-B4F3D2A1-7C6E-4A8B-9D1F-0E2A6C5B3D14
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -120,13 +121,21 @@ end;
 // Uninstall-side process handoff. PrepareToInstall above only runs in Setup,
 // and Uninstall cannot use Restart Manager (CloseApplications is install-only),
 // so without this the uninstaller hits "file in use" errors — which are
-// non-fatal there: it deletes itself and strands the leftovers. Also the only
-// guard for upgraded installs whose old exe predates the AppMutex mutex.
-// taskkill is a no-op (nonzero exit, ignored) when nothing is running.
-function InitializeUninstall(): Boolean;
+// non-fatal there: it deletes itself and strands the leftovers.
+//
+// ORDERING IS LOAD-BEARING: Inno runs [Code] InitializeUninstall BEFORE its
+// internal AppMutex check (see RunSecondPhase in Setup.Uninstall.pas), so
+// killing the app there silently destroys the mutex and the "application is
+// running" gate never fires. The kill therefore lives in
+// CurUninstallStepChanged(usUninstall), which runs AFTER the AppMutex gate
+// passed and immediately before file deletion — cleaning up processes the
+// gate cannot see (mutex-less pre-AppMutex installs, orphaned worker/ollama
+// children outliving the tray parent). taskkill is a no-op (nonzero exit,
+// ignored) when nothing is running.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  StopRunningInstance;
-  Result := True;
+  if CurUninstallStep = usUninstall then
+    StopRunningInstance;
 end;
 
 // Runs right before files are copied (both fresh installs and upgrades).
