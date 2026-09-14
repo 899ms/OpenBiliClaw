@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1240,6 +1242,54 @@ def test_open_landing_page_still_opens_web_on_health_timeout(
     # Timeout → best-effort open of /web without an init-status probe.
     assert opened == ["http://127.0.0.1:8420/web/"]
     assert probed == []
+
+
+# --------------------------------------------------------------------------- #
+# Installer-coordination mutex (Inno Setup AppMutex)
+# --------------------------------------------------------------------------- #
+
+
+def test_installer_mutex_name_matches_inno_appmutex() -> None:
+    """entry.py's mutex name and the .iss AppMutex= must stay in lockstep."""
+    project_root = Path(__file__).resolve().parent.parent
+    iss_text = (project_root / "packaging" / "openbiliclaw.iss").read_text(encoding="utf-8")
+    match = re.search(r"^AppMutex=(\S+)", iss_text, flags=re.MULTILINE)
+    assert match is not None, "packaging/openbiliclaw.iss must set AppMutex="
+    assert match.group(1) == entry._INSTALLER_MUTEX_NAME
+
+
+def test_acquire_installer_mutex_skips_dev_and_non_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dev runs (not frozen) never take the mutex, even on Windows.
+    assert entry._acquire_installer_mutex() is None
+    # Frozen but non-Windows: still None.
+    monkeypatch.setattr(entry.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(entry.os, "name", "posix")
+    assert entry._acquire_installer_mutex() is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="named mutex is Windows-only")
+def test_acquire_installer_mutex_frozen_windows_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(entry.sys, "frozen", True, raising=False)
+    assert entry._acquire_installer_mutex(), "CreateMutexW must return a handle"
+    # ERROR_ALREADY_EXISTS still yields a handle — parent + worker children
+    # share one mutex; existence is all that matters.
+    assert entry._acquire_installer_mutex()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="named mutex is Windows-only")
+def test_acquire_installer_mutex_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+
+    def _boom(*_args: object, **_kwargs: object) -> int:
+        raise OSError("CreateMutexW unavailable")
+
+    monkeypatch.setattr(entry.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(ctypes.windll.kernel32, "CreateMutexW", _boom)
+    assert entry._acquire_installer_mutex() is None
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience

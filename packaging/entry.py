@@ -776,6 +776,41 @@ def _try_single_instance_lock(project_root: Path) -> tuple[str, Any]:
     return "acquired", handle
 
 
+# Named mutex held by every packaged OpenBiliClaw process (the tray parent and
+# each --openbiliclaw-worker child — all are the frozen exe whose files
+# Setup/Uninstall overwrite or delete). packaging/openbiliclaw.iss lists this
+# name in [Setup] AppMutex so both Setup and Uninstall open with the standard
+# "application is running" dialog instead of proceeding into locked files:
+# Inno's CloseApplications/Restart Manager is install-only, and the
+# uninstaller treats locked-file delete errors as non-fatal — it used to
+# strand the locked files, delete itself, and leave the user no way to retry
+# the uninstall. Session-local on purpose (no Global\ prefix): the install is
+# per-user, and another user's running instance must not block this user's
+# Setup/Uninstall.
+_INSTALLER_MUTEX_NAME = "OpenBiliClaw-B4F3D2A1-7C6E-4A8B-9D1F-0E2A6C5B3D14"
+
+
+def _acquire_installer_mutex() -> Any:
+    """Create the named mutex Inno Setup's AppMutex check looks for.
+
+    Best-effort and fail-open: any problem (non-Windows, dev run, ctypes
+    failure) returns ``None`` and startup proceeds unaffected. The handle is
+    intentionally never closed — Windows releases it automatically when the
+    process exits (including crashes), which is exactly the lifetime the
+    installer/uninstaller coordination needs. Acquiring an already-existing
+    mutex is fine: parent and worker children share one name, and the mutex
+    merely needs to exist while any packaged process runs.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.CreateMutexW(None, False, _INSTALLER_MUTEX_NAME)
+    except Exception:  # noqa: BLE001 — coordination only, never block startup
+        return None
+
+
 def _tray_icon_image() -> Any:
     """Load the canonical app icon for the Windows tray / macOS menu bar."""
     from PIL import Image
@@ -1395,6 +1430,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Installer coordination: hold the AppMutex for the whole process lifetime
+    # (parent and --openbiliclaw-worker children alike — both are the packaged
+    # exe whose files Setup/Uninstall overwrite/delete). Never closed; Windows
+    # releases it automatically on process exit. See _acquire_installer_mutex.
+    _installer_mutex = _acquire_installer_mutex()
+
     # Frozen desktop child processes are re-executions of the same packaged
     # executable.  Route them to the requested backend module before the normal
     # desktop main() (tray/splash/migration) runs.
@@ -1409,8 +1450,7 @@ if __name__ == "__main__":
         # send their logs to the same desktop.log as the parent.  Also close
         # the Windows boot splash as early as possible in each child.
         child_root = Path(
-            os.environ.get("OPENBILICLAW_PROJECT_ROOT")
-            or _resolve_runtime_paths()[0]
+            os.environ.get("OPENBILICLAW_PROJECT_ROOT") or _resolve_runtime_paths()[0]
         )
         _redirect_output_to_logfile(child_root)
         _close_splash()

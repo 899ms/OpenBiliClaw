@@ -57,6 +57,14 @@ PrivilegesRequired=lowest
 ; (PyInstaller console apps don't always cooperate with RM).
 CloseApplications=force
 RestartApplications=no
+; Setup AND Uninstall open with the standard "application is running" dialog
+; when the packaged app holds the named mutex created by packaging/entry.py
+; (_acquire_installer_mutex). CloseApplications/Restart Manager above is
+; install-only, and the uninstaller treats locked-file delete errors as
+; non-fatal — without this gate it stranded the locked files, deleted itself,
+; and left no way to retry the uninstall. Older installed builds without the
+; mutex fall through to the InitializeUninstall taskkill in [Code].
+AppMutex=OpenBiliClaw-B4F3D2A1-7C6E-4A8B-9D1F-0E2A6C5B3D14
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Script lives in packaging\; resolve [Files] Source + OutputDir from repo root.
@@ -107,6 +115,18 @@ begin
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   // Give Windows a moment to release the handles before the file copy begins.
   Sleep(800);
+end;
+
+// Uninstall-side process handoff. PrepareToInstall above only runs in Setup,
+// and Uninstall cannot use Restart Manager (CloseApplications is install-only),
+// so without this the uninstaller hits "file in use" errors — which are
+// non-fatal there: it deletes itself and strands the leftovers. Also the only
+// guard for upgraded installs whose old exe predates the AppMutex mutex.
+// taskkill is a no-op (nonzero exit, ignored) when nothing is running.
+function InitializeUninstall(): Boolean;
+begin
+  StopRunningInstance;
+  Result := True;
 end;
 
 // Runs right before files are copied (both fresh installs and upgrades).

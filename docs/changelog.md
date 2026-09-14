@@ -16,6 +16,8 @@
 
 - **B 站视频信息补分区 id，新增标签读取方法（issue #57 / #232 方向 1）**：`get_video_info()` 补填同一 `/x/web-interface/view` 响应里一直存在、但此前被丢弃的 `tid` / `tid_v2`（零额外请求）；新增 `get_video_tags(bvid, limit=20)`，走 `/x/tag/archive/tags`（网页播放器标签行所用的端点）取标签名，匿名 Cookie 亦可读取，响应远轻于 `/x/web-interface/view/detail`（后者会连带 Card / Related / Reply）。**实测纠正**：2026-09-11 在 8 个分区各取 1 个样本（含 plain `/view` 与 WBI `/x/web-interface/wbi/view` 两种变体）确认 —— 该响应**不含 `tag` 数组**，`tname` / `tname_v2` **恒为空字符串**，因此 `VideoInfo.tags` 在这条路径上保持 `None`，标签只能由 `get_video_tags()` 显式获取；`get_video_info()` 的请求数不变（有回归测试锁定）。集成点（把标签喂给评估 prompt、摇摆区视频才拉标签）留待后续按需接入，本次不改变任何发现/推荐链路行为。
 
+- **修复卸载正在运行的 Windows 桌面版时卸载器自删、无法二次卸载**：Inno 的 `CloseApplications`/Restart Manager 只作用于安装，卸载器对占用文件按非致命错误处理后仍会照常删除开始菜单图标、注册表卸载项与 `unins000.exe` 自身——用户关掉程序后也没有入口重试卸载，只能手删 `%LOCALAPPDATA%\Programs\OpenBiliClaw`。现在 `packaging/entry.py` 为每个冻结进程（托盘主进程与 `--openbiliclaw-worker` 子进程）全程持有一个命名互斥体（`_acquire_installer_mutex`，fail-open，进程退出自动释放），`openbiliclaw.iss` 增设 `AppMutex`，Setup 与 Uninstall 启动即弹标准「检测到 OpenBiliClaw 正在运行」对话框（关闭应用后点 OK 自动重检）；卸载器侧 `[Code] InitializeUninstall` 复用 `StopRunningInstance` 的 `taskkill /T /F` 兜底，覆盖升级前尚无互斥体的旧安装。新增互斥体名与 `.iss` 的一致性回归（防两处漂移）及 fail-open / 非冻结守卫单测。
+
 ---
 
 ## v0.3.221：保存 URL 归一化、B 站视频信息回退与 learned scorer 校准（2026-09-11）
