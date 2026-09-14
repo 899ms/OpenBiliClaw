@@ -2846,9 +2846,12 @@ def create_app(
                 )
         return await call_next(request)
 
-    # Register AFTER the degraded guard so the auth gate is the outermost http
-    # middleware (runs first): unauthenticated requests are rejected before any
-    # downstream handling. CORS stays inner; 401/403 echo a permissive header.
+    # Register AFTER the degraded guard so the auth gate runs ahead of it:
+    # unauthenticated requests are rejected before any downstream handling.
+    # CORS stays inner; 401/403 echo a permissive header. Note that the
+    # recommendation proxy below is registered even later, so it wraps this
+    # gate: /api/recommendations/* is authenticated by the recommendation
+    # process, which is why that hop must preserve the request context.
     app.middleware("http")(make_auth_middleware(_get_auth_gate))
 
     if (
@@ -2857,15 +2860,67 @@ def create_app(
     ):
         import httpx as _httpx
 
+        def _ingress_origin_is_same_origin(request: Request, host: str) -> bool:
+            """Whether the request Origin matches this ingress's effective view.
+
+            ``AuthGate.effective`` is the authoritative answer: it applies the
+            configured trusted-proxy rules and the uvicorn-rewritten scheme, so it
+            reflects what the client actually sees. The empty-host early return only
+            makes explicit what that view already implies: no host is never
+            same-origin.
+            """
+            from openbiliclaw import auth_core
+
+            if not host:
+                return False
+            return auth_core.same_origin(
+                auth_core.parse_origin(request.headers.get("origin")),
+                _get_auth_gate().effective(request),
+            )
+
         @app.middleware("http")
         async def proxy_recommendation_api(request: Request, call_next: Any) -> Any:
             if not request.url.path.startswith("/api/recommendations"):
                 return await call_next(request)
-            headers = {
-                key: value
-                for key, value in request.headers.items()
-                if key.lower() not in {"host", "content-length", "connection"}
-            }
+            # The original Host MUST be forwarded: the recommendation process runs
+            # the same auth middleware, whose CSRF check compares the request
+            # Origin against the effective (scheme, host, port). Dropping Host
+            # makes httpx synthesise it from the backend URL (``localhost`` on the
+            # Unix-socket path, ``127.0.0.1:<port>`` on the TCP path), so a
+            # same-origin browser POST could never match its Origin and every
+            # cookie-authenticated /api/recommendations/* write returned 403
+            # ``csrf``. Bearer-token clients skipped that check, which is why the
+            # extension kept working while the desktop Web UI did not.
+            # The remaining ingress context is reconstructed here, because the
+            # recommendation process cannot verify it: a Unix-socket peer has no
+            # address (uvicorn therefore refuses to apply X-Forwarded-Proto for it)
+            # and on the loopback-TCP path it would trust 127.0.0.1 by default. An
+            # already-validated same-origin Origin is therefore rewritten for the
+            # plain-HTTP hop -- mirroring what tls_proxy does for the built-in TLS
+            # thread -- so an https page (Caddy or any external terminator) still
+            # satisfies the same-origin check, while a cross-site Origin stays
+            # rejected.
+            same_origin_host = (request.headers.get("host") or "").strip()
+            same_origin = _ingress_origin_is_same_origin(request, same_origin_host)
+            headers: dict[str, str] = {}
+            for key, value in request.headers.items():
+                lowered = key.lower()
+                # The scheme must not leak in: on the loopback-TCP transport uvicorn
+                # would adopt https for the hop and stop matching the normalised
+                # Origin. X-Forwarded-Host must not move the host anchor.
+                # X-Forwarded-For / X-Real-IP / Forwarded do stay: auth_core treats
+                # their presence on a loopback peer as fail-closed, and dropping them
+                # would widen the local exemption.
+                if lowered in {
+                    "content-length",
+                    "connection",
+                    "x-forwarded-proto",
+                    "x-forwarded-host",
+                }:
+                    continue
+                if lowered == "origin" and same_origin:
+                    value = f"http://{same_origin_host}"
+                headers[key] = value
             body = await request.body()
             recommendation_port = os.environ.get(RECOMMENDATION_PORT_ENV, "").strip()
             if recommendation_port:

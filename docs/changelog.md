@@ -4,6 +4,15 @@
 
 ---
 
+## 未发布：推荐接口反代入口上下文修复
+
+- **修复网页「加载更多 / 换一批」固定 403（推荐接口反代丢失 Host）**：四进程模式下主 API 把 `/api/recommendations/*` 反代给独立推荐进程，转发前剔除了 `Host`，httpx 于是按后端地址自行生成 `Host: localhost`（Unix socket 路径）或 `127.0.0.1:<port>`（Windows 回环 TCP 路径），而 `Origin` 原样转发 —— 推荐进程内同一套认证中间件的 CSRF 同源校验比较的正是 `Origin` 与 effective host，于是同源判定永不成立，三端 Web 的写请求（`append` / `reshuffle` / `refresh`）在使用会话 cookie 时固定返回 `403 {"error":"csrf"}`；浏览器扩展走 Bearer 豁免 CSRF，因此只有网页受影响，且非 `recommendations` 的写接口照常可用。现在反代保留浏览器原始 `Host`（`content-length` / `connection` 等传输层头部仍不转发），推荐进程的 CSRF 判定与入口恢复到同一口径。新增 `tests/test_recommendation_proxy_headers.py`：覆盖 Unix socket 与回环 TCP 两条传输的 Host / Origin 透传、hop 头剔除，以及「反代后的请求能通过推荐进程 CSRF」的契约断言，并含把 `Host` 重新剔除后即失败的回归守卫。
+
+- **修复外部 TLS 终结部署（Caddy 等）下网页「加载更多 / 换一批」仍 403**：推荐进程走 Unix socket，对端没有地址，uvicorn 因此不会按 `X-Forwarded-Proto` 改写它的 scheme，于是 https 页面的 `Origin` 永远无法与它算出的 `http` 同源匹配。反代现在用主 API 自己的 effective 视角判定 `Origin`，同源时改写为 `http://<Host>`（与 `tls_proxy` 对内置 TLS 线程的处理一致；前提是入口能算出外部有效 host —— 反向代理保留原始 `Host`，或终结器列入 `auth.trusted_proxies` 并提供 `X-Forwarded-Host`），跨站 `Origin` 原样保留、继续被拒；并且不再把 `X-Forwarded-Proto` / `X-Forwarded-Host` 转给推荐进程 —— 这个 hop 无法验证这两个声明，scheme 与 host 锚点统一由主 API 重建；`X-Forwarded-For` / `X-Real-IP` / `Forwarded` 仍照常透传，否则会放宽 `auth_core` 对「loopback 对端 + 存在转发头」的 fail-closed 判定。
+
+
+---
+
 ## 未发布：推荐理由补齐发布时间与评估时刻
 
 - **修复推荐理由把 2024 年旧内容说成“最新”**：推荐理由（`expression`）生成链路此前既不传当前时间、也不传内容发布时间，模型只能靠标题年份或自身知识猜测时效。现在单条实时 `_try_generate_expression()` 与批量池 `_precompute_batch()` 都会把候选的 `published_at` / `published_label` 以及该条的评估时刻 `evaluated_at`（`DiscoveredContent.temporal_evaluated_at`，不是生成文案时的 wall clock）放进 user_prompt 的 content payload；单条和批量静态 system prompt 各加一条规则，只允许对照 `evaluated_at` + `published_at` 判断新旧，禁止根据标题年份、“最新/今天”等词、模型知识截止时间或其它字段推断，字段缺失时不得使用时效词或猜测年龄。时间字段位于可变 user payload，system prompt 仍字节静态，prompt cache 前缀不受影响。补单条 / 批量 prompt 与引擎级回归测试。
