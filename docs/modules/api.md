@@ -360,6 +360,8 @@ popup、移动 Web 与桌面 Web 只有 durable 对话中的假设卡片保留 c
 | 代理归一化入口 scheme | 转发前用主 API 的 effective 视角（含受信代理与 uvicorn 改写后的 scheme）判定 `Origin`：同源时改写为 `http://<Host>`，与 `tls_proxy` 对内置 TLS 线程的做法一致，使 Caddy 等外部 TLS 终结下 https 页面的写请求也能通过推荐进程的同源校验；跨站或 scheme 不匹配的 `Origin` 原样转发并继续被拒。 |
 | 代理剥离入口上下文头 | 不再向推荐进程转发 `X-Forwarded-Proto` / `X-Forwarded-Host`：Unix socket 对端没有地址、回环 TCP 对端默认被信任，scheme 与 host 锚点必须由主 API 在上游重建。`X-Forwarded-For` / `X-Real-IP` / `Forwarded` 保持透传 —— `auth_core` 视「loopback 对端 + 存在转发头」为 fail-closed，剥离它们会放宽本机免登录判定。 |
 
+scheme 归一化的前提是入口能算出外部有效 host：反向代理保留原始 `Host`，或终结器列入 `auth.trusted_proxies` 并提供 `X-Forwarded-Host`。nginx 默认会把 `Host` 重写为上游地址（`proxy_set_header Host $proxy_host`）；这类部署需要显式改成 `proxy_set_header Host $host`，否则主 API 自身的 CSRF 同源判定对所有写接口同样不通过，并不只是推荐反代这一跳。
+
 ### 惊喜队列的交互隔离（2026-09-08）
 
 已实现：`GET /api/delight/pending-batch` 使用 FastAPI 同步路由在线程池执行动态阈值、候选历史与不喜欢主题的读取，避免手机刷新时旁路请求阻塞主 API 的换批转发。公开参数、队列上限、筛选与 liked/delivered 行处理及响应字段不变；每次仍读取现有数据，不增加陈旧结果缓存。
