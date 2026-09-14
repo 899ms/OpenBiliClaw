@@ -63,6 +63,9 @@ jobs:
       - name: Run macOS installer handoff E2E
         run: python -m pytest -q tests/test_macos_installer_e2e.py
 
+      - name: Prefetch embedded Tailnet modules for every target
+        run: python scripts/generate_tailnet_notices.py --prefetch
+
       - name: Download official Ollama.app runtime
         run: |
           curl -L https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip -o Ollama-darwin.zip
@@ -133,6 +136,9 @@ jobs:
           echo "bare=${v#v}" >> "$GITHUB_OUTPUT"
           numeric="$(python -c 'import re,sys; m=re.match(r"v?(\d+)\.(\d+)\.(\d+)", sys.argv[1]); print(f"{m.group(1)}.{m.group(2)}.{m.group(3)}.0" if m else "0.0.0.0")' "$v")"
           echo "version_info=$numeric" >> "$GITHUB_OUTPUT"
+
+      - name: Prefetch embedded Tailnet modules for every target
+        run: python scripts/generate_tailnet_notices.py --prefetch
 
       - name: PyInstaller onedir build (ollama staged separately below)
         run: python packaging/build.py --clean --no-bundle-ollama --archive-version "${{ steps.ver.outputs.version }}"
