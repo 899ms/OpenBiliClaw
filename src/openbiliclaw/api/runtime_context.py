@@ -643,6 +643,58 @@ class RuntimeContext:
         scheduler = getattr(getattr(self, "config", None), "scheduler", None)
         return _gate(scheduler, self.presence)
 
+    @staticmethod
+    def full_worker_expected() -> bool:
+        """Whether this process delegates background loops to worker children."""
+        return (
+            os.environ.get("OPENBILICLAW_FULL_WORKER", "").strip() == "1"
+            or os.environ.get("OPENBILICLAW_WORKER", "").strip() == "1"
+        )
+
+    def worker_heartbeat_status(self) -> dict[str, Any]:
+        """Read the delegated full worker's heartbeat health, best effort."""
+        data_path = getattr(getattr(self, "config", None), "data_path", None)
+        if data_path is None:
+            return {}
+        try:
+            from openbiliclaw.runtime.worker_status import WorkerStatusStore
+
+            payload: dict[str, Any] = WorkerStatusStore(
+                data_path / "runtime" / "worker_status.json"
+            ).status_payload()
+            return payload
+        except Exception:
+            logger.debug("Unable to read full worker heartbeat", exc_info=True)
+            return {}
+
+    def warn_if_full_worker_heartbeat_stale(self) -> None:
+        """Warn when delegated background loops have no live worker behind them.
+
+        The API decides whether to run its own loops from environment flags
+        alone. A crashed ``worker`` used to stay invisible until every
+        background endpoint returned 503; this warning plus ``worker_running``
+        in ``/api/runtime-status`` makes the delegation outage diagnosable.
+        The desktop parent respawns crashed children, so a stale heartbeat
+        normally self-heals shortly after the warning.
+        """
+        if not self.full_worker_expected():
+            return
+        payload = self.worker_heartbeat_status()
+        age = float(payload.get("worker_heartbeat_age_seconds", -1.0))
+        if age < 0 or bool(payload.get("worker_running")):
+            # -1 means no heartbeat file yet: the worker may still be starting
+            # (config probe, cold imports). Only warn once a previously live
+            # worker's heartbeat has actually gone stale.
+            return
+        logger.warning(
+            "Full worker heartbeat is stale (age=%.0fs, pid=%s, mode=%s); background "
+            "loops remain delegated to it — /api/runtime-status reports "
+            "worker_running=false and the desktop parent respawns crashed children",
+            age,
+            payload.get("worker_pid"),
+            payload.get("worker_mode"),
+        )
+
     async def rebuild_from_config(self, new_config: Config) -> None:
         """Rebuild all swappable components from *new_config*.
 
@@ -1903,10 +1955,9 @@ class RuntimeContext:
         # A dedicated discovery worker process runs runtime_controller. The
         # API process must not also start these loops or its event loop will be
         # competing with every HTTP request (chat, status, recommendations).
-        full_worker_active = (
-            os.environ.get("OPENBILICLAW_FULL_WORKER", "").strip() == "1"
-            or os.environ.get("OPENBILICLAW_WORKER", "").strip() == "1"
-        )
+        full_worker_active = self.full_worker_expected()
+        if full_worker_active:
+            self.warn_if_full_worker_heartbeat_stale()
 
         # Start new tasks from the freshly-built components.
         # v0.3.63+: route through ``self.task_registry.track`` so the

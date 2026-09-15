@@ -41,6 +41,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from openbiliclaw.proc import ChildProcessSupervisor, ManagedChild
 from openbiliclaw.recommendation_runtime import ensure_recommendation_transport_env
 
 if TYPE_CHECKING:
@@ -1339,9 +1340,7 @@ def main() -> None:
     if worker_requested:
         os.environ["OPENBILICLAW_FULL_WORKER"] = "1"
         data_path = (
-            runtime_config.data_path
-            if runtime_config is not None
-            else project_root / "data"
+            runtime_config.data_path if runtime_config is not None else project_root / "data"
         )
         ensure_recommendation_transport_env(data_path)
 
@@ -1359,46 +1358,57 @@ def main() -> None:
 
     listener_sockets = create_wildcard_listener_sockets(host, port)
     tailnet_supervisor = _start_packaged_tailnet(runtime_config, host, port)
-    child_processes: list[subprocess.Popen] = []
+
+    children: list[ManagedChild] = []
+    if worker_requested:
+        children.extend(
+            [
+                ManagedChild(
+                    "full-worker",
+                    lambda: _spawn_backend_child(
+                        "openbiliclaw.worker",
+                        env={**os.environ, "OPENBILICLAW_FULL_WORKER": "1"},
+                    ),
+                ),
+                ManagedChild(
+                    "discovery-worker",
+                    lambda: _spawn_backend_child(
+                        "openbiliclaw.discovery_worker",
+                        env={
+                            **os.environ,
+                            "OPENBILICLAW_DISCOVERY_WORKER": "1",
+                            "OPENBILICLAW_FULL_WORKER": "1",
+                        },
+                    ),
+                ),
+                ManagedChild(
+                    "recommendation-server",
+                    lambda: _spawn_backend_child(
+                        "openbiliclaw.recommendation_server",
+                        env={
+                            **os.environ,
+                            "OPENBILICLAW_RECOMMENDATION_ONLY": "1",
+                            "OPENBILICLAW_FULL_WORKER": "1",
+                        },
+                    ),
+                ),
+            ]
+        )
+
+    # The image proxy is always a dedicated child, even in the legacy
+    # single-API-process fallback, so image work cannot stall API serving.
+    children.append(
+        ManagedChild(
+            "image-service",
+            lambda: _spawn_backend_child("openbiliclaw.image_service", env={**os.environ}),
+        )
+    )
+    child_supervisor = ChildProcessSupervisor(children)
 
     try:
-        if worker_requested:
-            child_processes.append(
-                _spawn_backend_child(
-                    "openbiliclaw.worker",
-                    env={**os.environ, "OPENBILICLAW_FULL_WORKER": "1"},
-                )
-            )
-            child_processes.append(
-                _spawn_backend_child(
-                    "openbiliclaw.discovery_worker",
-                    env={
-                        **os.environ,
-                        "OPENBILICLAW_DISCOVERY_WORKER": "1",
-                        "OPENBILICLAW_FULL_WORKER": "1",
-                    },
-                )
-            )
-            child_processes.append(
-                _spawn_backend_child(
-                    "openbiliclaw.recommendation_server",
-                    env={
-                        **os.environ,
-                        "OPENBILICLAW_RECOMMENDATION_ONLY": "1",
-                        "OPENBILICLAW_FULL_WORKER": "1",
-                    },
-                )
-            )
-
-        # The image proxy is always a dedicated child, even in the legacy
-        # single-API-process fallback, so image work cannot stall API serving.
-        child_processes.append(
-            _spawn_backend_child("openbiliclaw.image_service", env={**os.environ})
-        )
+        child_supervisor.start()
         image_service_port = os.environ.get("OPENBILICLAW_IMAGE_SERVICE_PORT", "8421")
-        os.environ["OPENBILICLAW_IMAGE_SERVICE_URL"] = (
-            f"http://127.0.0.1:{image_service_port}"
-        )
+        os.environ["OPENBILICLAW_IMAGE_SERVICE_URL"] = f"http://127.0.0.1:{image_service_port}"
 
         if use_tray:
             # Windowed build: uvicorn runs in the background and a tray icon owns the
@@ -1415,14 +1425,7 @@ def main() -> None:
             else:
                 server.run()
     finally:
-        for proc in reversed(child_processes):
-            if proc is None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+        child_supervisor.stop()
         if tailnet_supervisor is not None:
             tailnet_supervisor.stop()
         close_listener_sockets(listener_sockets)
@@ -1454,7 +1457,23 @@ if __name__ == "__main__":
         )
         _redirect_output_to_logfile(child_root)
         _close_splash()
-        runpy.run_module(sys.argv[2], run_name="__main__")
+        try:
+            runpy.run_module(sys.argv[2], run_name="__main__")
+        except Exception:
+            # Windowed builds turn any uncaught exception in a child into a
+            # PyInstaller bootloader error dialog. Log the traceback to
+            # desktop.log and exit with a plain SystemExit (which the
+            # bootloader handles silently) so a crashed child stays
+            # diagnosable instead of blocking startup with error boxes; the
+            # parent-side supervisor respawns it with backoff.
+            import traceback
+
+            print(
+                f"[OpenBiliClaw] backend child {sys.argv[2]} crashed; see logs/desktop.log",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+            raise SystemExit(1) from None
         raise SystemExit(0)
 
     try:
