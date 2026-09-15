@@ -4,6 +4,12 @@
 
 ---
 
+## 未发布：Windows 安装/卸载拦截运行中的应用
+
+- **修复卸载正在运行的 Windows 桌面版时卸载器自删、无法二次卸载**：Inno 的 `CloseApplications`/Restart Manager 只作用于安装，卸载器对占用文件按非致命错误处理后仍会照常删除开始菜单图标、注册表卸载项与 `unins000.exe` 自身——用户关掉程序后也没有入口重试卸载，只能手删 `%LOCALAPPDATA%\Programs\OpenBiliClaw`。现在 `packaging/entry.py` 为每个冻结进程（托盘主进程与 `--openbiliclaw-worker` 子进程）全程持有一个命名互斥体（`_acquire_installer_mutex`，fail-open，进程退出自动释放），`openbiliclaw.iss` 增设 `AppMutex`，Setup 与 Uninstall 启动即弹标准「检测到 OpenBiliClaw 正在运行」对话框（关闭应用后点 OK 自动重检）；卸载器侧 `[Code] CurUninstallStepChanged(usUninstall)` 复用 `StopRunningInstance` 的 `taskkill /T /F` 兜底——**必须在 AppMutex 门禁之后**执行：Inno 卸载器先跑 `[Code] InitializeUninstall` 事件再做内部互斥体检查（`Setup.Uninstall.pas` `RunSecondPhase` 的既定顺序），把强杀放进 InitializeUninstall 会先杀掉持锁进程、让门禁永远静默通过（真机验证过该反例）；usUninstall 在门禁通过后、删文件前触发，覆盖升级前尚无互斥体的旧安装与孤儿 worker/ollama 子进程。新增互斥体名与 `.iss` 的一致性回归（防两处漂移）及 fail-open / 非冻结守卫单测。真机验证：应用运行中触发卸载即被门禁拦截（卸载日志记录 `Defaulting to Cancel for suppressed message box: Uninstall has detected that OpenBiliClaw is currently running`），应用、文件与卸载入口零改动、退出应用后可重试。
+
+---
+
 ## 未发布：修复手动桌面安装包 workflow 的 Tailnet 模块预取缺失
 
 - **修复 `build-installers.yml` 自嵌入式 tailnet 宿主合入起必然失败（发现于 PR #249 的 Windows 安装器实测）**：`7f3b7e35` 给两个平台 job 加了 `actions/setup-go`，但没有把 tailnet 依赖预取进 Go module cache，而 `packaging/build.py` 会以 `GOPROXY=off`（离线、可复现）调起 `scripts/generate_tailnet_notices.py --check`；于是 `go list -tags=ts_omit_logtail,ts_omit_webclient -deps -json .` 在 tailscale.com v1.102.3 新增的 `github.com/tailscale/peercred`（unix 凭据文件）上直接 `module lookup disabled by GOPROXY=off`，PyInstaller 还没开始 job 就红了——`release-desktop.yml` 的两个 job 一直有 `python scripts/generate_tailnet_notices.py --prefetch`，所以 tag 发布路径不受影响，只有手动 workflow 自 2026-09-01 起没跑通过（main 上同样失败）。现与 release-desktop 对齐，在 macOS / windows 两个 job 的 PyInstaller 构建前各补一步预取；新增契约测试 `test_packaging_workflows_prefetch_tailnet_modules_before_every_build` 锁定「每个调用 `packaging/build.py` 的 job 之前都必须有 Tailnet 模块预取」，后续再漏加会直接失败。
@@ -42,8 +48,6 @@
 - **补上 B 站扩展任务的 CSRF 门禁**：`GET /api/sources/bili/next-task` 与其它来源的 `next-task` 一样是「pending → in_progress」的领取型 GET，但此前不在 `api/auth.py` 的 `_CSRF_GET_EXACT` 集合里 —— 带 cookie 的跨站顶层导航（`SameSite=Lax` 会随顶层 GET 发送会话 cookie，且 `Sec-Fetch-Site: cross-site` 已使本机免登录 fast path fail-closed）可以在没有 `X-OBC-Auth` 的情况下把一条 pending 的 B 站扩展任务置为 `in_progress`，而扩展永远收不到它，只能等租约回收。现在该路径与其余九个来源一起强制 `X-OBC-Auth`；扩展走 `Authorization: Bearer`（Bearer 豁免 CSRF），不受影响，本机 CLI / 扩展链路无行为变化。同时把 CSRF 回归从手抄路径列表改为**集合相等断言**（`tests/test_api_auth.py`：已注册的 `*/next-task` 路由集合 == `_CSRF_GET_EXACT` 中登记的 claim 路径），后续新增来源漏登记会直接失败，`docs/modules/api-auth.md` 的 CSRF 行同步更正为十个来源。
 
 - **B 站视频信息补分区 id，新增标签读取方法（issue #57 / #232 方向 1）**：`get_video_info()` 补填同一 `/x/web-interface/view` 响应里一直存在、但此前被丢弃的 `tid` / `tid_v2`（零额外请求）；新增 `get_video_tags(bvid, limit=20)`，走 `/x/tag/archive/tags`（网页播放器标签行所用的端点）取标签名，匿名 Cookie 亦可读取，响应远轻于 `/x/web-interface/view/detail`（后者会连带 Card / Related / Reply）。**实测纠正**：2026-09-11 在 8 个分区各取 1 个样本（含 plain `/view` 与 WBI `/x/web-interface/wbi/view` 两种变体）确认 —— 该响应**不含 `tag` 数组**，`tname` / `tname_v2` **恒为空字符串**，因此 `VideoInfo.tags` 在这条路径上保持 `None`，标签只能由 `get_video_tags()` 显式获取；`get_video_info()` 的请求数不变（有回归测试锁定）。集成点（把标签喂给评估 prompt、摇摆区视频才拉标签）留待后续按需接入，本次不改变任何发现/推荐链路行为。
-
-- **修复卸载正在运行的 Windows 桌面版时卸载器自删、无法二次卸载**：Inno 的 `CloseApplications`/Restart Manager 只作用于安装，卸载器对占用文件按非致命错误处理后仍会照常删除开始菜单图标、注册表卸载项与 `unins000.exe` 自身——用户关掉程序后也没有入口重试卸载，只能手删 `%LOCALAPPDATA%\Programs\OpenBiliClaw`。现在 `packaging/entry.py` 为每个冻结进程（托盘主进程与 `--openbiliclaw-worker` 子进程）全程持有一个命名互斥体（`_acquire_installer_mutex`，fail-open，进程退出自动释放），`openbiliclaw.iss` 增设 `AppMutex`，Setup 与 Uninstall 启动即弹标准「检测到 OpenBiliClaw 正在运行」对话框（关闭应用后点 OK 自动重检）；卸载器侧 `[Code] CurUninstallStepChanged(usUninstall)` 复用 `StopRunningInstance` 的 `taskkill /T /F` 兜底——**必须在 AppMutex 门禁之后**执行：Inno 卸载器先跑 `[Code] InitializeUninstall` 事件再做内部互斥体检查（`Setup.Uninstall.pas` `RunSecondPhase` 的既定顺序），把强杀放进 InitializeUninstall 会先杀掉持锁进程、让门禁永远静默通过（真机验证过该反例）；usUninstall 在门禁通过后、删文件前触发，覆盖升级前尚无互斥体的旧安装与孤儿 worker/ollama 子进程。新增互斥体名与 `.iss` 的一致性回归（防两处漂移）及 fail-open / 非冻结守卫单测。真机验证：应用运行中触发卸载即被门禁拦截（卸载日志记录 `Defaulting to Cancel for suppressed message box: Uninstall has detected that OpenBiliClaw is currently running`），应用、文件与卸载入口零改动、退出应用后可重试。
 
 ---
 
