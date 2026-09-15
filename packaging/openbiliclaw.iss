@@ -57,6 +57,15 @@ PrivilegesRequired=lowest
 ; (PyInstaller console apps don't always cooperate with RM).
 CloseApplications=force
 RestartApplications=no
+; Setup AND Uninstall open with the standard "application is running" dialog
+; when the packaged app holds the named mutex created by packaging/entry.py
+; (_acquire_installer_mutex). CloseApplications/Restart Manager above is
+; install-only, and the uninstaller treats locked-file delete errors as
+; non-fatal — without this gate it stranded the locked files, deleted itself,
+; and left no way to retry the uninstall. Older installed builds without the
+; mutex fall through to the CurUninstallStepChanged(usUninstall) taskkill in
+; [Code] (deliberately AFTER the gate — see the ordering note there).
+AppMutex=OpenBiliClaw-B4F3D2A1-7C6E-4A8B-9D1F-0E2A6C5B3D14
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Script lives in packaging\; resolve [Files] Source + OutputDir from repo root.
@@ -115,6 +124,26 @@ begin
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   // Give Windows a moment to release the handles before the file copy begins.
   Sleep(800);
+end;
+
+// Uninstall-side process handoff. PrepareToInstall above only runs in Setup,
+// and Uninstall cannot use Restart Manager (CloseApplications is install-only),
+// so without this the uninstaller hits "file in use" errors — which are
+// non-fatal there: it deletes itself and strands the leftovers.
+//
+// ORDERING IS LOAD-BEARING: Inno runs [Code] InitializeUninstall BEFORE its
+// internal AppMutex check (see RunSecondPhase in Setup.Uninstall.pas), so
+// killing the app there silently destroys the mutex and the "application is
+// running" gate never fires. The kill therefore lives in
+// CurUninstallStepChanged(usUninstall), which runs AFTER the AppMutex gate
+// passed and immediately before file deletion — cleaning up processes the
+// gate cannot see (mutex-less pre-AppMutex installs, orphaned worker/ollama
+// children outliving the tray parent). taskkill is a no-op (nonzero exit,
+// ignored) when nothing is running.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    StopRunningInstance;
 end;
 
 // Runs right before files are copied (both fresh installs and upgrades).

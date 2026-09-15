@@ -4,6 +4,12 @@
 
 ---
 
+## 未发布：Windows 安装/卸载拦截运行中的应用
+
+- **修复卸载正在运行的 Windows 桌面版时卸载器自删、无法二次卸载**：Inno 的 `CloseApplications`/Restart Manager 只作用于安装，卸载器对占用文件按非致命错误处理后仍会照常删除开始菜单图标、注册表卸载项与 `unins000.exe` 自身——用户关掉程序后也没有入口重试卸载，只能手删 `%LOCALAPPDATA%\Programs\OpenBiliClaw`。现在 `packaging/entry.py` 为每个冻结进程（托盘主进程与 `--openbiliclaw-worker` 子进程）全程持有一个命名互斥体（`_acquire_installer_mutex`，fail-open，进程退出自动释放），`openbiliclaw.iss` 增设 `AppMutex`，Setup 与 Uninstall 启动即弹标准「检测到 OpenBiliClaw 正在运行」对话框（关闭应用后点 OK 自动重检）；卸载器侧 `[Code] CurUninstallStepChanged(usUninstall)` 复用 `StopRunningInstance` 的 `taskkill /T /F` 兜底——**必须在 AppMutex 门禁之后**执行：Inno 卸载器先跑 `[Code] InitializeUninstall` 事件再做内部互斥体检查（`Setup.Uninstall.pas` `RunSecondPhase` 的既定顺序），把强杀放进 InitializeUninstall 会先杀掉持锁进程、让门禁永远静默通过（真机验证过该反例）；usUninstall 在门禁通过后、删文件前触发，覆盖升级前尚无互斥体的旧安装与孤儿 worker/ollama 子进程。新增互斥体名与 `.iss` 的一致性回归（防两处漂移）及 fail-open / 非冻结守卫单测。真机验证：应用运行中触发卸载即被门禁拦截（卸载日志记录 `Defaulting to Cancel for suppressed message box: Uninstall has detected that OpenBiliClaw is currently running`），应用、文件与卸载入口零改动、退出应用后可重试。
+
+---
+
 ## 未发布：修复手动桌面安装包 workflow 的 Tailnet 模块预取缺失
 
 - **修复 `build-installers.yml` 自嵌入式 tailnet 宿主合入起必然失败（发现于 PR #249 的 Windows 安装器实测）**：`7f3b7e35` 给两个平台 job 加了 `actions/setup-go`，但没有把 tailnet 依赖预取进 Go module cache，而 `packaging/build.py` 会以 `GOPROXY=off`（离线、可复现）调起 `scripts/generate_tailnet_notices.py --check`；于是 `go list -tags=ts_omit_logtail,ts_omit_webclient -deps -json .` 在 tailscale.com v1.102.3 新增的 `github.com/tailscale/peercred`（unix 凭据文件）上直接 `module lookup disabled by GOPROXY=off`，PyInstaller 还没开始 job 就红了——`release-desktop.yml` 的两个 job 一直有 `python scripts/generate_tailnet_notices.py --prefetch`，所以 tag 发布路径不受影响，只有手动 workflow 自 2026-09-01 起没跑通过（main 上同样失败）。现与 release-desktop 对齐，在 macOS / windows 两个 job 的 PyInstaller 构建前各补一步预取；新增契约测试 `test_packaging_workflows_prefetch_tailnet_modules_before_every_build` 锁定「每个调用 `packaging/build.py` 的 job 之前都必须有 Tailnet 模块预取」，后续再漏加会直接失败。
