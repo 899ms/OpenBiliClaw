@@ -71,14 +71,20 @@ def test_inno_installer_sets_numeric_file_version_resource() -> None:
     assert "VersionInfoProductVersion={#MyAppVersionInfoVersion}" in script
 
 
-def test_inno_installer_always_restarts_freshly_installed_executable() -> None:
+def test_inno_installer_silent_upgrade_hands_off_to_fresh_executable() -> None:
+    """Silent installs/upgrades must still hand off to the freshly installed exe.
+
+    Interactive installs are now an opt-in Finish-page checkbox (covered by
+    tests/test_installer_script.py); /SILENT and /VERYSILENT have no wizard, so
+    the unconditional handoff v0.3.182 added must survive on that path.
+    """
     script = (Path(__file__).resolve().parent.parent / "packaging" / "openbiliclaw.iss").read_text(
         encoding="utf-8"
     )
     run_entry = next(
         line
         for line in script.splitlines()
-        if line.startswith('Filename: "{app}\\{#MyAppExeName}"')
+        if line.startswith('Filename: "{app}\\{#MyAppExeName}"') and "skipifnotsilent" in line
     )
 
     assert 'WorkingDir: "{app}"' in run_entry
@@ -523,6 +529,43 @@ def test_macos_packaging_workflows_run_installer_handoff_e2e(workflow_name: str)
 
     assert 'pip install -e ".[packaging]" "pytest>=8"' in workflow
     assert "python -m pytest -q tests/test_macos_installer_e2e.py" in workflow
+
+
+@pytest.mark.parametrize(
+    "workflow_name",
+    ["release-desktop.yml", "build-installers.yml"],
+)
+def test_packaging_workflows_prefetch_tailnet_modules_before_every_build(
+    workflow_name: str,
+) -> None:
+    """Every PyInstaller job must warm the offline Go module cache first.
+
+    packaging/build.py invokes scripts/generate_tailnet_notices.py with
+    GOPROXY=off, so a job that only sets up Go fails with "module lookup
+    disabled by GOPROXY=off" before PyInstaller even starts.
+    """
+    lines = (
+        (Path(__file__).resolve().parent.parent / ".github" / "workflows" / workflow_name)
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+
+    builds = [index for index, line in enumerate(lines) if "packaging/build.py" in line]
+    prefetches = [
+        index
+        for index, line in enumerate(lines)
+        if "generate_tailnet_notices.py --prefetch" in line
+    ]
+
+    assert builds, f"{workflow_name} no longer invokes packaging/build.py"
+    remaining = list(prefetches)
+    for build in builds:
+        earlier = [index for index in remaining if index < build]
+        assert earlier, (
+            f"{workflow_name}: packaging/build.py at line {build + 1} has no "
+            "preceding Tailnet module prefetch step"
+        )
+        remaining.remove(earlier[-1])
 
 
 def test_manual_installer_workflow_uses_official_macos_ollama_bundle() -> None:

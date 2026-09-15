@@ -1680,6 +1680,52 @@ def test_batch_expression_prompt_carries_body_text_in_user_only() -> None:
     assert "TWEET_BODY_MARKER" not in system
 
 
+_TEMPORAL_EXPRESSION_CONTENT = {
+    "title": "2024 年的老片重映",
+    "up_name": "某UP",
+    "published_at": "2024-05-01T12:00:00Z",
+    "published_label": "2024-05-01",
+    "evaluated_at": "2026-01-02T03:04:05Z",
+}
+
+
+def test_recommendation_expression_prompt_carries_temporal_grounding() -> None:
+    messages = build_recommendation_expression_prompt(
+        profile_summary={"a": 1},
+        content_summary=dict(_TEMPORAL_EXPRESSION_CONTENT),
+        tone_profile=None,
+        source_platform="bilibili",
+    )
+    system, user = messages[0]["content"], messages[1]["content"]
+
+    assert "2024-05-01T12:00:00Z" in user
+    assert "2024-05-01" in user
+    assert "2026-01-02T03:04:05Z" in user
+    # The evaluation clock must never leak into the static cached prefix.
+    assert "2024-05-01T12:00:00Z" not in system
+    assert "2026-01-02T03:04:05Z" not in system
+    # Static rule: only the supplied fields may be used for freshness.
+    assert "content_summary.evaluated_at" in system
+    assert "评估这条内容时的权威当前时间" in system
+
+
+def test_batch_expression_prompt_carries_per_item_temporal_grounding() -> None:
+    messages = build_batch_expression_prompt(
+        profile_summary={"a": 1},
+        content_items=[dict(_TEMPORAL_EXPRESSION_CONTENT)],
+        tone_profile=None,
+        source_platform="bilibili",
+    )
+    system, user = messages[0]["content"], messages[1]["content"]
+
+    assert "2024-05-01T12:00:00Z" in user
+    assert "2026-01-02T03:04:05Z" in user
+    assert "2024-05-01T12:00:00Z" not in system
+    assert "2026-01-02T03:04:05Z" not in system
+    assert "evaluated_at" in system
+    assert "评估该条内容时的权威当前时间" in system
+
+
 # ----------------------------------------------------------------------
 # Discover backpressure P1.4: merged multi-platform keyword builder + parser.
 

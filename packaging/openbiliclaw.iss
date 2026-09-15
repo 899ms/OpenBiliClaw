@@ -90,11 +90,19 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; Always launch the executable we just installed. This is intentionally not a
-; postinstall checkbox and is not skipped for silent upgrades: PrepareToInstall
-; stopped the old process tree, so a successful setup must hand off to the
-; freshly written {app} binary instead of leaving the old version running.
-Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Flags: nowait
+; Interactive installs: a checked "Launch OpenBiliClaw" checkbox on the Finish
+; page. The app starts only when the user clicks Finish — never while the
+; wizard is still open — and the user may uncheck it to not launch at all.
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: postinstall nowait skipifsilent
+; Silent installs/upgrades (/SILENT, /VERYSILENT): no Finish page is shown, but
+; the postinstall entry above WOULD still run — the wizard auto-clicks through
+; the hidden Finished page — so skipifsilent holds it back and this mirror entry
+; takes over. PrepareToInstall stopped the old process tree, so a successful
+; silent setup must hand off to the freshly written {app} binary instead of
+; leaving nothing running (the upgrade regression that originally forced an
+; unconditional launch here). Both skip flags are load-bearing: an unscoped
+; entry would launch the app twice on a silent install.
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Flags: nowait skipifnotsilent
 
 ; NOTE: user data (config.toml, data\, logs\) lives under
 ; %USERPROFILE%\OpenBiliClaw, the same root used by the one-line / AI installers,
