@@ -338,6 +338,14 @@ _NEGATIVE_REACTIONS = frozenset({"thumbs_down"})
 # direct signal of like / dislike.
 _PASSIVE_BROWSE_EVENT_TYPES = frozenset({"snapshot", "scroll", "hover", "search", "reshuffle"})
 
+# Collector events that are persisted for context / observability but must
+# never become profile evidence. Deliberately NOT the same set as
+# ``_PASSIVE_BROWSE_EVENT_TYPES`` above: ``search`` is satisfaction-neutral
+# yet is a genuine intent signal (0.5 strength, consumed by the SURFACE
+# updater), so it must keep flowing into the profile pipeline. ``pause`` /
+# ``seek`` are playback mechanics with no default strength or action label.
+NON_PROFILE_EVENT_TYPES = frozenset({"hover", "scroll", "snapshot", "reshuffle", "pause", "seek"})
+
 
 def classify_event_satisfaction(event: dict[str, Any]) -> tuple[SatisfactionCategory, str]:
     """Return ``(category, reason)`` describing whether the user enjoyed this event.

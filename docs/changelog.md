@@ -4,6 +4,12 @@
 
 ---
 
+## 未发布：上下文事件不再进入画像证据
+
+- **修复 hover / scroll / snapshot / reshuffle / pause / seek 等上下文事件被当成画像证据**：这些插件采集事件此前会随 generic durable 路径生成 `ProfileSignal`、写入 layer buffer 并交给 speculator，但它们只是活动时间线与诊断用的上下文，不应影响口味画像。现在 `sources/event_format.py` 新增 `NON_PROFILE_EVENT_TYPES`，`soul/pipeline.py` 在 `_enqueue_batch_locked` 中先识别并跳过这些信号：durable event 行保留、consumer cursor 照常推进（不阻塞后续事件、重启可恢复），但不 buffer、不触发 layer updater、不进入 speculator。`search` 特意不在集合内（满足度中性但属真实意图信号，继续按 0.5 强度进入 SURFACE updater），`view` 也继续作为画像证据。新增回归：六类事件参数化「零接受 / 零 buffer / cursor 不倒退」、`search` + `view` 仍被接受，以及 SoulEngine 层「消费 6 行 context-only + 1 行 view，cursor 推进 7、只 buffer view」的 durable 路径测试。
+
+---
+
 ## 未发布：Windows 安装/卸载拦截运行中的应用
 
 - **修复卸载正在运行的 Windows 桌面版时卸载器自删、无法二次卸载**：Inno 的 `CloseApplications`/Restart Manager 只作用于安装，卸载器对占用文件按非致命错误处理后仍会照常删除开始菜单图标、注册表卸载项与 `unins000.exe` 自身——用户关掉程序后也没有入口重试卸载，只能手删 `%LOCALAPPDATA%\Programs\OpenBiliClaw`。现在 `packaging/entry.py` 为每个冻结进程（托盘主进程与 `--openbiliclaw-worker` 子进程）全程持有一个命名互斥体（`_acquire_installer_mutex`，fail-open，进程退出自动释放），`openbiliclaw.iss` 增设 `AppMutex`，Setup 与 Uninstall 启动即弹标准「检测到 OpenBiliClaw 正在运行」对话框（关闭应用后点 OK 自动重检）；卸载器侧 `[Code] CurUninstallStepChanged(usUninstall)` 复用 `StopRunningInstance` 的 `taskkill /T /F` 兜底——**必须在 AppMutex 门禁之后**执行：Inno 卸载器先跑 `[Code] InitializeUninstall` 事件再做内部互斥体检查（`Setup.Uninstall.pas` `RunSecondPhase` 的既定顺序），把强杀放进 InitializeUninstall 会先杀掉持锁进程、让门禁永远静默通过（真机验证过该反例）；usUninstall 在门禁通过后、删文件前触发，覆盖升级前尚无互斥体的旧安装与孤儿 worker/ollama 子进程。新增互斥体名与 `.iss` 的一致性回归（防两处漂移）及 fail-open / 非冻结守卫单测。真机验证：应用运行中触发卸载即被门禁拦截（卸载日志记录 `Defaulting to Cancel for suppressed message box: Uninstall has detected that OpenBiliClaw is currently running`），应用、文件与卸载入口零改动、退出应用后可重试。
