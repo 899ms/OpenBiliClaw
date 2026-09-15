@@ -122,3 +122,4 @@ Provider openai_compatible is cooling down after rate limit.
 - [x] Phase 4（完整）：`OPENBILICLAW_WORKER=1` 自动拉起 full worker，worker 构建完整 RuntimeContext 并运行全部周期性后台任务；API 进程在 full worker 模式下跳过自身后台循环。
 - [x] Phase 4（完整·事件处理）：full worker 同时运行 app-owned profile/feedback event-processing 调度，API 进程不再启动 event/feedback 后台任务。
 - [x] Phase 4（可观测）：worker 通过 `data/runtime/worker_status.json` 心跳暴露到 `/api/runtime-status`（`worker_running` / `worker_mode` / `worker_pid` / 上次心跳与年龄）。
+- [x] 后续修复（2026-09-14，issue #250）：worker / discovery_worker 在无可用 LLM 配置时探针重试并保持心跳（不再崩溃弹窗），桌面父进程新增 `ChildProcessSupervisor` 崩溃重启，`recommendation_server` 探针门后再起服务，子进程未捕获异常只写日志 + `SystemExit(1)`；补 `tests/test_worker_degraded_boot.py`、`tests/test_proc_supervisor.py`。

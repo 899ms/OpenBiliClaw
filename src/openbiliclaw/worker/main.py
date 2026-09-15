@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 import asyncio
@@ -38,6 +39,10 @@ DEFAULT_MAX_MUTATIONS_PER_BATCH = 50
 DEFAULT_SNAPSHOT_CANDIDATE_LIMIT = 400
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
 DEFAULT_SERVE_PUBLISH_INTERVAL_SECONDS = 20.0
+# Retry cadence while the on-disk config cannot build any LLM instance yet.
+# The probe only constructs the registry (no network) and re-reads
+# config.toml on every attempt, so saving a usable key is picked up in-place.
+DEFAULT_LLM_PROBE_RETRY_SECONDS = 15.0
 
 
 async def _drain_serve_outbox(database: Database, runtime_dir: Path) -> None:
@@ -202,6 +207,61 @@ async def run_maintenance_worker(
         database.close()
 
 
+async def _wait_for_llm_registry(
+    *,
+    retry_interval_seconds: float | None = None,
+    probe: Callable[[], None] | None = None,
+) -> None:
+    """Wait until the on-disk config builds at least one usable LLM instance.
+
+    A desktop/CLI launch whose config has no buildable LLM instance used to
+    crash this worker before it ever served a heartbeat: windowed builds popped
+    a PyInstaller error dialog, and after the user later saved a valid key the
+    background loops stayed dead until restart. The probe only constructs the
+    registry (no network calls) and re-reads ``config.toml`` on every attempt,
+    so a key saved from the setup wizard is picked up without a restart.
+    """
+    from openbiliclaw.llm.registry import RegistryBuildError, build_llm_registry
+
+    retry_interval = (
+        DEFAULT_LLM_PROBE_RETRY_SECONDS
+        if retry_interval_seconds is None
+        else float(retry_interval_seconds)
+    )
+    probe_fn = probe
+    if probe_fn is None:
+
+        def _default_probe() -> None:
+            build_llm_registry(load_config())
+
+        probe_fn = _default_probe
+
+    waiting_logged = False
+    while True:
+        try:
+            await asyncio.to_thread(probe_fn)
+            if waiting_logged:
+                logger.info("LLM registry builds again; starting full worker")
+            return
+        except RegistryBuildError as exc:
+            if not waiting_logged:
+                logger.warning(
+                    "Full worker is waiting for a buildable LLM configuration (%s); "
+                    "retrying every %.0fs while keeping the heartbeat alive",
+                    exc,
+                    retry_interval,
+                )
+                waiting_logged = True
+        except Exception:
+            logger.exception(
+                "Full worker LLM probe failed unexpectedly; retrying in %.0fs",
+                retry_interval,
+            )
+        # Floor keeps a misconfigured zero interval from hot-spinning; the
+        # production default is 15s (tests inject a tiny interval).
+        await asyncio.sleep(max(0.05, retry_interval))
+
+
 async def run_full_worker() -> None:
     """Run a full RuntimeContext background worker in a separate process.
 
@@ -230,6 +290,12 @@ async def run_full_worker() -> None:
     feedback_scheduler: EventProcessingScheduler | None = None
     ctx = None
     try:
+        # Degraded boot: never let a missing/invalid LLM config kill the
+        # process. Waiting with a live heartbeat lets the API report the
+        # worker as alive (degraded) and lets the user fix config.toml in the
+        # setup wizard without restarting the app.
+        await _wait_for_llm_registry()
+        config = load_config()
         ctx = build_runtime_context(config)
         await ctx.restart_background_tasks(app)
         logger.info("Full worker background tasks started")

@@ -3155,6 +3155,9 @@ def create_app(
             or os.environ.get("OPENBILICLAW_WORKER", "").strip() == "1"
         )
         if full_worker_active:
+            warn_stale_worker = getattr(ctx, "warn_if_full_worker_heartbeat_stale", None)
+            if callable(warn_stale_worker):
+                warn_stale_worker()
             logger.info(
                 "External full worker active; API periodic and event-processing loops delegated"
             )

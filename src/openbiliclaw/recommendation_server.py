@@ -2,11 +2,19 @@
 
 Uses a Unix domain socket on POSIX platforms.  Windows asyncio/uvicorn cannot
 create Unix sockets, so the Windows build binds a loopback TCP port instead.
+
+Like the full worker, this process now waits out a config that cannot build an
+LLM instance (fresh install / broken key) instead of serving from a degraded
+context forever: once the user saves a usable key it starts the real API, so
+recommendation endpoints recover without restarting the desktop app.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import time
+from typing import TYPE_CHECKING
 
 import uvicorn
 
@@ -19,8 +27,54 @@ from openbiliclaw.recommendation_runtime import (
     recommendation_sock_from_data_path,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
+
+# Retry cadence while the config cannot build an LLM registry (construction
+# only, no network). Re-reads config.toml on every attempt.
+DEFAULT_LLM_PROBE_RETRY_SECONDS = 15.0
+
+
+def _probe_llm_registry() -> None:
+    """Build the LLM registry from the current on-disk config."""
+    from openbiliclaw.llm.registry import build_llm_registry
+
+    build_llm_registry(load_config())
+
+
+def wait_for_buildable_llm(
+    *,
+    retry_interval_seconds: float = DEFAULT_LLM_PROBE_RETRY_SECONDS,
+    probe: Callable[[], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Block until config.toml builds at least one usable LLM instance."""
+    probe_fn = probe or _probe_llm_registry
+    retry_interval = max(1.0, float(retry_interval_seconds))
+    waiting_logged = False
+    while True:
+        try:
+            probe_fn()
+            if waiting_logged:
+                logger.info("Recommendation server LLM configuration recovered; starting API")
+            return
+        except Exception as exc:
+            if not waiting_logged:
+                logger.warning(
+                    "Recommendation server is waiting for a buildable LLM "
+                    "configuration (%s); retrying every %.0fs",
+                    exc,
+                    retry_interval,
+                )
+                waiting_logged = True
+            sleep(retry_interval)
+
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    wait_for_buildable_llm()
     app = create_app()
     recommendation_port = os.environ.get(RECOMMENDATION_PORT_ENV, "").strip()
     if os.name == "nt" or recommendation_port:
