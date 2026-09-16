@@ -687,6 +687,13 @@ def test_main_uses_configured_api_host_when_env_host_unset(
     monkeypatch.setenv("OPENBILICLAW_WORKER", "0")
 
     class _DummyProc:
+        @property
+        def pid(self) -> int:
+            return 4242
+
+        def poll(self) -> int | None:
+            return None
+
         def terminate(self) -> None:
             pass
 
@@ -806,6 +813,13 @@ def test_main_opens_setup_after_repairing_unloadable_config(
     monkeypatch.setenv("OPENBILICLAW_WORKER", "0")
 
     class _DummyProc:
+        @property
+        def pid(self) -> int:
+            return 4242
+
+        def poll(self) -> int | None:
+            return None
+
         def terminate(self) -> None:
             pass
 
@@ -842,9 +856,17 @@ def test_main_opens_setup_after_repairing_unloadable_config(
             self._target = target
             self._args = args
             self._kwargs = kwargs or {}
+            self._name = name
 
         def start(self) -> None:
+            # Run the landing-page thread inline, but never execute the child
+            # supervisor's watchdog loop (it would block the test forever).
+            if self._name == "obc-child-supervisor":
+                return
             self._target(*self._args, **self._kwargs)
+
+        def join(self, timeout: float | None = None) -> None:
+            pass
 
     monkeypatch.setattr(entry.threading, "Thread", _InlineThread)
 
@@ -901,6 +923,13 @@ def test_main_disables_uvicorn_access_log_in_tray_mode(
     monkeypatch.setenv("OPENBILICLAW_WORKER", "0")
 
     class _DummyProc:
+        @property
+        def pid(self) -> int:
+            return 4242
+
+        def poll(self) -> int | None:
+            return None
+
         def terminate(self) -> None:
             pass
 
