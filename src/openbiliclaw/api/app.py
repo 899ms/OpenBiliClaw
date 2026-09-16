@@ -7402,6 +7402,8 @@ def create_app(
         from openbiliclaw.config import load_config
 
         raw_mid = payload.get("mid")
+        if raw_mid is None:
+            raise HTTPException(status_code=400, detail="缺少 mid")
         try:
             mid = int(raw_mid)
         except (TypeError, ValueError) as exc:
