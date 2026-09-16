@@ -12,7 +12,10 @@ from openbiliclaw.soul.event_prompt_views import (
     build_cognition_event_view_v1,
     normalize_cognition_input_view,
 )
-from openbiliclaw.soul.profile_views import build_cognition_profile_view_v1
+from openbiliclaw.soul.profile_views import (
+    build_cognition_profile_view_v1,
+    preference_prompt_payload,
+)
 
 if TYPE_CHECKING:
     from openbiliclaw.soul.tone import ToneProfile
@@ -250,7 +253,7 @@ def render_preference_summary(preference_summary: dict[str, object]) -> str:
     """Render preference summary into stable text."""
     if not preference_summary:
         return "（暂无偏好摘要）"
-    return json.dumps(preference_summary, ensure_ascii=False, indent=2)
+    return json.dumps(preference_prompt_payload(preference_summary), ensure_ascii=False, indent=2)
 
 
 def _category_vocab_line() -> str:
@@ -359,6 +362,10 @@ def build_preference_analysis_prompt(
     """
     from openbiliclaw.sources.event_format import render_retraction_marked_events
 
+    # Storage bookkeeping (the incremental decay cursor) is not model input:
+    # dropping it keeps the prompt byte-identical to the pre-cursor payload and
+    # out of the ``max_prompt_chars`` chunking decision.
+    existing_preference = preference_prompt_payload(existing_preference)
     system_prompt = _PREFERENCE_ANALYSIS_SYSTEM_PROMPT
     selected_view = normalize_cognition_input_view(input_view)
     rendered_events = render_retraction_marked_events(events)
@@ -458,6 +465,7 @@ def build_soul_profile_prompt(
     source_platform_mix: dict[str, float] | None = None,
 ) -> list[dict[str, str]]:
     """Build a cache-friendly prompt for initial soul-profile generation."""
+    preference_summary = preference_prompt_payload(preference_summary)
     system_prompt = """
 <task>
 你要生成一份人格画像。你是用户的老朋友,正坐在 ta 对面,直接跟 ta 说"你是这样一个人"。
@@ -834,6 +842,7 @@ def build_awareness_prompt(
     """Build a structured prompt for recent awareness-note generation."""
     from openbiliclaw.sources.event_format import render_retraction_marked_events
 
+    preference_summary = preference_prompt_payload(preference_summary)
     selected_view = normalize_cognition_input_view(input_view)
     rendered_events = render_retraction_marked_events(events)
     if selected_view == "compact-v1":
@@ -990,6 +999,7 @@ def build_awareness_with_confusions_prompt(
     """
     from openbiliclaw.sources.event_format import render_retraction_marked_events
 
+    preference_summary = preference_prompt_payload(preference_summary)
     selected_view = normalize_cognition_input_view(input_view)
     rendered_events = render_retraction_marked_events(events)
     if selected_view == "compact-v1":
@@ -1141,6 +1151,7 @@ def build_insight_prompt(
     instead of regenerating from the full awareness history every time.
     See rules 5 / 6 below.
     """
+    preference_summary = preference_prompt_payload(preference_summary)
     selected_view = normalize_cognition_input_view(input_view)
     if selected_view == "compact-v1":
         profile_view = build_cognition_profile_view_v1(

@@ -62,6 +62,7 @@
 | 分类词表 + 一次性迁移 | ✅ | `soul/taxonomy.py` 定义 19 项固定一级分类词表 `CATEGORY_VOCAB`（含「其他」，代码常量非 config），`resolve_category()` 按精确命中 → embedding 最近邻（≥0.55）→「其他」解析；`CategoryMigrator` 用一次 LLM 映射把存量自由分类迁移到词表，代码校验完整覆盖且目标必须在词表内，失败零写入；应用前写 `consolidation_runs/<run_id>.json`（`kind=category_migration`）并追加 `soul_changelog.md`，复用 `profile-consolidate --revert` 回滚 |
 | ProfileConsolidator（12h 画像整理） | ✅ | LLM 整理合并重复的喜欢 / 讨厌主题：规则层同名同类合并（零成本）；同名异类构造独占的强制嫌疑簇送 LLM 裁决（同名异义防护，no-merge 用 `name::category` 限定键）→ likes 以 embedding + 词面重叠构造相似图并取连通分量，不再用“首成员命中即占用”的贪心分组；默认跨类候选阈值 ≥0.80、同一 category 的二级兴趣再放宽 0.04，超库存按水位压力最低到 0.72，dislikes 保持严格 ≥0.85。跨 category 的词面召回只接受包含关系，避免“游戏资讯 / 科技资讯”靠通用后缀串成大簇；无 embedding 仍可走同一保守词面图。no-merge 会切断已判 distinct 的边但不遮住成员的新邻居，且以 `known_distinct_pairs` 进入 prompt 与代码校验，禁止经传递路径重新合并；策略版本升级只清理旧“严格同义词”口径的模型 keep，用户显式 revert 的 pair 单独保护，旧状态也可从 run snapshot + changelog 恢复。分批 LLM（每批 32 簇）按“是否重复占用同一推荐意图”输出 merge/keep：像“搞笑 / 娱乐搞笑”可合并，真正改变召回范围的父子兴趣仍保留；代码继续校验 members 逐字存在、簇内全覆盖、canonical 禁裸大词与避雷严禁向上泛化。单批失败不阻断其它批，但只要存在失败 / 缺失 / 非法响应就不写 clean digest，下一 due tick 会重试相同输入；完成日志带 `retry_pending`。LLM canonical 优先选能覆盖整组的简洁旧 member，写回时保留原词到 `aliases`，后续增量命中 alias 会强化 canonical。覆盖范围默认为 likes 权重 top-512 + 全量避雷；active likes 超过 `profile_consolidation_like_target_upper` 时临时开 full boundary，合并后仍超上限则把低权重且非用户保护的长尾移入 `archived_interests`，新信号可复活；`profile-consolidate --full` 仍可手动全量整理。embedding + LLM 窗口结束、真正写入前会对 active / archived / dislikes 做完整 revision 校验；若 preference analyzer 同期落入新证据，本轮零写入、零状态推进并让下一 tick 重试，避免旧快照覆盖新兴趣。改 flat preference 后经 `populate_from_flat_preference` 重建 Onion 树，且先 remap `profile_overrides.json` 再刷新有效画像镜像；应用记录在 `consolidation_runs/<run_id>.json`，同时备份原始 flat preference、完整 raw `soul.json` 与被改动的 overrides，再追加 `soul_changelog.md`；新记录的 `revert(run_id)` 会精确恢复原始 Soul 树及有效画像镜像，旧记录仍兼容按 flat preference 重建，并固定被回滚 pair。由 pipeline tick 调度（默认 12h），应用后发 `profile_consolidation` 认知更新卡片 |
 | 画像整理成员引用兼容（2026-09-16） | ✅ | 普通 likes 整理簇同时接受字符串和 `{name, category}` 成员引用，避免模型按输入对象原样返回时被误判为 unknown member；同名异类簇仍强制使用 `name::category` 分类限定键。 |
+| 画像证据与衰减一致性（2026-09-16） | ✅ | 增量画像只把本轮 `last_seen` 变化的兴趣计为新生命周期证据，保留项不再虚增 `evidence_count` 或复活；偏好权重用持久化 `last_decay_at` 增量衰减，同一快照重复处理与按日分批处理结果一致。 |
 | SoulEngine.get_effective_disliked_topics() | ✅ | base（raw soul.interest.dislikes ∪ raw preference.disliked_topics）再套覆盖层 remove/add（remove 最后生效），供推荐 / delight 最终过滤，用户移除项不被 raw 反向打穿；`get_profile()` 会在 Soul 重建前把该快照覆盖进有效画像 |
 | SoulEngine.apply_user_edit() | ✅ | 折叠一次确定性编辑：存覆盖层 → 同步正向/避雷两套 speculator → 记 `source=manual` cognition → 重渲染有效画像镜像并通知两端 → 新增 dislike 按编辑前后差集把 `purge_pool_for_new_dislikes` 清池**调度为 `asyncio` 后台 detached 任务**（embedding 召回 + LLM 分类耗时数十秒，绝不能阻塞编辑响应，否则前端看着像「加了没保存」；`_schedule_dislike_purge` 派发，`wait_for_pending_edits()` 供测试 / 优雅关闭等待） |
 | AwarenessAnalyzer | ✅ | 近期事件 → `AwarenessNote` 列表，支持同日去重；解析 LLM 响应时复用 `llm.json_utils.extract_llm_json_list()`，兼容 `results/items/notes/data/observations/recent_observations/latest/latest_observations` 等 object-wrapped array、reasoning 模型 bare singular-note dict、wrapper-key 下单 note、fenced JSON、JSONL 和 MiMo malformed `{ [ ... ] }`；prompt 按画像 → 偏好 → 近期事件排序以保留缓存前缀，并把近期 `dislike` / `thumbs_down` / negative 事件视为“最近开始避开 X”的保守观察信号 |
@@ -556,7 +557,7 @@ GitHub bootstrap signals 由后端官方 REST client 读取公开 starred reposi
 `PreferenceAnalyzer.merge_preferences()` 当前有几条很具体的规则：
 
 - 兴趣按 `(name, category)` 作为唯一键合并
-- 老兴趣会先做时间衰减：`weight × 0.9^weeks`
+- 老兴趣会先做时间衰减：`weight × 0.9^weeks`；`weeks` 从持久化的 `last_decay_at`（旧数据回退 `last_seen`）增量计算，衰减后把基准推进到本轮时间，因此重复处理同一快照不会再次扣权重
 - 衰减后若低于 `0.05`，该兴趣会被丢弃
 - 同名兴趣再次出现时：
   - `first_seen` 保留最早值
@@ -1123,6 +1124,8 @@ assert DEFAULT_PREFERENCE_EVENT_CHUNK_SIZE * MAX_CONCURRENT_PREFERENCE_CHUNKS ==
 #   "disliked_topics": ["低质标题党"],
 # }
 ```
+
+`interests` 的内部持久化记录可能包含 `last_decay_at`。它是权重衰减游标，不是新的用户行为时间；真正的行为新鲜度仍由 `last_seen` 表示。生命周期覆盖在接收完整合并快照时，只把新增项或 `last_seen` 发生变化的项视为本轮证据，未触及的保留项沿用原有 `state / evidence_count / last_evidence_at`。该游标不会进入任何 LLM prompt：`profile_views.preference_prompt_payload()` 在偏好分析 / 觉察 / 洞察 / 灵魂画像五条 prompt（前四条的 legacy 与 compact-v1 两条视图）与 `render_preference_summary` 里统一剔除它（它每次合并都会变化，序列化只会吃 prompt 预算并影响偏好分析的分块判定）；无游标的输入仍渲染出逐字节相同的 prompt。
 
 ### 分类词表与一次性迁移
 

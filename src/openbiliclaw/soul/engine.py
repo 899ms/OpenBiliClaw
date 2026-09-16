@@ -1023,13 +1023,14 @@ class SoulEngine:
         """Overlay topic-lifecycle metadata onto a freshly analysed preference.
 
         Carries lifecycle fields forward from ``existing_preference`` and counts
-        this analysis as one unit of evidence per surviving/new topic (new →
-        trial; sustained → active; dormant → active). Best-effort: any failure
-        is logged at DEBUG and never breaks the analysis path. Each transition
-        is recorded to the ledger (write point ``topic_lifecycle``).
+        this analysis only for topics whose ``last_seen`` changed (new → trial;
+        sustained → active; dormant → active). Retained topics are not fresh
+        evidence. Best-effort: any failure is logged at DEBUG and never breaks
+        the analysis path. Each transition is recorded to the ledger (write
+        point ``topic_lifecycle``).
         """
         try:
-            from openbiliclaw.soul.topic_lifecycle import apply_evidence
+            from openbiliclaw.soul.topic_lifecycle import apply_evidence, changed_interest_keys
 
             existing_interests = [
                 item for item in existing_preference.get("interests", []) if isinstance(item, dict)
@@ -1037,7 +1038,12 @@ class SoulEngine:
             updated_interests = updated_preference.get("interests")
             if not isinstance(updated_interests, list):
                 return
-            merged, transitions = apply_evidence(existing_interests, updated_interests)
+            evidence_keys = changed_interest_keys(existing_interests, updated_interests)
+            merged, transitions = apply_evidence(
+                existing_interests,
+                updated_interests,
+                evidence_keys=evidence_keys,
+            )
             updated_preference["interests"] = merged
             for tr in transitions:
                 self._ledger.record(

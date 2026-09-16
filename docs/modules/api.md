@@ -4,6 +4,10 @@
 
 `src/openbiliclaw/api/` 暴露本地 FastAPI 契约，并把 UI 请求编排到 durable storage、Soul、Dialogue 与 runtime。本文记录配置、迁移、推荐和对话等公开端点；通用鉴权见 [api-auth.md](api-auth.md)，初始化端点见 [init.md](init.md)。
 
+## 推荐通知测试生命周期
+
+`POST /api/recommendations/append` 会在响应关键路径外安排推荐池状态通知。验证该通知的测试使用 `httpx.AsyncClient` + `ASGITransport`，让请求和有界异步等待共享 pytest 的事件循环；不得在请求级同步 `TestClient` portal 已关闭后用阻塞等待验证后台任务。追加推荐回归覆盖无延迟及 50ms 状态读取延迟，并保持完整响应与通知内容断言。生产接口、通知调度及应用启动流程不变。
+
 ## B 站评论展示字段
 
 `GET /api/bilibili/video/comments` 的每条评论除作者、正文和点赞数外，返回 `ctime`（Unix 秒）、`reply_count` 和 `avatar`，供原生客户端显示本地日期、回复数量和头像。时间文本由客户端格式化，后端不输出语言相关日期字符串。

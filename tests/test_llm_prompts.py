@@ -1409,6 +1409,105 @@ def test_preference_analysis_system_prompt_contains_full_vocab() -> None:
     assert "category 必须" in system
 
 
+def test_prompt_builders_strip_the_interest_decay_cursor() -> None:
+    """``last_decay_at`` is storage bookkeeping, not prompt input.
+
+    It moves on every merge and says nothing about user behaviour, so it must
+    not spend prompt budget, shift the preference analyzer's
+    ``max_prompt_chars`` chunking decision, or perturb prompt-cache prefixes.
+    """
+    from openbiliclaw.llm.prompts import (
+        build_awareness_prompt,
+        build_awareness_with_confusions_prompt,
+        build_insight_prompt,
+        build_preference_analysis_prompt,
+        build_soul_profile_prompt,
+        render_preference_summary,
+    )
+
+    interest = {
+        "name": "滑雪",
+        "category": "体育",
+        "weight": 0.8,
+        "first_seen": "2026-09-01T00:00:00",
+        "last_seen": "2026-09-01T00:00:00",
+        "source": "browse",
+    }
+    persisted = {"interests": [{**interest, "last_decay_at": "2026-09-08T00:00:00"}]}
+    cleaned = {"interests": [interest]}
+    events = [{"event_type": "view", "title": "标题"}]
+
+    for view in ("legacy", "compact-v1"):
+        messages = [
+            build_preference_analysis_prompt(
+                events=events,
+                existing_preference=persisted,
+                input_view=view,
+            ),
+            build_awareness_prompt(
+                events=events,
+                preference_summary=persisted,
+                soul_profile={},
+                input_view=view,
+            ),
+            build_awareness_with_confusions_prompt(
+                events=events,
+                preference_summary=persisted,
+                soul_profile={},
+                input_view=view,
+            ),
+            build_insight_prompt(
+                awareness_notes=[],
+                preference_summary=persisted,
+                soul_profile={},
+                input_view=view,
+            ),
+        ]
+        baselines = [
+            build_preference_analysis_prompt(
+                events=events,
+                existing_preference=cleaned,
+                input_view=view,
+            ),
+            build_awareness_prompt(
+                events=events,
+                preference_summary=cleaned,
+                soul_profile={},
+                input_view=view,
+            ),
+            build_awareness_with_confusions_prompt(
+                events=events,
+                preference_summary=cleaned,
+                soul_profile={},
+                input_view=view,
+            ),
+            build_insight_prompt(
+                awareness_notes=[],
+                preference_summary=cleaned,
+                soul_profile={},
+                input_view=view,
+            ),
+        ]
+
+        assert messages == baselines
+        assert "last_decay_at" not in json.dumps(messages, ensure_ascii=False)
+
+    soul_messages = build_soul_profile_prompt(
+        history_summary={},
+        preference_summary=persisted,
+        tone_profile=None,
+    )
+    assert soul_messages == build_soul_profile_prompt(
+        history_summary={},
+        preference_summary=cleaned,
+        tone_profile=None,
+    )
+    assert "last_decay_at" not in json.dumps(soul_messages, ensure_ascii=False)
+
+    assert render_preference_summary(persisted) == render_preference_summary(cleaned)
+    assert "last_decay_at" not in render_preference_summary(persisted)
+
+
 # ----------------------------------------------------------------------
 # v0.3.x batch_content_evaluation negative_examples block.
 

@@ -600,6 +600,48 @@ def test_merge_preferences_applies_decay_and_deduplicates_tags() -> None:
     assert set(merged["favorite_up_users"]) == {"旧UP", "新UP"}
 
 
+def test_merge_preferences_decay_is_independent_of_processing_frequency() -> None:
+    from openbiliclaw.soul.preference_analyzer import PreferenceAnalyzer
+
+    analyzer = PreferenceAnalyzer(FakeStructuredService())
+    start = datetime(2026, 9, 1, 0, 0, 0)
+    preference: dict[str, object] = {
+        "interests": [
+            {
+                "name": "滑雪",
+                "category": "体育",
+                "weight": 1.0,
+                "first_seen": start.isoformat(),
+                "last_seen": start.isoformat(),
+                "source": "old",
+            }
+        ]
+    }
+
+    once = analyzer.merge_preferences(
+        preference,
+        {"interests": []},
+        now=start + timedelta(days=7),
+    )
+    twice = analyzer.merge_preferences(
+        once,
+        {"interests": []},
+        now=start + timedelta(days=7),
+    )
+
+    assert once["interests"][0]["weight"] == pytest.approx(0.9)
+    assert twice["interests"][0]["weight"] == pytest.approx(0.9)
+
+    daily = preference
+    for day in range(1, 8):
+        daily = analyzer.merge_preferences(
+            daily,
+            {"interests": []},
+            now=start + timedelta(days=day),
+        )
+    assert daily["interests"][0]["weight"] == pytest.approx(0.9)
+
+
 def test_merge_preferences_reactivates_matching_archived_interest() -> None:
     analyzer = PreferenceAnalyzer(FakeStructuredService())
     merged = analyzer.merge_preferences(

@@ -10,6 +10,14 @@
 
 ---
 
+## 未发布：画像证据与衰减一致性
+
+- **稳定追加推荐通知回归测试**：使用与后台通知共享事件循环的异步 ASGI 客户端，避免同步测试请求结束后取消尚未完成的状态通知；覆盖无延迟和 50ms 状态读取延迟，不修改生产接口或放宽通知断言。
+- **修复画像证据虚增与重复衰减**：增量分析返回的全量偏好快照不再让未触及兴趣增加 `evidence_count`、刷新 `last_evidence_at` 或复活；兴趣权重新增 `last_decay_at` 增量游标，同一时刻重复合并或按日分批处理与一次处理得到相同衰减结果。新增未触及方向、被触及方向与衰减频率三条生命周期根因回归和相关模块全量回归。
+- **偏好 prompt 不再序列化内部衰减游标**：`last_decay_at` 是存储记账，不是用户行为，但会随原始偏好 dict 进入偏好分析 / 觉察 / 洞察 / 灵魂画像几条 prompt（实测每个兴趣 +53 字符，200 个兴趣每次多出约 10.6KB，足以把偏好分析顶过 `max_prompt_chars=24000` 触发额外分块）。现在 `profile_views.preference_prompt_payload()` 在五条 builder 与 `render_preference_summary` 的入口统一剔除它，无游标输入的 prompt 逐字节不变。
+
+---
+
 ## 未发布：移动端原生播放页 UP 主信息与关注
 
 - **新增 UP 主信息卡片与关注能力（移动端依赖）**：移动端原生播放页此前只能展示视频标题与简介，无法看到“是谁发的”。现在从既有的 `GET /api/bilibili/video/info` `owner` 对象取 `mid` / `name` / `face`；新增 `GET /api/bilibili/user/card?mid=<mid>` 透传 B 站 `/x/web-interface/card`，返回头像、签名、粉丝数与当前登录用户的 `following`；新增 `POST /api/bilibili/user/follow` 用 `{mid, follow}` 走 `/x/relation/modify`（`act=1` 关注 / `act=2` 取消关注），CSRF（`bili_jct`）仍只留在后端。B 站对“已经关注用户，无法重复关注”返回 `22014`，现按成功处理并回查 card，避免移动端本地状态过期时误报失败；card 回查失败时返回请求的目标状态，避免把已成功的关注回滚成失败。新增 `tests/test_bilibili_api.py` 覆盖 card 解析/协议相对头像归一化、关注/取消关注请求体、重复关注幂等、未登录拒绝与 card 回查失败保持状态，`tests/test_api_app.py` 固定两个新端点的响应契约。
