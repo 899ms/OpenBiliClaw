@@ -816,6 +816,147 @@ async def test_get_following_parses_users() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_user_card_parses_follow_state_and_normalizes_face() -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc")
+    fake_http = FakeAsyncClient(
+        {
+            "code": 0,
+            "data": {
+                "card": {
+                    "mid": "42",
+                    "name": "测试UP",
+                    "face": "//i0.hdslb.com/bfs/face/up.jpg",
+                    "sign": "签名",
+                    "fans": "12345",
+                },
+                "following": True,
+            },
+        }
+    )
+    client._client = fake_http
+
+    card = await client.get_user_card(42)
+
+    assert card == {
+        "mid": 42,
+        "name": "测试UP",
+        "face": "https://i0.hdslb.com/bfs/face/up.jpg",
+        "sign": "签名",
+        "fans": 12345,
+        "following": True,
+    }
+    assert fake_http.calls[0][0].endswith("/x/web-interface/card")
+    assert fake_http.calls[0][1] == {"mid": 42, "photo": "false"}
+
+
+@pytest.mark.asyncio
+async def test_get_user_card_rejects_non_positive_mid() -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc")
+
+    with pytest.raises(BilibiliAPIError, match="invalid mid"):
+        await client.get_user_card(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("follow", "expected_act"),
+    [(True, "1"), (False, "2")],
+)
+async def test_set_user_follow_posts_relation_modify_and_refreshes_card(
+    follow: bool, expected_act: str
+) -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc; bili_jct=csrf123")
+    fake_http = RouteAsyncClient(
+        {
+            "/x/relation/modify": [{"code": 0, "data": {}}],
+            "/x/web-interface/card": [
+                {
+                    "code": 0,
+                    "data": {
+                        "card": {
+                            "mid": "42",
+                            "name": "测试UP",
+                            "face": "",
+                            "fans": 12346,
+                        },
+                        "following": follow,
+                    },
+                }
+            ],
+        }
+    )
+    client._client = fake_http
+
+    state = await client.set_user_follow(42, follow=follow)
+
+    assert state["following"] is follow
+    assert state["fans"] == 12346
+    assert fake_http.calls[0][0].endswith("/x/relation/modify")
+    assert fake_http.calls[0][1] == {
+        "fid": "42",
+        "act": expected_act,
+        "re_src": "11",
+        "csrf": "csrf123",
+    }
+
+
+@pytest.mark.asyncio
+async def test_set_user_follow_requires_login() -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc")
+
+    with pytest.raises(BilibiliAuthExpiredError):
+        await client.set_user_follow(42, follow=True)
+
+
+@pytest.mark.asyncio
+async def test_set_user_follow_keeps_requested_state_when_card_refresh_fails() -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc; bili_jct=csrf123")
+    fake_http = RouteAsyncClient(
+        {
+            "/x/relation/modify": [{"code": 0, "data": {}}],
+            "/x/web-interface/card": [{"code": -352, "message": "风控"}],
+        }
+    )
+    client._client = fake_http
+
+    state = await client.set_user_follow(42, follow=True)
+
+    assert state == {
+        "mid": 42,
+        "name": "",
+        "face": "",
+        "sign": "",
+        "fans": 0,
+        "following": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_set_user_follow_treats_duplicate_follow_as_success() -> None:
+    client = BilibiliAPIClient(cookie="SESSDATA=abc; bili_jct=csrf123")
+    fake_http = RouteAsyncClient(
+        {
+            "/x/relation/modify": [{"code": 22014, "message": "已经关注用户，无法重复关注"}],
+            "/x/web-interface/card": [
+                {
+                    "code": 0,
+                    "data": {
+                        "card": {"mid": "42", "name": "测试UP", "fans": 99},
+                        "following": True,
+                    },
+                }
+            ],
+        }
+    )
+    client._client = fake_http
+
+    state = await client.set_user_follow(42, follow=True)
+
+    assert state["following"] is True
+    assert state["fans"] == 99
+
+
+@pytest.mark.asyncio
 async def test_get_video_comments_returns_top_n_comments() -> None:
     client = BilibiliAPIClient(cookie="SESSDATA=abc")
     client._client = RouteAsyncClient(

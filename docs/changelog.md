@@ -2,6 +2,12 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 未发布：移动端原生播放页 UP 主信息与关注
+
+- **新增 UP 主信息卡片与关注能力（移动端依赖）**：移动端原生播放页此前只能展示视频标题与简介，无法看到“是谁发的”。现在从既有的 `GET /api/bilibili/video/info` `owner` 对象取 `mid` / `name` / `face`；新增 `GET /api/bilibili/user/card?mid=<mid>` 透传 B 站 `/x/web-interface/card`，返回头像、签名、粉丝数与当前登录用户的 `following`；新增 `POST /api/bilibili/user/follow` 用 `{mid, follow}` 走 `/x/relation/modify`（`act=1` 关注 / `act=2` 取消关注），CSRF（`bili_jct`）仍只留在后端。B 站对“已经关注用户，无法重复关注”返回 `22014`，现按成功处理并回查 card，避免移动端本地状态过期时误报失败；card 回查失败时返回请求的目标状态，避免把已成功的关注回滚成失败。新增 `tests/test_bilibili_api.py` 覆盖 card 解析/协议相对头像归一化、关注/取消关注请求体、重复关注幂等、未登录拒绝与 card 回查失败保持状态，`tests/test_api_app.py` 固定两个新端点的响应契约。
+
+---
+
 ## 未发布：后台 worker 降级等待与子进程存活看护（issue #250）
 
 - **修复 Windows 桌面版启动必弹两个错误对话框、且后台循环随子进程一起死掉（[issue #250](https://github.com/whiteguo233/OpenBiliClaw/issues/250)）**：四进程桌面版在 `config.toml` 没有任何可成功构造的 LLM 实例时（全新安装未配 key，或 key 失效），`worker` / `discovery_worker` 两个窗口化子进程分别在 `build_runtime_context`（`RegistryBuildError`）与 `raise RuntimeError("runtime_controller.run_forever not available")` 处未捕获退出——PyInstaller bootloader 各弹一个 "Unhandled exception in script" 对话框；主 API 进程虽已用 `build_degraded_runtime_context` 降级为可配密钥、但会按环境变量继续把后台循环委托给已死子进程，于是用户在 `/setup` 修好 key 后，发现 / 刷新 / 候选评估（`/api/sources/*/next-task`、`/api/events`）仍持续 503，直到重启应用。现在：① `worker/main.py::run_full_worker` 先用 `build_llm_registry(load_config())` 做纯构造探针（无网络），失败时每 15 秒重读磁盘配置重试，等待期间心跳照常写 `worker_status.json`，成功后重新加载配置再走完整 `build_runtime_context`；② `discovery_worker.py` 同样的探针门 + 重试循环（失败时先关闭 degraded 上下文再退避），拿不到 `run_forever` 只记日志不抛异常；③ `packaging/entry.py` 的 `--openbiliclaw-worker` 分发把子进程异常写进 `logs/desktop.log` 后以 `SystemExit(1)` 退出，任何未预期崩溃都不再触发 bootloader 弹窗；④ `proc.py::ChildProcessSupervisor` 让桌面父进程周期巡检后端子进程，崩溃后按 2s 起步、上限 60s 的指数退避重启（存活 ≥5 分钟重置退避），父进程退出时逆序 terminate/kill；⑤ API 侧 `RuntimeContext.warn_if_full_worker_heartbeat_stale()` 在委托模式下发现已存在但过期的 worker 心跳时打 WARNING（首次启动尚无心跳文件时不误报），配合 `/api/runtime-status` 既有的 `worker_running` / `worker_heartbeat_age_seconds` 暴露降级委托状态。⑥ `recommendation_server.py` 同样先探针等待可构造的 LLM 配置再 `create_app()`，避免独立推荐进程永久停在 degraded 而让主 API 热恢复后 `/api/recommendations` 仍回 503；新增 `tests/test_worker_degraded_boot.py`（探针重试、等待期心跳仍在、discovery worker 不再 raise、心跳告警边界）与 `tests/test_proc_supervisor.py`（崩溃重启、退避与重置、stop 清理）。
