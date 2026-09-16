@@ -4427,6 +4427,80 @@ class TestBackendAPI:
         config_text = (tmp_path / "config.toml").read_text()
         assert cookie_value in config_text
 
+    def test_bilibili_user_card_and_follow_endpoints_forward_up_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Mobile UP card / follow endpoints keep the documented wire contract."""
+        from fastapi.testclient import TestClient
+
+        import openbiliclaw.bilibili.api as bilibili_api_module
+        from openbiliclaw.config import Config
+
+        config = Config(data_dir=str(tmp_path))
+        config.bilibili.cookie = "SESSDATA=abc; bili_jct=csrf123"
+        monkeypatch.setattr("openbiliclaw.config.load_config", lambda *_a, **_kw: config)
+        monkeypatch.setattr(
+            "openbiliclaw.bilibili.auth.resolve_runtime_cookie",
+            lambda **_kw: "SESSDATA=abc; bili_jct=csrf123",
+        )
+
+        class _FakeBilibiliClient:
+            def __init__(self, *, cookie: str = "", proxy: str | None = None) -> None:
+                self.cookie = cookie
+                self.proxy = proxy
+
+            async def get_user_card(self, mid: int) -> dict[str, object]:
+                return {
+                    "mid": mid,
+                    "name": "测试UP",
+                    "face": "https://i0.hdslb.com/bfs/face/up.jpg",
+                    "sign": "签名",
+                    "fans": 123,
+                    "following": False,
+                }
+
+            async def set_user_follow(self, mid: int, *, follow: bool) -> dict[str, object]:
+                return {
+                    "mid": mid,
+                    "name": "测试UP",
+                    "face": "https://i0.hdslb.com/bfs/face/up.jpg",
+                    "sign": "签名",
+                    "fans": 124,
+                    "following": follow,
+                }
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(bilibili_api_module, "BilibiliAPIClient", _FakeBilibiliClient)
+
+        app = create_app(memory_manager=object(), database=object(), soul_engine=object())
+        client = TestClient(app)
+
+        card = client.get("/api/bilibili/user/card", params={"mid": 42})
+        assert card.status_code == 200, card.text
+        assert card.json() == {
+            "ok": True,
+            "mid": 42,
+            "name": "测试UP",
+            "face": "https://i0.hdslb.com/bfs/face/up.jpg",
+            "sign": "签名",
+            "fans": 123,
+            "following": False,
+        }
+
+        follow = client.post("/api/bilibili/user/follow", json={"mid": 42, "follow": True})
+        assert follow.status_code == 200, follow.text
+        assert follow.json() == {
+            "ok": True,
+            "mid": 42,
+            "name": "测试UP",
+            "face": "https://i0.hdslb.com/bfs/face/up.jpg",
+            "sign": "签名",
+            "fans": 124,
+            "following": True,
+        }
+
     def test_bilibili_cookie_sync_restarts_background_tasks_after_rebuild(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

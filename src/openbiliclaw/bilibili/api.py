@@ -88,6 +88,18 @@ def _json_list(value: Any) -> list[dict[str, Any]]:
     return cast("list[dict[str, Any]]", value)
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    """Parse a Bilibili numeric field that may be an int or a numeric string."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class VideoInfo:
     """Basic video information from Bilibili."""
@@ -1321,6 +1333,104 @@ class BilibiliAPIClient:
             )
             for user in users
         ]
+
+    async def get_user_card(self, mid: int) -> dict[str, Any]:
+        """Get an UP's public card plus the current user's follow state.
+
+        The mobile native player already knows the video owner from
+        ``/api/bilibili/video/info``; this endpoint enriches that owner with the
+        fan count and whether the logged-in account follows them. Bilibili's
+        ``/x/web-interface/card`` returns ``following`` next to the public card
+        for an authenticated Cookie, so one upstream request covers both fields.
+
+        Args:
+            mid: UP's numeric Bilibili user id. Must be positive.
+
+        Returns:
+            A flat dict: ``mid`` / ``name`` / ``face`` / ``sign`` / ``fans`` /
+            ``following``. ``face`` is normalized to https because Bilibili
+            sometimes returns a protocol-relative ``//i0.hdslb.com/...`` URL.
+
+        Raises:
+            BilibiliAPIError: ``mid`` is not positive or Bilibili returns an
+                application error (including ``-352`` risk control).
+        """
+        user_id = int(mid)
+        if user_id <= 0:
+            raise BilibiliAPIError("invalid mid", code=-400)
+        data = await self._get_json(
+            "/x/web-interface/card",
+            params={"mid": user_id, "photo": "false"},
+        )
+        card = _json_object(data.get("card", {}))
+        face = str(card.get("face", "") or "").strip()
+        if face.startswith("//"):
+            face = f"https:{face}"
+        return {
+            "mid": _int_value(card.get("mid"), user_id) or user_id,
+            "name": str(card.get("name", "") or "").strip(),
+            "face": face,
+            "sign": str(card.get("sign", "") or "").strip(),
+            "fans": max(0, _int_value(card.get("fans"))),
+            "following": bool(data.get("following", False)),
+        }
+
+    async def set_user_follow(self, mid: int, *, follow: bool) -> dict[str, Any]:
+        """Follow or unfollow an UP and return the refreshed card state.
+
+        ``/x/relation/modify`` is the web follow endpoint: ``act=1`` follows and
+        ``act=2`` unfollows. It requires the logged-in account's CSRF token
+        (``bili_jct``), which is why follow writes stay on the backend; the
+        mobile client never calls this endpoint directly. After a successful
+        modify the card is fetched again so callers render Bilibili's
+        authoritative ``following`` flag and fan count instead of a local guess.
+
+        ``re_src=11`` is the video-page follow source used by the web player.
+        When Bilibili applied the change but the follow-up card fetch fails
+        (for example transient risk control), the requested state is returned so
+        the UI does not roll back a successful action. Bilibili's ``22014``
+        ("已经关注用户，无法重复关注") is treated as success because it means the
+        account is already in the requested state, which can happen when the
+        client's card snapshot was stale.
+
+        Raises:
+            BilibiliAPIError: ``mid`` is not positive or Bilibili rejects the
+                relation change.
+        """
+        user_id = int(mid)
+        if user_id <= 0:
+            raise BilibiliAPIError("invalid mid", code=-400)
+        try:
+            await self._post_json(
+                "/x/relation/modify",
+                data={
+                    "fid": str(user_id),
+                    "act": "1" if follow else "2",
+                    "re_src": "11",
+                    "csrf": self._csrf_token(),
+                },
+            )
+        except BilibiliAPIError as exc:
+            if follow and exc.code == 22014:
+                logger.debug("follow is already active (mid=%s)", user_id)
+            else:
+                raise
+        try:
+            return await self.get_user_card(user_id)
+        except BilibiliAPIError:
+            logger.debug(
+                "refreshing user card after follow change failed (mid=%s)",
+                user_id,
+                exc_info=True,
+            )
+            return {
+                "mid": user_id,
+                "name": "",
+                "face": "",
+                "sign": "",
+                "fans": 0,
+                "following": follow,
+            }
 
     async def get_related_videos(self, bvid: str) -> list[dict[str, Any]]:
         """Get related/recommended videos for a given video.

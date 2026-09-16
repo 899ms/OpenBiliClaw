@@ -2,6 +2,12 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 未发布：移动端原生播放页 UP 主信息与关注
+
+- **新增 UP 主信息卡片与关注能力（移动端依赖）**：移动端原生播放页此前只能展示视频标题与简介，无法看到“是谁发的”。现在从既有的 `GET /api/bilibili/video/info` `owner` 对象取 `mid` / `name` / `face`；新增 `GET /api/bilibili/user/card?mid=<mid>` 透传 B 站 `/x/web-interface/card`，返回头像、签名、粉丝数与当前登录用户的 `following`；新增 `POST /api/bilibili/user/follow` 用 `{mid, follow}` 走 `/x/relation/modify`（`act=1` 关注 / `act=2` 取消关注），CSRF（`bili_jct`）仍只留在后端。B 站对“已经关注用户，无法重复关注”返回 `22014`，现按成功处理并回查 card，避免移动端本地状态过期时误报失败；card 回查失败时返回请求的目标状态，避免把已成功的关注回滚成失败。新增 `tests/test_bilibili_api.py` 覆盖 card 解析/协议相对头像归一化、关注/取消关注请求体、重复关注幂等、未登录拒绝与 card 回查失败保持状态，`tests/test_api_app.py` 固定两个新端点的响应契约。
+
+---
+
 ## 未发布：画像整理成员引用兼容
 
 - **修复普通画像整理簇拒绝对象成员引用**：likes judge prompt 提供 `{name, category}` 成员对象，但普通簇校验此前只登记裸名称，模型原样返回对象便会被误判为 unknown member、整簇被拒。普通簇现在按名称消费对象引用，并在写 rename map / run record 前把对象成员归一为名称，保证 override 重命名、keyword 标签迁移与用户 revert 的 no-merge pair 保护不丢；同名异类簇仍使用分类限定键严格校验。新增完整 `ProfileConsolidator.run()` 对象成员回归、对象成员 keyword 标签迁移回归与对象成员 revert 钉 pair 回归。

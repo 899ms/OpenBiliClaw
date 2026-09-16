@@ -7367,6 +7367,66 @@ def create_app(
         finally:
             await client.close()
 
+    @app.get("/api/bilibili/user/card")
+    async def bilibili_user_card(mid: int = Query(..., gt=0)) -> dict[str, Any]:
+        """Return an UP's public card plus the current user's follow state."""
+        from openbiliclaw.bilibili.api import BilibiliAPIClient, BilibiliAPIError
+        from openbiliclaw.bilibili.auth import resolve_runtime_cookie
+        from openbiliclaw.config import load_config
+
+        cfg = _pin_active_runtime_config(load_config())
+        cookie = resolve_runtime_cookie(
+            data_dir=cfg.data_path,
+            configured_cookie=str(getattr(cfg.bilibili, "cookie", "") or ""),
+        )
+        if not cookie:
+            raise HTTPException(status_code=401, detail="B站 Cookie 未配置或已失效")
+        client = BilibiliAPIClient(
+            cookie=cookie,
+            proxy=(getattr(cfg.bilibili, "proxy", None) or None),
+        )
+        try:
+            return {"ok": True, **await client.get_user_card(mid)}
+        except BilibiliAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            await client.close()
+
+    @app.post("/api/bilibili/user/follow")
+    async def bilibili_user_follow(
+        payload: Annotated[dict[str, Any], Body()],
+    ) -> dict[str, Any]:
+        """Follow or unfollow an UP for the mobile native player."""
+        from openbiliclaw.bilibili.api import BilibiliAPIClient, BilibiliAPIError
+        from openbiliclaw.bilibili.auth import resolve_runtime_cookie
+        from openbiliclaw.config import load_config
+
+        raw_mid = payload.get("mid")
+        try:
+            mid = int(raw_mid)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="缺少 mid") from exc
+        if mid <= 0:
+            raise HTTPException(status_code=400, detail="缺少 mid")
+        follow = bool(payload.get("follow", True))
+        cfg = _pin_active_runtime_config(load_config())
+        cookie = resolve_runtime_cookie(
+            data_dir=cfg.data_path,
+            configured_cookie=str(getattr(cfg.bilibili, "cookie", "") or ""),
+        )
+        if not cookie:
+            raise HTTPException(status_code=401, detail="B站 Cookie 未配置或已失效")
+        client = BilibiliAPIClient(
+            cookie=cookie,
+            proxy=(getattr(cfg.bilibili, "proxy", None) or None),
+        )
+        try:
+            return {"ok": True, **await client.set_user_follow(mid, follow=follow)}
+        except BilibiliAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            await client.close()
+
     @app.get("/api/bilibili/video/info")
     async def bilibili_video_info(bvid: str = Query(...)) -> dict[str, Any]:
         """Return Bilibili video metadata for the mobile native player intro tab.
