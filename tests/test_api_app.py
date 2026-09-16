@@ -7574,8 +7574,14 @@ class TestBackendAPI:
         assert [item["bvid"] for item in response.json()["items"]] == ["BV-SQLITE"]
         assert memory.events[0]["metadata"]["returned_item_ids"] == ["BV-SQLITE"]
 
-    def test_append_recommendations_endpoint_excludes_existing_bvids(self) -> None:
-        from fastapi.testclient import TestClient
+    @pytest.mark.parametrize("status_delay", [0.0, 0.05])
+    async def test_append_recommendations_endpoint_excludes_existing_bvids(
+        self, status_delay: float
+    ) -> None:
+        import asyncio
+        import time
+
+        import httpx
 
         class FakeEventHub:
             def __init__(self) -> None:
@@ -7591,6 +7597,8 @@ class TestBackendAPI:
                 self.pool_available_count = 4
 
             def get_runtime_status(self) -> dict[str, object]:
+                # Force the background status read to outlive a fast HTTP response.
+                time.sleep(status_delay)
                 return {
                     "initialized": True,
                     "pool_available_count": self.pool_available_count,
@@ -7646,12 +7654,15 @@ class TestBackendAPI:
             recommendation_engine=recommendation_engine,
             runtime_controller=runtime,
         )
-        client = TestClient(app)
-
-        response = client.post(
-            "/api/recommendations/append",
-            json={"excluded_bvids": ["BV1A", "BV1B"]},
-        )
+        # Share pytest's running event loop with the fire-and-forget publisher;
+        # a request-scoped TestClient portal cancels it when the response ends.
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/recommendations/append",
+                json={"excluded_bvids": ["BV1A", "BV1B"]},
+            )
 
         assert response.status_code == 200
         assert recommendation_engine.calls == [({"profile": "ok"}, ["BV1A", "BV1B"], 10)]
@@ -7692,11 +7703,9 @@ class TestBackendAPI:
             ],
             "has_more": False,
         }
-        import time
-
         deadline = time.monotonic() + 1.0
         while not hub.events and time.monotonic() < deadline:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
         assert hub.events
         assert hub.events[-1]["type"] == "refresh.pool_updated"
         assert hub.events[-1]["message"] == "推荐池已同步"
