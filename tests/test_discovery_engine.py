@@ -326,11 +326,15 @@ class _SplitRetryBatchLLMService:
         invalid_all_batches: bool = False,
         count_mismatch_batch_calls: set[int] | None = None,
         rate_limit_batch_calls: set[int] | None = None,
+        reasoning_budget_batch_calls: set[int] | None = None,
+        reasoning_budget_all_batches: bool = False,
     ) -> None:
         self.invalid_batch_calls = invalid_batch_calls or set()
         self.invalid_all_batches = invalid_all_batches
         self.count_mismatch_batch_calls = count_mismatch_batch_calls or set()
         self.rate_limit_batch_calls = rate_limit_batch_calls or set()
+        self.reasoning_budget_batch_calls = reasoning_budget_batch_calls or set()
+        self.reasoning_budget_all_batches = reasoning_budget_all_batches
         self.batch_call_sizes: list[int] = []
         self.single_calls = 0
 
@@ -355,6 +359,11 @@ class _SplitRetryBatchLLMService:
         call_index = len(self.batch_call_sizes)
         if call_index in self.rate_limit_batch_calls:
             raise LLMProviderExecutionError("Provider returned 429 rate limit")
+        if self.reasoning_budget_all_batches or call_index in self.reasoning_budget_batch_calls:
+            raise LLMProviderExecutionError(
+                "openai_compatible returned reasoning but no final content "
+                "(finish_reason=length); disable thinking/reasoning or increase max_tokens"
+            )
         if self.invalid_all_batches or call_index in self.invalid_batch_calls:
             return _SlowResponse("not json")
 
@@ -3737,6 +3746,43 @@ async def test_evaluate_content_batch_rate_limit_propagates_without_split_retry(
 
     assert llm_service.batch_call_sizes == [16]
     assert llm_service.single_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_splits_when_reasoning_exhausts_budget() -> None:
+    """reasoning-only + finish_reason=length is size-dependent: halve and retry."""
+    llm_service = _SplitRetryBatchLLMService(reasoning_budget_batch_calls={1})
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(45, prefix="REASON")
+
+    scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=45)
+
+    assert llm_service.batch_call_sizes == [45, 22, 23]
+    assert llm_service.single_calls == 0
+    assert scores == [0.73] * 45
+    assert all(content.relevance_score == 0.73 for content in contents)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_content_batch_persistent_reasoning_exhaustion_is_bounded() -> None:
+    """A budget-exhausted batch never degrades into per-item single calls."""
+    llm_service = _SplitRetryBatchLLMService(reasoning_budget_all_batches=True)
+    engine = ContentDiscoveryEngine(
+        llm_service=llm_service,
+        evaluation_candidate_transport="production",
+    )
+    contents = _split_retry_contents(16, prefix="REASONFAIL")
+
+    scores = await engine.evaluate_content_batch(contents, _build_profile(), batch_size=16)
+
+    assert llm_service.batch_call_sizes[0] == 16
+    assert len(llm_service.batch_call_sizes) == 7
+    assert llm_service.single_calls == 0
+    assert scores == [0.0] * 16
+    assert all(c.relevance_reason == "evaluation_response_missing" for c in contents)
 
 
 @pytest.mark.asyncio

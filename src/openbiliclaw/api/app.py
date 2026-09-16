@@ -11422,8 +11422,10 @@ def create_app(
                 llm.complete_with_core_memory(
                     system_instruction=messages[0]["content"],
                     user_input=messages[1]["content"],
-                    # 16 (not 8) so the longest label `neutral_deferred` can't truncate.
-                    max_tokens=16,
+                    # 512: a reasoning-first instance must fit its thinking
+                    # *and* the longest label `neutral_deferred`; the old 16
+                    # was guaranteed to come back empty for such models.
+                    max_tokens=512,
                     temperature=0.0,
                     json_mode=False,
                     caller="api.sentiment",

@@ -23,6 +23,16 @@ from .prompts import build_socratic_dialogue_prompt
 logger = logging.getLogger(__name__)
 DEFAULT_LLM_CONCURRENCY = DEFAULT_TOTAL_LLM_CONCURRENCY
 
+# Structured (JSON-returning) tasks were historically budgeted by their
+# expected payload size — 256 for one score, 512 for a keyword list. Those
+# caps predate reasoning-first endpoints: a model that spends the whole
+# output budget on invisible thinking returns no final content
+# (``finish_reason=length``) and the call fails. ``max_tokens`` is a ceiling,
+# not a reservation — normal completions still stop at EOS — so every
+# structured call gets at least this floor. Per-call budgets above the floor
+# are untouched.
+MIN_STRUCTURED_MAX_TOKENS = 4096
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator, Mapping
 
@@ -599,13 +609,17 @@ class LLMService:
         structured tasks (eval / classify / write-expression) that
         don't benefit from chain-of-thought — disabling it on
         DeepSeek-V4 cuts a 30-item batch from ~10 min to ~30s.
+
+        ``max_tokens`` is floored at :data:`MIN_STRUCTURED_MAX_TOKENS` so a
+        reasoning-first endpoint can think *and* still emit the final JSON;
+        callers asking for more than the floor keep their budget.
         """
         return await self.complete_with_core_memory(
             system_instruction=self._structured_json_contract(system_instruction),
             user_input=user_input,
             history=history,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=max(int(max_tokens), MIN_STRUCTURED_MAX_TOKENS),
             json_mode=True,
             caller=caller,
             reasoning_effort=reasoning_effort,
@@ -680,6 +694,9 @@ class LLMService:
         inject_core_memory: bool = True,
     ) -> LLMResponse:
         """Execute a JSON-mode task with user text plus image inputs."""
+        # Multimodal batch evaluation pays the same reasoning-budget tax as
+        # the text path; see MIN_STRUCTURED_MAX_TOKENS.
+        max_tokens = max(int(max_tokens), MIN_STRUCTURED_MAX_TOKENS)
         stable_block, volatile_block = self._core_memory_blocks(inject_core_memory)
         parts = [self._structured_json_contract(system_instruction)]
         if stable_block:

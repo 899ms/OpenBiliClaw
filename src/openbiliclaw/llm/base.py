@@ -352,6 +352,38 @@ def is_llm_moderation_error(exc: BaseException) -> bool:
     return False
 
 
+# Providers raise this exact pair of markers when a reasoning-first model
+# spent the whole ``max_tokens`` budget on invisible thinking and never
+# emitted the final answer. The failure is *size-dependent* for batched
+# callers — a smaller batch needs less output — so an evaluation loop can
+# split the request instead of failing the whole batch.
+_REASONING_BUDGET_EXHAUSTED_MARKERS = (
+    "returned reasoning but no final content",
+    "finish_reason=length",
+)
+
+
+def is_reasoning_budget_exhausted(exc: BaseException) -> bool:
+    """Return True when an exception chain reports reasoning-only output.
+
+    Both markers must appear on the same link: adapters raise
+    ``"<provider> returned reasoning but no final content
+    (finish_reason=length); disable thinking/reasoning or increase
+    max_tokens"``. Callers use this to tell a budget failure (raise the cap /
+    retry a smaller batch) apart from rate-limit / auth / timeout failures,
+    which must keep propagating unchanged.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if all(marker in message for marker in _REASONING_BUDGET_EXHAUSTED_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def describe_llm_failure(exc: BaseException) -> str | None:
     """Translate an LLM exception chain into a short, human-readable Chinese
     reason suitable for page-side display during guided init.

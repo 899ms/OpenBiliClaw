@@ -2,6 +2,14 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 未发布：LLM 输出预算下限与评估分批自愈
+
+- **修复推理实例在结构化小任务上「reasoning-only + finish_reason=length」拖垮整条模块路由链**：这类模型的 `max_tokens` 同时覆盖思考与正文，历史调用点按期望输出长度给的 16 / 256 / 512 / 1024 预算会被 thinking 整段吃掉，`content` 为空后 provider 判失败，模块链里若没有非推理实例兜底就写 error 级 `all_providers_failed` 告警（DSH 面板「异常报警」里表现为两条 `bad_response` warning + 一条 error）。现在分三层处理：① `LLMService.complete_structured_task()` / `complete_multimodal_structured_task()` 统一以 `MIN_STRUCTURED_MAX_TOKENS=4096` 兜底 `max_tokens`（`max_tokens` 是上限不是预扣，正常答完不产生额外成本），`api.sentiment` 16→512，`recommendation.evaluate_batch` 8192→16384，统一关键词 planner 合并生成下限 4096→8192；② 新增 `llm.base.is_reasoning_budget_exhausted()`，沿 cause/context 链统一识别该签名，`soul.posture_gate` 与 `soul.preference_analyzer` 的私有判定改用它（行为不变）；③ 评估 / 表达式批量在该签名下把批减半递归重试 —— discovery `_evaluate_batch` 把整个子批标记 missing 后走既有 split-retry（深度 3、额外请求 6），recommendation 新增 `_classify_batch_with_split_retry`（`classify_pool_backlog` 入口）并让 `_precompute_batch_with_split_retry` 同样按预算错误拆分；限流 / 鉴权 / 超时 / 传输错误继续原样上抛（rate limit 仍走 claim 释放，不因拆分放大请求）。
+- **测试与文档**：`tests/test_llm_service.py` 新增 helper 与结构化 / 多模态下限回归；`tests/test_discovery_engine.py` 新增「预算耗尽 → [45, 22, 23] 拆分」与「持续耗尽仍有界、不退化逐条」两个回归，并保留 rate limit 不拆分断言；`tests/test_recommendation_engine.py` 新增 classify 拆分 / 非预算异常直抛 / 表达式拆分三个回归；同步更新 `api.sentiment` 与 merged-keyword 上限断言，LLM / discovery / recommendation 模块文档补齐对应功能行。
+- **真实环境验证**：用本机 `config.toml` 的真实端点在 `openai_compatible`（deepseek-v4-flash）上复现了原始签名（16 token → reasoning-only + `finish_reason=length`）；同一请求经 `complete_structured_task()` 的下限后发 4096 真实成功（`{"arrival": "12:59"}`）。discovery 批量评估与 recommendation 批量分类在注入该真实异常后，真实子批请求各按 `4 → 2 + 2` 拆分并完成打分；限流失败仍一次直抛、不拆分（注入异常来自真实端点，重试全部为真实请求）。
+
+---
+
 ## 未发布：移动端原生播放页 UP 主信息与关注
 
 - **新增 UP 主信息卡片与关注能力（移动端依赖）**：移动端原生播放页此前只能展示视频标题与简介，无法看到“是谁发的”。现在从既有的 `GET /api/bilibili/video/info` `owner` 对象取 `mid` / `name` / `face`；新增 `GET /api/bilibili/user/card?mid=<mid>` 透传 B 站 `/x/web-interface/card`，返回头像、签名、粉丝数与当前登录用户的 `following`；新增 `POST /api/bilibili/user/follow` 用 `{mid, follow}` 走 `/x/relation/modify`（`act=1` 关注 / `act=2` 取消关注），CSRF（`bili_jct`）仍只留在后端。B 站对“已经关注用户，无法重复关注”返回 `22014`，现按成功处理并回查 card，避免移动端本地状态过期时误报失败；card 回查失败时返回请求的目标状态，避免把已成功的关注回滚成失败。新增 `tests/test_bilibili_api.py` 覆盖 card 解析/协议相对头像归一化、关注/取消关注请求体、重复关注幂等、未登录拒绝与 card 回查失败保持状态，`tests/test_api_app.py` 固定两个新端点的响应契约。
