@@ -2469,6 +2469,63 @@ async def test_classify_pool_backlog_fills_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classify_batch_split_retry_halves_on_reasoning_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reasoning-only + finish_reason=length is size-dependent: halve and retry."""
+    calls: list[int] = []
+
+    async def _fake_classify(batch: list[DiscoveredContent], _profile: SoulProfile) -> None:
+        calls.append(len(batch))
+        if len(batch) > 1:
+            raise LLMProviderExecutionError(
+                "openai_compatible returned reasoning but no final content "
+                "(finish_reason=length); disable thinking/reasoning or increase max_tokens"
+            )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        engine = RecommendationEngine(llm=_DummyLLM(), database=db)
+        monkeypatch.setattr(engine, "_classify_batch", _fake_classify)
+        items = [
+            DiscoveredContent(bvid=f"BV_SPLIT_{index}", title=f"t{index}") for index in range(4)
+        ]
+
+        await engine._classify_batch_with_split_retry(items, _build_profile())
+
+    assert calls == [4, 2, 1, 1, 2, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_classify_batch_split_retry_propagates_non_budget_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    async def _fake_classify(batch: list[DiscoveredContent], _profile: SoulProfile) -> None:
+        calls.append(len(batch))
+        raise LLMProviderExecutionError("Provider returned 429 rate limit")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        engine = RecommendationEngine(llm=_DummyLLM(), database=db)
+        monkeypatch.setattr(engine, "_classify_batch", _fake_classify)
+
+        with pytest.raises(LLMProviderExecutionError):
+            await engine._classify_batch_with_split_retry(
+                [
+                    DiscoveredContent(bvid="BV_NOSPLIT_A", title="a"),
+                    DiscoveredContent(bvid="BV_NOSPLIT_B", title="b"),
+                ],
+                _build_profile(),
+            )
+
+    assert calls == [2]
+
+
+@pytest.mark.asyncio
 async def test_classify_pool_backlog_retires_legacy_temporally_stale_rows() -> None:
     class _TemporalClassifyLLM:
         async def complete_structured_task(self, **_kwargs: Any) -> LLMResponse:
@@ -4596,6 +4653,65 @@ async def test_precompute_batch_skips_single_fallback_during_provider_cooldown()
 
     assert exc_info.value.kind == "rate_limited"
     assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_precompute_batch_split_retry_halves_on_reasoning_budget() -> None:
+    """A JSON copy batch that dies on reasoning budget splits into singles."""
+
+    class _ReasoningBudgetExpressionLLM:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        async def complete_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            history: list[dict[str, str]] | None = None,
+            temperature: float = 0.7,
+            max_tokens: int = 4096,
+            caller: str = "",
+            reasoning_effort: str | None = None,
+        ) -> LLMResponse:
+            bvids = [chunk.split('"', 1)[0] for chunk in user_input.split('"bvid": "')[1:]]
+            self.batch_sizes.append(len(bvids))
+            if len(bvids) > 1:
+                raise LLMProviderExecutionError(
+                    "openai_compatible returned reasoning but no final content "
+                    "(finish_reason=length); disable thinking/reasoning or increase max_tokens"
+                )
+            assert bvids
+            return LLMResponse(
+                content=json.dumps(
+                    [{"bvid": bvids[0], "expression": f"copy-{bvids[0]}", "topic_label": "t"}],
+                    ensure_ascii=False,
+                ),
+                provider="test",
+                model="dummy",
+                usage={},
+            )
+
+    items = [
+        DiscoveredContent(bvid="BV_REASON_A", title="A", relevance_score=0.8),
+        DiscoveredContent(bvid="BV_REASON_B", title="B", relevance_score=0.7),
+    ]
+    llm = _ReasoningBudgetExpressionLLM()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        _seed_pool(db, items, precomputed=False)
+        engine = RecommendationEngine(llm=llm, database=db)
+
+        completed = await engine._precompute_batch_with_split_retry(items, _build_profile())
+
+        rows = {row["bvid"]: dict(row) for row in db.get_cached_content(limit=10)}
+
+    assert completed == 2
+    assert llm.batch_sizes == [2, 1, 1]
+    assert rows["BV_REASON_A"]["pool_expression"] == "copy-BV_REASON_A"
+    assert rows["BV_REASON_B"]["pool_expression"] == "copy-BV_REASON_B"
 
 
 @pytest.mark.asyncio

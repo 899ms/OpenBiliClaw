@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from openbiliclaw.llm.base import LLMProviderError, LLMResponse, is_llm_moderation_error
+from openbiliclaw.llm.base import (
+    LLMProviderError,
+    LLMResponse,
+    is_llm_moderation_error,
+    is_reasoning_budget_exhausted,
+)
 from openbiliclaw.llm.json_utils import (
     DEFAULT_STRUCTURED_MAX_TOKENS,
     format_parse_failure,
@@ -589,12 +594,8 @@ class PreferenceAnalyzer:
                     break
                 except (LLMProviderError, LLMServiceError) as exc:
                     message = str(exc).lower()
-                    reasoning_exhausted = (
-                        "returned reasoning but no final content" in message
-                        and "finish_reason=length" in message
-                    )
                     if (
-                        reasoning_exhausted
+                        is_reasoning_budget_exhausted(exc)
                         and not reasoning_budget_retried
                         and max_tokens < PREFERENCE_REASONING_FALLBACK_MAX_TOKENS
                     ):

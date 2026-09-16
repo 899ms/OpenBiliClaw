@@ -16757,8 +16757,8 @@ def test_probe_chat_sentiment_uses_plain_text_llm_call() -> None:
     method, kwargs = llm.calls[0]
     assert method == "core"
     assert kwargs["caller"] == "api.sentiment"
-    # 16 (was 8) so the longest label `neutral_deferred` can't truncate.
-    assert kwargs["max_tokens"] == 16
+    # 512 leaves room for reasoning + the longest label `neutral_deferred`.
+    assert kwargs["max_tokens"] == 512
     assert kwargs["json_mode"] is False
 
 

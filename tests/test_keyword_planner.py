@@ -3210,8 +3210,9 @@ async def test_merged_ask_capped_at_gen_batch(db: Database) -> None:
     user = llm.calls[0]["user"]
     assert '"need": 10' in user
     assert '"need": 30' not in user
-    # Small ask (10) → max_tokens floored at the 4096 default.
-    assert llm.max_tokens_seen[0] == 4096
+    # Small ask (10) → max_tokens floored at the 8192 default (reasoning-first
+    # instances need headroom to think before the merged JSON is emitted).
+    assert llm.max_tokens_seen[0] == 8192
 
 
 async def test_merged_max_tokens_scales_with_total_ask(db: Database) -> None:

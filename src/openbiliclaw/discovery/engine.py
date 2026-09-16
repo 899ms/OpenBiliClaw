@@ -62,6 +62,7 @@ from openbiliclaw.discovery.temporal import (
     parse_temporal_evaluation,
     schedule_temporal_evaluation,
 )
+from openbiliclaw.llm.base import is_reasoning_budget_exhausted
 from openbiliclaw.llm.evaluation_wire import encode_evaluation_row_wire
 from openbiliclaw.llm.json_utils import (
     extract_llm_json_list,
@@ -3907,15 +3908,31 @@ class ContentDiscoveryEngine:
 
         async def run(indices: list[int], depth: int) -> None:
             subset = [batch[index] for index in indices]
-            subset_results = await self._evaluate_batch_once(
-                subset,
-                profile,
-                source_context=source_context,
-                negative_examples=negative_examples,
-                evaluated_at=evaluated_at,
-                evaluation_bucket=evaluation_bucket,
-                normal_cache_enabled=normal_cache_enabled,
-            )
+            try:
+                subset_results = await self._evaluate_batch_once(
+                    subset,
+                    profile,
+                    source_context=source_context,
+                    negative_examples=negative_examples,
+                    evaluated_at=evaluated_at,
+                    evaluation_bucket=evaluation_bucket,
+                    normal_cache_enabled=normal_cache_enabled,
+                )
+            except Exception as exc:
+                if not is_reasoning_budget_exhausted(exc):
+                    raise
+                # A reasoning-first model burned the whole output budget on
+                # invisible thinking and returned no final content. Unlike a
+                # timeout, the failure is size-dependent: mark every member
+                # missing so the recursive split below retries the same work
+                # in smaller batches until it fits. Rate limits / auth /
+                # transport failures keep propagating unchanged.
+                logger.warning(
+                    "Batch evaluation exhausted the output budget on %d item(s); "
+                    "splitting the batch",
+                    len(subset),
+                )
+                subset_results = [None] * len(subset)
             missing: list[int] = []
             for index, score in zip(indices, subset_results, strict=True):
                 results[index] = score

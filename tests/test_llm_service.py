@@ -21,8 +21,10 @@ from openbiliclaw.llm.base import (
     classify_llm_unavailability,
     describe_llm_failure,
     is_llm_moderation_error,
+    is_reasoning_budget_exhausted,
 )
 from openbiliclaw.llm.service import (
+    MIN_STRUCTURED_MAX_TOKENS,
     LLMProviderExecutionError,
     LLMResponseContentError,
     LLMService,
@@ -58,6 +60,7 @@ class FakeRegistry:
         self.provider_calls: list[dict[str, object]] = []
         self.json_modes: list[bool] = []
         self.reasoning_efforts: list[str | None] = []
+        self.max_tokens_seen: list[int] = []
 
     async def complete(
         self,
@@ -71,6 +74,7 @@ class FakeRegistry:
         self.calls.append(messages)
         self.json_modes.append(json_mode)
         self.reasoning_efforts.append(reasoning_effort)
+        self.max_tokens_seen.append(max_tokens)
         if self.error is not None:
             raise self.error
         return self.response or LLMResponse(content="", provider="openai")
@@ -95,6 +99,7 @@ class FakeRegistry:
                 "reasoning_effort": reasoning_effort,
             }
         )
+        self.max_tokens_seen.append(max_tokens)
         if self.provider_error is not None:
             raise self.provider_error
         return self.response or LLMResponse(content="ok", provider=provider_name)
@@ -1066,3 +1071,80 @@ async def test_complete_with_core_memory_defaults_to_three_concurrent_calls() ->
 
     assert observed == 3
     assert peak == 3
+
+
+# -- Reasoning-budget classifier + structured max_tokens floor -------------
+
+
+def test_is_reasoning_budget_exhausted_matches_wrapped_provider_message() -> None:
+    message = (
+        "openai_compatible returned reasoning but no final content "
+        "(finish_reason=length); disable thinking/reasoning or increase max_tokens"
+    )
+    assert is_reasoning_budget_exhausted(RuntimeError(message))
+
+    try:
+        try:
+            raise LLMResponseError(message)
+        except LLMResponseError as err:
+            raise LLMProviderExecutionError(f"All providers failed. Last error: {err}") from err
+    except LLMProviderExecutionError as wrapped:
+        assert is_reasoning_budget_exhausted(wrapped)
+
+
+def test_is_reasoning_budget_exhausted_ignores_other_failures() -> None:
+    assert not is_reasoning_budget_exhausted(RuntimeError("429 rate limited"))
+    assert not is_reasoning_budget_exhausted(
+        RuntimeError("openai_compatible returned empty content")
+    )
+    # Both markers must land on the same link: a bare "reasoning but no final
+    # content" without the finish_reason marker is a different failure shape.
+    assert not is_reasoning_budget_exhausted(
+        RuntimeError("returned reasoning but no final content")
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_task_floors_small_max_tokens() -> None:
+    registry = FakeRegistry(response=LLMResponse(content='{"ok": true}', provider="openai"))
+    service = LLMService(registry=registry, memory=FakeMemoryManager("core"))  # type: ignore[arg-type]
+
+    await service.complete_structured_task(
+        system_instruction="return json",
+        user_input="hi",
+        max_tokens=256,
+        caller="eval.relevance",
+    )
+
+    assert registry.max_tokens_seen == [MIN_STRUCTURED_MAX_TOKENS]
+
+
+@pytest.mark.asyncio
+async def test_structured_task_keeps_budgets_above_the_floor() -> None:
+    registry = FakeRegistry(response=LLMResponse(content='{"ok": true}', provider="openai"))
+    service = LLMService(registry=registry, memory=FakeMemoryManager("core"))  # type: ignore[arg-type]
+
+    await service.complete_structured_task(
+        system_instruction="return json",
+        user_input="hi",
+        max_tokens=16384,
+        caller="discovery.evaluate_batch",
+    )
+
+    assert registry.max_tokens_seen == [16384]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_structured_task_floors_small_max_tokens() -> None:
+    registry = FakeRegistry(response=LLMResponse(content='{"ok": true}', provider="openai"))
+    service = LLMService(registry=registry, memory=FakeMemoryManager("core"))  # type: ignore[arg-type]
+
+    await service.complete_multimodal_structured_task(
+        system_instruction="return json",
+        user_input="hi",
+        image_inputs=[{"content_id": "1", "data_url": "data:image/png;base64,AA=="}],
+        max_tokens=512,
+        caller="discovery.evaluate_batch",
+    )
+
+    assert registry.max_tokens_seen == [MIN_STRUCTURED_MAX_TOKENS]

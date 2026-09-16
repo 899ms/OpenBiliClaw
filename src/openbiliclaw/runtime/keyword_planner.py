@@ -364,10 +364,12 @@ _PER_PLATFORM_SUPPLY_TOP = 8
 # interest-name fallback. Size max_tokens from the actual per-cycle ask (sum of
 # the gen_batch-capped needs) with a generous per-keyword budget (Chinese phrase
 # + JSON quoting). Over-provisioning is effectively free: max_tokens is a ceiling
-# billed on real output, not a charge. Never drop below the prior 4096 default.
+# billed on real output, not a charge. The floor is 8192 (was 4096) because
+# reasoning-first instances can otherwise spend the whole budget on invisible
+# thinking and return no final JSON at all.
 _MERGED_TOKENS_PER_KEYWORD = 48
 _MERGED_JSON_OVERHEAD_TOKENS = 1024
-_MERGED_MIN_MAX_TOKENS = 4096
+_MERGED_MIN_MAX_TOKENS = 8192
 _INSPIRATION_AXIS_KEYWORD_MAX_TOKENS = 8192
 # F2 (Phase 2.1): the single axis+keyword call keeps the 8192 floor for small
 # slot counts and only scales past a comfortable threshold, so high-platform
@@ -1302,7 +1304,8 @@ class KeywordPlanner:
                 # Budget the merged call's max_tokens from the actual ask (sum of the
                 # gen_batch-capped needs) so the trailing platforms in the JSON are
                 # never truncated onto the interest-name fallback. Scales with
-                # platform count and gen_batch; floored at the prior 4096 default.
+                # platform count and gen_batch; floored at 8192 so reasoning-first
+                # instances can finish thinking before emitting the JSON.
                 merged_max_tokens = max(
                     _MERGED_MIN_MAX_TOKENS,
                     total_ask * _MERGED_TOKENS_PER_KEYWORD + _MERGED_JSON_OVERHEAD_TOKENS,

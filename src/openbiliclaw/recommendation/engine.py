@@ -31,7 +31,7 @@ from openbiliclaw.discovery.temporal import (
     parse_temporal_evaluation,
     schedule_temporal_evaluation,
 )
-from openbiliclaw.llm.base import classify_llm_failure_kind
+from openbiliclaw.llm.base import classify_llm_failure_kind, is_reasoning_budget_exhausted
 from openbiliclaw.llm.json_utils import (
     extract_llm_json_list,
     extract_llm_json_object,
@@ -1986,7 +1986,7 @@ class RecommendationEngine:
         for batch_start in range(0, len(items), batch_size):
             batch = items[batch_start : batch_start + batch_size]
             try:
-                await self._classify_batch(batch, profile)
+                await self._classify_batch_with_split_retry(batch, profile)
             except Exception:
                 logger.exception(
                     "classify_pool_backlog: batch failed (%d items)",
@@ -2067,6 +2067,51 @@ class RecommendationEngine:
         )
         return classified
 
+    async def _classify_batch_with_split_retry(
+        self,
+        batch: list[DiscoveredContent],
+        profile: SoulProfile,
+        *,
+        max_split_depth: int = 3,
+        max_extra_requests: int = 6,
+    ) -> None:
+        """Classify a batch, halving it when reasoning exhausts the budget.
+
+        ``recommendation.evaluate_batch`` is bounded JSON scoring, but a
+        reasoning-first instance can still spend the whole ``max_tokens`` on
+        invisible thinking and return no final content
+        (``finish_reason=length``). That failure is size-dependent — a smaller
+        batch needs less output — so retry the batch in halves, bounded by
+        depth and an extra-request budget, before letting it fail. Rate
+        limits / auth / transport failures propagate unchanged.
+        """
+        budget = {"remaining": max(0, int(max_extra_requests))}
+
+        async def run(items: list[DiscoveredContent], depth: int) -> None:
+            try:
+                await self._classify_batch(items, profile)
+                return
+            except Exception as exc:
+                if (
+                    not is_reasoning_budget_exhausted(exc)
+                    or len(items) <= 1
+                    or depth >= max_split_depth
+                    or budget["remaining"] <= 0
+                ):
+                    raise
+                logger.warning(
+                    "classify_pool_backlog: batch of %d exhausted the reasoning budget; splitting",
+                    len(items),
+                )
+            midpoint = max(1, len(items) // 2)
+            for subset in (items[:midpoint], items[midpoint:]):
+                if not subset or budget["remaining"] <= 0:
+                    break
+                budget["remaining"] -= 1
+                await run(subset, depth + 1)
+
+        await run(batch, 0)
+
     async def _classify_batch(
         self,
         batch: list[DiscoveredContent],
@@ -2130,10 +2175,14 @@ class RecommendationEngine:
         response = await complete_structured(
             system_instruction=messages[0]["content"],
             user_input=messages[1]["content"],
-            max_tokens=8192,
+            max_tokens=16384,
             # v0.3.51+: structured XHS classification — pure score +
             # categorical fields, doesn't need deep reasoning; send low
             # portable effort because some models reject empty reasoning.
+            # v0.3.x: 16384 matches discovery evaluate_batch so a
+            # reasoning-first instance can finish thinking and still emit the
+            # full batch JSON; the caller also splits the batch on
+            # reasoning-budget exhaustion (see _classify_batch_with_split_retry).
             reasoning_effort=None,
             caller="recommendation.evaluate_batch",
             **without_core_memory_kwargs(complete_structured),
@@ -4143,6 +4192,36 @@ class RecommendationEngine:
         """
         budget = {"remaining": max(0, int(max_extra_requests))}
 
+        async def run_subsets(
+            subsets: tuple[list[DiscoveredContent], ...],
+            depth: int,
+            completed: int,
+        ) -> int:
+            total = completed
+            for subset in subsets:
+                if not subset or budget["remaining"] <= 0:
+                    break
+                budget["remaining"] -= 1
+                try:
+                    total += await run(subset, depth + 1)
+                except ExpressionCopyTransientError as downstream:
+                    raise ExpressionCopyTransientError(
+                        kind=downstream.kind,
+                        completed=total + downstream.completed,
+                        retry_after=downstream.retry_after,
+                    ) from downstream
+                except asyncio.CancelledError:
+                    raise
+                except Exception as downstream:
+                    if classify_llm_failure_kind(downstream) in {
+                        "auth_failed",
+                        "no_provider",
+                    }:
+                        prior = max(0, int(getattr(downstream, "completed", 0) or 0))
+                        downstream.completed = total + prior  # type: ignore[attr-defined]
+                    raise
+            return total
+
         async def run(items: list[DiscoveredContent], depth: int) -> int:
             try:
                 return await self._precompute_batch(items, profile, fallback_to_single=False)
@@ -4157,30 +4236,26 @@ class RecommendationEngine:
                 else:
                     midpoint = max(1, len(missing) // 2)
                     subsets = (missing[:midpoint], missing[midpoint:])
-                total = completed
-                for subset in subsets:
-                    if not subset or budget["remaining"] <= 0:
-                        break
-                    budget["remaining"] -= 1
-                    try:
-                        total += await run(subset, depth + 1)
-                    except ExpressionCopyTransientError as downstream:
-                        raise ExpressionCopyTransientError(
-                            kind=downstream.kind,
-                            completed=total + downstream.completed,
-                            retry_after=downstream.retry_after,
-                        ) from downstream
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as downstream:
-                        if classify_llm_failure_kind(downstream) in {
-                            "auth_failed",
-                            "no_provider",
-                        }:
-                            prior = max(0, int(getattr(downstream, "completed", 0) or 0))
-                            downstream.completed = total + prior  # type: ignore[attr-defined]
-                        raise
-                return total
+                return await run_subsets(subsets, depth, completed)
+            except Exception as exc:
+                # A JSON copy batch can also die because a reasoning-first
+                # model burned the whole output budget on invisible thinking
+                # (no final content, finish_reason=length). That failure is
+                # size-dependent, so halve the batch and retry instead of
+                # failing the whole run; rate limits / auth keep propagating.
+                if (
+                    not is_reasoning_budget_exhausted(exc)
+                    or len(items) <= 1
+                    or depth >= max_split_depth
+                    or budget["remaining"] <= 0
+                ):
+                    raise
+                logger.warning(
+                    "expression batch of %d exhausted the reasoning budget; splitting",
+                    len(items),
+                )
+                midpoint = max(1, len(items) // 2)
+                return await run_subsets((items[:midpoint], items[midpoint:]), depth, 0)
 
         return await run(batch, 0)
 
