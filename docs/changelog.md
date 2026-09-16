@@ -10,6 +10,12 @@
 
 ---
 
+## 未发布：画像证据与衰减一致性
+
+- **修复画像证据虚增与重复衰减**：增量分析返回的全量偏好快照不再让未触及兴趣增加 `evidence_count`、刷新 `last_evidence_at` 或复活；兴趣权重新增 `last_decay_at` 增量游标，同一时刻重复合并或按日分批处理与一次处理得到相同衰减结果。新增两条根因回归和相关模块全量回归。
+
+---
+
 ## 未发布：移动端原生播放页 UP 主信息与关注
 
 - **新增 UP 主信息卡片与关注能力（移动端依赖）**：移动端原生播放页此前只能展示视频标题与简介，无法看到“是谁发的”。现在从既有的 `GET /api/bilibili/video/info` `owner` 对象取 `mid` / `name` / `face`；新增 `GET /api/bilibili/user/card?mid=<mid>` 透传 B 站 `/x/web-interface/card`，返回头像、签名、粉丝数与当前登录用户的 `following`；新增 `POST /api/bilibili/user/follow` 用 `{mid, follow}` 走 `/x/relation/modify`（`act=1` 关注 / `act=2` 取消关注），CSRF（`bili_jct`）仍只留在后端。B 站对“已经关注用户，无法重复关注”返回 `22014`，现按成功处理并回查 card，避免移动端本地状态过期时误报失败；card 回查失败时返回请求的目标状态，避免把已成功的关注回滚成失败。新增 `tests/test_bilibili_api.py` 覆盖 card 解析/协议相对头像归一化、关注/取消关注请求体、重复关注幂等、未登录拒绝与 card 回查失败保持状态，`tests/test_api_app.py` 固定两个新端点的响应契约。

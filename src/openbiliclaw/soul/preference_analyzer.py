@@ -1176,6 +1176,7 @@ class PreferenceAnalyzer:
                     **item,
                     "first_seen": now.isoformat(),
                     "last_seen": now.isoformat(),
+                    "last_decay_at": now.isoformat(),
                 }
                 active_aliases = self._alias_key_map(merged_interests.values())
                 continue
@@ -1264,18 +1265,22 @@ class PreferenceAnalyzer:
             if not isinstance(raw_item, dict):
                 continue
             item = self._normalize_interest(raw_item)
-            last_seen_text = str(item.get("last_seen") or "")
+            decay_reference_text = str(item.get("last_decay_at") or item.get("last_seen") or "")
             try:
-                last_seen = datetime.fromisoformat(last_seen_text) if last_seen_text else now
+                decay_reference = (
+                    datetime.fromisoformat(decay_reference_text) if decay_reference_text else now
+                )
             except ValueError:
-                last_seen = now
-            weeks = max((now - last_seen).days, 0) / 7
+                decay_reference = now
+            weeks = max((now - decay_reference).total_seconds(), 0.0) / (7 * 24 * 60 * 60)
             decayed_weight = self._clamp_weight(
                 self._to_float(item.get("weight", 0.0)) * (self.decay_factor_per_week**weeks)
             )
             if decayed_weight < self.min_interest_weight:
                 continue
             item["weight"] = decayed_weight
+            if now >= decay_reference:
+                item["last_decay_at"] = now.isoformat()
             decayed.append(item)
         return decayed
 
@@ -1360,6 +1365,9 @@ class PreferenceAnalyzer:
         aliases = self._interest_aliases(raw_item, canonical_name=name)
         if aliases:
             normalized["aliases"] = aliases
+        last_decay_at = raw_item.get("last_decay_at")
+        if last_decay_at:
+            normalized["last_decay_at"] = last_decay_at
         return normalized
 
     def _merge_interest_record(
@@ -1378,6 +1386,7 @@ class PreferenceAnalyzer:
             "category": canonical_category,
             "first_seen": existing.get("first_seen") or now.isoformat(),
             "last_seen": now.isoformat(),
+            "last_decay_at": now.isoformat(),
             "weight": self._clamp_weight(
                 max(
                     self._to_float(existing.get("weight", 0.0)),
