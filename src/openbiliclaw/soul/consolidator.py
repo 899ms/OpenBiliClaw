@@ -568,19 +568,36 @@ class ProfileConsolidator:
         # ── Stage 3: apply ─────────────────────────────────────────────────
         rename_map: dict[str, str] = {}
         keyword_interest_rename_map: dict[str, str] = {}
+        clusters_by_id = {cluster.cluster_id: cluster for cluster in clusters}
         for op in valid_ops:
             raw_members = op.get("members")
             display_members = raw_members if isinstance(raw_members, list) else []
             members = [_member_name(member) for member in display_members]
             member_keys = _as_str_list(op.get("_member_keys"))
             canonical = str(op.get("canonical", ""))
+            cluster = clusters_by_id.get(str(op.get("cluster_id", "")))
+            qualified_member_keys = (
+                cluster.member_categories is not None
+                if cluster is not None
+                else any("::" in key for key in member_keys)
+            )
+            # Ordinary likes/dislikes clusters identify members by bare name.
+            # The model may echo the prompt's ``{name, category}`` objects even
+            # though plain strings are allowed, so normalize those refs to names
+            # before building the rename map / run record: override remapping,
+            # keyword-label migration and revert pair pinning all key off names.
+            # Qualified homonym clusters keep the category-bearing refs so a
+            # same-surface-name entry remains distinguishable on revert.
+            record_members: list[object] = (
+                list(display_members) if qualified_member_keys else list(members)
+            )
             if op["scope"] == "likes":
                 interests = self._apply_like_merge(
                     interests, members, canonical, member_keys=member_keys
                 )
             else:
                 dislikes_raw = self._apply_dislike_merge(dislikes_raw, members, canonical)
-            for member in display_members:
+            for member in record_members:
                 if isinstance(member, str) and member != canonical:
                     rename_map[member] = canonical
                     if op["scope"] == "likes":
@@ -588,7 +605,7 @@ class ProfileConsolidator:
             report.merges.append(
                 {
                     "scope": op["scope"],
-                    "members": display_members,
+                    "members": record_members,
                     "canonical": canonical,
                     "reason": str(op.get("reason", "")),
                 }
