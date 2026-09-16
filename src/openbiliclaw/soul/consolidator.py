@@ -575,10 +575,10 @@ class ProfileConsolidator:
             members = [_member_name(member) for member in display_members]
             member_keys = _as_str_list(op.get("_member_keys"))
             canonical = str(op.get("canonical", ""))
-            cluster = clusters_by_id.get(str(op.get("cluster_id", "")))
+            op_cluster = clusters_by_id.get(str(op.get("cluster_id", "")))
             qualified_member_keys = (
-                cluster.member_categories is not None
-                if cluster is not None
+                op_cluster.member_categories is not None
+                if op_cluster is not None
                 else any("::" in key for key in member_keys)
             )
             # Ordinary likes/dislikes clusters identify members by bare name.
