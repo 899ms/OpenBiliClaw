@@ -80,6 +80,9 @@ def test_recommendation_server_windows_binds_tcp(monkeypatch) -> None:
 
     calls: list[dict[str, object]] = []
     fake_app = object()
+    # Transport tests must not depend on the developer machine's on-disk LLM
+    # config; the readiness gate itself is covered by test_worker_degraded_boot.
+    monkeypatch.setattr(recommendation_server, "wait_for_buildable_llm", lambda: None)
     monkeypatch.setattr(recommendation_server.os, "name", "nt")
     monkeypatch.setattr(recommendation_server, "create_app", lambda: fake_app)
     monkeypatch.setattr(
@@ -110,6 +113,9 @@ def test_recommendation_server_posix_binds_unix_socket(
     calls: list[dict[str, object]] = []
     fake_app = object()
     sock = recommendation_sock_from_data_path(tmp_path)
+    # Same as the Windows transport test: binding behavior is independent of
+    # the on-disk LLM config readiness gate.
+    monkeypatch.setattr(recommendation_server, "wait_for_buildable_llm", lambda: None)
     monkeypatch.setattr(recommendation_server, "create_app", lambda: fake_app)
     monkeypatch.setattr(
         recommendation_server.uvicorn,
