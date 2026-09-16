@@ -1421,6 +1421,8 @@ def test_prompt_builders_strip_the_interest_decay_cursor() -> None:
         build_awareness_with_confusions_prompt,
         build_insight_prompt,
         build_preference_analysis_prompt,
+        build_soul_profile_prompt,
+        render_preference_summary,
     )
 
     interest = {
@@ -1489,6 +1491,21 @@ def test_prompt_builders_strip_the_interest_decay_cursor() -> None:
 
         assert messages == baselines
         assert "last_decay_at" not in json.dumps(messages, ensure_ascii=False)
+
+    soul_messages = build_soul_profile_prompt(
+        history_summary={},
+        preference_summary=persisted,
+        tone_profile=None,
+    )
+    assert soul_messages == build_soul_profile_prompt(
+        history_summary={},
+        preference_summary=cleaned,
+        tone_profile=None,
+    )
+    assert "last_decay_at" not in json.dumps(soul_messages, ensure_ascii=False)
+
+    assert render_preference_summary(persisted) == render_preference_summary(cleaned)
+    assert "last_decay_at" not in render_preference_summary(persisted)
 
 
 # ----------------------------------------------------------------------

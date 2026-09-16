@@ -253,7 +253,7 @@ def render_preference_summary(preference_summary: dict[str, object]) -> str:
     """Render preference summary into stable text."""
     if not preference_summary:
         return "（暂无偏好摘要）"
-    return json.dumps(preference_summary, ensure_ascii=False, indent=2)
+    return json.dumps(preference_prompt_payload(preference_summary), ensure_ascii=False, indent=2)
 
 
 def _category_vocab_line() -> str:
@@ -465,6 +465,7 @@ def build_soul_profile_prompt(
     source_platform_mix: dict[str, float] | None = None,
 ) -> list[dict[str, str]]:
     """Build a cache-friendly prompt for initial soul-profile generation."""
+    preference_summary = preference_prompt_payload(preference_summary)
     system_prompt = """
 <task>
 你要生成一份人格画像。你是用户的老朋友,正坐在 ta 对面,直接跟 ta 说"你是这样一个人"。
