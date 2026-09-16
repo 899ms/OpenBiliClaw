@@ -1125,7 +1125,7 @@ assert DEFAULT_PREFERENCE_EVENT_CHUNK_SIZE * MAX_CONCURRENT_PREFERENCE_CHUNKS ==
 # }
 ```
 
-`interests` 的内部持久化记录可能包含 `last_decay_at`。它是权重衰减游标，不是新的用户行为时间；真正的行为新鲜度仍由 `last_seen` 表示。生命周期覆盖在接收完整合并快照时，只把新增项或 `last_seen` 发生变化的项视为本轮证据，未触及的保留项沿用原有 `state / evidence_count / last_evidence_at`。
+`interests` 的内部持久化记录可能包含 `last_decay_at`。它是权重衰减游标，不是新的用户行为时间；真正的行为新鲜度仍由 `last_seen` 表示。生命周期覆盖在接收完整合并快照时，只把新增项或 `last_seen` 发生变化的项视为本轮证据，未触及的保留项沿用原有 `state / evidence_count / last_evidence_at`。该游标不会进入任何 LLM prompt：`profile_views.preference_prompt_payload()` 在偏好分析 / 觉察 / 洞察四条 prompt 的 legacy 与 compact-v1 两条视图里统一剔除它（它每次合并都会变化，序列化只会吃 prompt 预算并影响偏好分析的分块判定）；无游标的输入仍渲染出逐字节相同的 prompt。
 
 ### 分类词表与一次性迁移
 
