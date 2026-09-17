@@ -215,11 +215,12 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.222 (2026-09-11)**
+📌 Latest: **v0.3.223 (2026-09-17)**
 
-- **Watch Later / Favorites no longer rejected for protocol-relative covers (issue #237)** — Bilibili `//i2.hdslb.com/...` covers are normalized to `https://...` at the backend, so the desktop / mobile web and Flutter clients save successfully.
-- **Steadier Bilibili video stats** — a new backend video-info endpoint falls back to WBI signing when the plain endpoint is rate-limited (412), so the mobile player's description and likes / coins / favorites / comments no longer go missing.
-- **Optional learned scorer for relevance (experimental)** — Desktop Web / extension "Advanced" can switch between `Agent (default)`, `Shadow (calibration)`, and `Learned (relevance only)`; defaults are unchanged.
+- **Web "Load more / Reshuffle" no longer 403s**: behind reverse proxies and external TLS termination, the recommendation proxy keeps the browser's original Host so the same-origin CSRF check passes again.
+- **Steadier Windows desktop startup and install (issue #250)**: workers wait out an unusable LLM config instead of quitting with error dialogs and auto-restart on crash; the uninstaller blocks while the app runs, and interactive installs launch only after Finish.
+- **Recommendation copy no longer calls old content "latest"**: expression prompts now carry each item's publish and evaluation time, so freshness is judged from data instead of titles or model knowledge.
+- **Mobile player gains a UP master card and follow**: the backend proxies Bilibili's user card and follow / unfollow endpoints, keeping cookies and CSRF tokens server-side.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
