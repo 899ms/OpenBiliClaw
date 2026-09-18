@@ -696,6 +696,92 @@ manage_ollama = true
         assert cfg.soul.insight_note_batch_size == 150
         assert cfg.soul.cognition_max_tokens == 32768
 
+    def test_reply_style_defaults_to_empty(self) -> None:
+        cfg = Config()
+
+        assert cfg.soul.reply_style == ""
+
+    def test_reply_style_round_trip_through_toml(self, tmp_path: Path) -> None:
+        cfg = Config()
+        cfg.soul.reply_style = "语气温和一点，多给具体例子"
+        target = tmp_path / "config.toml"
+
+        save_config(cfg, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert 'reply_style = "语气温和一点，多给具体例子"' in rendered
+        assert loaded.soul.reply_style == "语气温和一点，多给具体例子"
+
+    def test_reply_style_parse_collapses_whitespace_into_one_line(self) -> None:
+        config = _build_config({"soul": {"reply_style": "  温和一点\n\n少用  梗\t "}})
+
+        assert config.soul.reply_style == "温和一点 少用 梗"
+
+    def test_reply_style_over_limit_is_a_blocking_issue(self) -> None:
+        from openbiliclaw.config import MAX_SOUL_REPLY_STYLE_CHARS, _collect_config_issues
+
+        cfg = Config()
+        cfg.soul.reply_style = "x" * MAX_SOUL_REPLY_STYLE_CHARS
+        assert not [
+            issue for issue in _collect_config_issues(cfg) if issue.field == "soul.reply_style"
+        ]
+
+        cfg.soul.reply_style = "x" * (MAX_SOUL_REPLY_STYLE_CHARS + 1)
+        issues = [
+            issue for issue in _collect_config_issues(cfg) if issue.field == "soul.reply_style"
+        ]
+
+        assert len(issues) == 1
+        assert issues[0].severity == "blocking"
+
+    def test_dialogue_tone_prompt_defaults_to_empty(self) -> None:
+        cfg = Config()
+
+        assert cfg.soul.dialogue_tone_prompt == ""
+
+    def test_dialogue_tone_prompt_round_trip_through_toml(self, tmp_path: Path) -> None:
+        cfg = Config()
+        cfg.soul.dialogue_tone_prompt = "像一个老朋友：\n- 多用短句\n- 先问动机"
+        target = tmp_path / "config.toml"
+
+        save_config(cfg, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        # Multi-line values render as one physical line with \n escapes.
+        assert 'dialogue_tone_prompt = "像一个老朋友：\\n- 多用短句\\n- 先问动机"' in rendered
+        assert loaded.soul.dialogue_tone_prompt == "像一个老朋友：\n- 多用短句\n- 先问动机"
+
+    def test_dialogue_tone_prompt_parse_strips_but_preserves_newlines(self) -> None:
+        config = _build_config({"soul": {"dialogue_tone_prompt": "  第一行\n\n  第二行  保留  \n"}})
+
+        assert config.soul.dialogue_tone_prompt == "第一行\n\n  第二行  保留"
+
+    def test_dialogue_tone_prompt_over_limit_is_a_blocking_issue(self) -> None:
+        from openbiliclaw.config import (
+            MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS,
+            _collect_config_issues,
+        )
+
+        cfg = Config()
+        cfg.soul.dialogue_tone_prompt = "x" * MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS
+        assert not [
+            issue
+            for issue in _collect_config_issues(cfg)
+            if issue.field == "soul.dialogue_tone_prompt"
+        ]
+
+        cfg.soul.dialogue_tone_prompt = "x" * (MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS + 1)
+        issues = [
+            issue
+            for issue in _collect_config_issues(cfg)
+            if issue.field == "soul.dialogue_tone_prompt"
+        ]
+
+        assert len(issues) == 1
+        assert issues[0].severity == "blocking"
+
     def test_cognition_budget_knobs_reject_invalid_values(self) -> None:
         from openbiliclaw.config import _collect_config_issues
 

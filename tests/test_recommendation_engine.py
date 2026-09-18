@@ -6935,3 +6935,103 @@ def test_mmr_reuses_each_cosine_pair_only_within_one_batch(monkeypatch, partial)
     assert [item.bvid for item in second] == [item.bvid for item in first]
     assert calls, "a later batch must calculate against its own vectors"
     assert max(calls.values()) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_expression_forwards_reply_style_into_tone_block() -> None:
+    """issue #255: RecommendationEngine.reply_style reaches the expression tone block."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        llm = _DummyLLM()
+        engine = RecommendationEngine(llm=llm, database=db, reply_style="像损友一样毒舌")
+
+        await engine.generate_expression(
+            DiscoveredContent(
+                bvid="BV1STYLE255",
+                title="讲透贸易逆差的底层逻辑",
+                up_name="经济观察",
+                description="从历史和制度角度解释问题。",
+                relevance_score=0.89,
+            ),
+            _build_profile(),
+        )
+
+        user_input = str(llm.calls[0]["user_input"])
+        assert "- 回复风格: 像损友一样毒舌" in user_input
+
+
+@pytest.mark.asyncio
+async def test_generate_expression_default_reply_style_leaves_prompt_untouched() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        llm = _DummyLLM()
+        engine = RecommendationEngine(llm=llm, database=db)
+
+        await engine.generate_expression(
+            DiscoveredContent(
+                bvid="BV1NODEFAULT255",
+                title="讲透贸易逆差的底层逻辑",
+                up_name="经济观察",
+                description="从历史和制度角度解释问题。",
+                relevance_score=0.89,
+            ),
+            _build_profile(),
+        )
+
+        user_input = str(llm.calls[0]["user_input"])
+        assert "- 回复风格:" not in user_input
+
+
+@pytest.mark.asyncio
+async def test_precompute_batch_forwards_reply_style_into_tone_block() -> None:
+    """issue #255: the batch expression path injects reply_style too."""
+
+    class _BatchLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def complete_structured_task(
+            self,
+            *,
+            system_instruction: str,
+            user_input: str,
+            **_kwargs: object,
+        ) -> LLMResponse:
+            self.calls.append({"system_instruction": system_instruction, "user_input": user_input})
+            return LLMResponse(
+                content=json.dumps(
+                    [
+                        {
+                            "bvid": "BV1BATCH255",
+                            "expression": "这条会接住你最近想把问题想透的状态。",
+                            "topic_label": "想透的状态",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                provider="test",
+                model="dummy",
+                usage={},
+            )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test.db")
+        db.initialize()
+        llm = _BatchLLM()
+        engine = RecommendationEngine(llm=llm, database=db, reply_style="多用短句")
+        batch = [
+            DiscoveredContent(
+                bvid="BV1BATCH255",
+                title="结构化工作流复盘",
+                up_name="效率实验室",
+                description="如何把复杂问题拆成稳定系统。",
+                relevance_score=0.9,
+            )
+        ]
+
+        await engine._precompute_batch(batch, _build_profile())
+
+        user_input = str(llm.calls[0]["user_input"])
+        assert "- 回复风格: 多用短句" in user_input

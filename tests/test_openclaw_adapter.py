@@ -1085,6 +1085,8 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             module_overrides=None,
             concurrency: int = 3,
             concurrency_gate: object | None = None,
+            reply_style: str = "",
+            dialogue_tone_prompt: str = "",
         ) -> None:
             self.registry = registry
             self.memory = memory
@@ -1092,6 +1094,8 @@ def test_build_openclaw_adapter_services_reuses_shared_database(
             self.module_overrides = module_overrides
             self.concurrency = concurrency
             self.concurrency_gate = concurrency_gate
+            self.reply_style = reply_style
+            self.dialogue_tone_prompt = dialogue_tone_prompt
 
     class FakeRecommendationEngine:
         def __init__(

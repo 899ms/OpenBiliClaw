@@ -7764,6 +7764,24 @@
           <input id="cfgCognitionMaxTokens" type="number" min="1024" max="128000" step="1" placeholder="32768">
         </div>
       </div>
+
+      <div class="settings-section">
+        <h3>回复语气</h3>
+        <div class="settings-field">
+          <label for="cfgReplyStyle">回复风格指令</label>
+          <input id="cfgReplyStyle" type="text" maxlength="200" autocomplete="off" placeholder="例如：说话简短直接，少用表情包语气">
+        </div>
+        <p class="settings-hint">追加一条语气要求，影响对话、推荐文案与画像，≤200 字，留空恢复默认。</p>
+        <div class="settings-field">
+          <label for="cfgDialogueTonePrompt">聊天语气块（整体替换）</label>
+          <textarea id="cfgDialogueTonePrompt" rows="3" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="留空使用内置默认语气"></textarea>
+        </div>
+        <p class="settings-hint">整体替换聊天 prompt 的语气块，只影响聊天，支持多行，≤1000 字，留空恢复默认；设置后回复风格指令对聊天不再生效。</p>
+        <div class="settings-actions">
+          <button id="cfgTestTone" class="settings-save" type="button">测试语气</button>
+        </div>
+        <p class="settings-hint" id="cfgTestToneResult" aria-live="polite"></p>
+      </div>
       </div>
 
       <div id="settingsPanelLogging" class="settings-panel" data-settings-panel="logging" role="tabpanel" aria-labelledby="settingsTabLogging" hidden>

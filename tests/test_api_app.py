@@ -2505,6 +2505,8 @@ class TestBackendAPI:
                 module_overrides: object | None = None,
                 concurrency: int = 1,
                 concurrency_gate: object | None = None,
+                reply_style: str = "",
+                dialogue_tone_prompt: str = "",
             ) -> None:
                 self.registry = registry
                 self.memory = memory
@@ -2512,6 +2514,8 @@ class TestBackendAPI:
                 self.module_overrides = module_overrides
                 self.concurrency = concurrency
                 self.concurrency_gate = concurrency_gate
+                self.reply_style = reply_style
+                self.dialogue_tone_prompt = dialogue_tone_prompt
 
         class FakeBilibiliClient:
             def __init__(self, *, cookie: str, proxy: str | None = None) -> None:
@@ -2756,6 +2760,8 @@ class TestBackendAPI:
                 module_overrides: object | None = None,
                 concurrency: int = 1,
                 concurrency_gate: object | None = None,
+                reply_style: str = "",
+                dialogue_tone_prompt: str = "",
             ) -> None:
                 self.registry = registry
                 self.memory = memory
@@ -2763,6 +2769,8 @@ class TestBackendAPI:
                 self.module_overrides = module_overrides
                 self.concurrency = concurrency
                 self.concurrency_gate = concurrency_gate
+                self.reply_style = reply_style
+                self.dialogue_tone_prompt = dialogue_tone_prompt
 
         class FakeBilibiliClient:
             def __init__(self, *, cookie: str, proxy: str | None = None) -> None:
@@ -12728,6 +12736,60 @@ class TestBackendAPI:
         # Read path: surfaced in the response so the settings page can reload it.
         assert data["config"]["sources"]["twitter"]["enabled"] is True
         assert data["config"]["scheduler"]["pool_source_shares"]["twitter"] == 4
+
+    def test_put_config_persists_soul_tone_fields(self, monkeypatch, tmp_path) -> None:
+        """PUT /api/config must persist soul.reply_style / dialogue_tone_prompt
+        (issue #255) — previously the soul merge whitelisted only the prompt
+        views / posture gate / int fields, so both tone fields were silently
+        dropped from the hot-reload rebuild and the settings echo."""
+        from fastapi.testclient import TestClient
+
+        from openbiliclaw.config import Config, LLMConfig, LLMProviderConfig, save_config
+
+        config_path = tmp_path / "config.toml"
+        cfg = Config(
+            llm=LLMConfig(
+                default_provider="ollama",
+                ollama=LLMProviderConfig(model="llama3", base_url="http://localhost:11434"),
+            ),
+        )
+        save_config(cfg, config_path)
+        monkeypatch.setenv("OPENBILICLAW_PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setattr("openbiliclaw.config.load_config", lambda *_a, **_kw: cfg)
+        monkeypatch.setattr(
+            "openbiliclaw.config.save_config",
+            lambda c, path=None: save_config(c, config_path),
+        )
+
+        app = create_app(memory_manager=object(), database=object(), soul_engine=object())
+        client = TestClient(app)
+
+        response = client.put(
+            "/api/config",
+            json={
+                "soul": {
+                    "reply_style": "  请使用正式书面语，\n避免网络梗。 ",
+                    "dialogue_tone_prompt": "你是严谨的学习顾问。\n- 先给结论\n- 再分点",
+                }
+            },
+        )
+
+        assert response.status_code == 202, response.text
+        data = response.json()
+        assert data["ok"] is True
+        # Write path: same normalization as _build_config (reply_style is
+        # collapsed to one line; dialogue_tone_prompt keeps newlines).
+        assert cfg.soul.reply_style == "请使用正式书面语， 避免网络梗。"
+        assert cfg.soul.dialogue_tone_prompt == "你是严谨的学习顾问。\n- 先给结论\n- 再分点"
+        # Read path: surfaced in the response echo.
+        assert data["config"]["soul"]["reply_style"] == cfg.soul.reply_style
+        assert data["config"]["soul"]["dialogue_tone_prompt"] == cfg.soul.dialogue_tone_prompt
+        # Persisted to disk and reloadable.
+        from openbiliclaw.config import load_config
+
+        reloaded = load_config(config_path)
+        assert reloaded.soul.reply_style == cfg.soul.reply_style
+        assert reloaded.soul.dialogue_tone_prompt == cfg.soul.dialogue_tone_prompt
 
     def test_put_config_persists_reddit_modes_budgets_and_pool_share(
         self, monkeypatch, tmp_path

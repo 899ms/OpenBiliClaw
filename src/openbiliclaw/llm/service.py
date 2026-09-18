@@ -274,6 +274,16 @@ class LLMService:
     module_overrides: Mapping[str, ModuleOverride] = field(default_factory=dict)
     concurrency: int = DEFAULT_LLM_CONCURRENCY
     concurrency_gate: LLMConcurrencyGate | None = None
+    # Free-text reply-style instruction from ``soul.reply_style`` (issue #255).
+    # Forwarded into the dialogue prompt's tone block; empty (default) keeps
+    # prompt output byte-identical.
+    reply_style: str = ""
+    # Free-text full replacement for the dialogue prompt's tone block, from
+    # ``soul.dialogue_tone_prompt``. Empty (default) keeps prompt output
+    # byte-identical; non-empty replaces the whole rendered tone block in
+    # ``complete_socratic_dialogue`` (and suppresses the reply_style line
+    # there, since the entire block is swapped).
+    dialogue_tone_prompt: str = ""
     _logged_unknown_override_keys: set[tuple[str, str]] = field(
         default_factory=set, init=False, repr=False
     )
@@ -857,6 +867,8 @@ class LLMService:
             tone_profile=tone_profile,
             history=[],
             source_platform_mix=source_mix or None,
+            reply_style=self.reply_style,
+            dialogue_tone_prompt=self.dialogue_tone_prompt,
         )
         return await self.complete_with_core_memory(
             system_instruction=prompt_messages[0]["content"],

@@ -109,21 +109,32 @@ def _tone_context_line(source_platform_mix: dict[str, float] | None) -> str:
 def _render_tone_profile(
     tone_profile: ToneProfile | None,
     source_platform_mix: dict[str, float] | None = None,
+    reply_style: str = "",
 ) -> str:
-    """Render tone profile guidance for prompt builders."""
+    """Render tone profile guidance for prompt builders.
+
+    ``reply_style`` (issue #255) is a free-text user instruction from
+    ``soul.reply_style``. Empty (default) keeps the rendered block
+    byte-identical; non-empty appends one extra ``回复风格`` line.
+    """
     tone = tone_profile or {
         "density": "balanced",
         "warmth": "warm",
         "playfulness": "low",
         "directness": "direct",
     }
-    return (
+    rendered = (
         _tone_context_line(source_platform_mix) + "\n"
         f"- 信息密度: {tone['density']}\n"
         f"- 情绪温度: {tone['warmth']}\n"
         f"- 梗感强度: {tone['playfulness']}\n"
         f"- 直给程度: {tone['directness']}"
     )
+    # Collapse whitespace so the instruction always stays a single line.
+    style_line = " ".join(str(reply_style or "").split())
+    if style_line:
+        rendered += f"\n- 回复风格: {style_line}"
+    return rendered
 
 
 def _normalize_prompt_style_list(value: object) -> list[str]:
@@ -205,6 +216,8 @@ def build_socratic_dialogue_prompt(
     tone_profile: ToneProfile | None,
     history: list[dict[str, str]],
     source_platform_mix: dict[str, float] | None = None,
+    reply_style: str = "",
+    dialogue_tone_prompt: str = "",
 ) -> list[dict[str, str]]:
     """Build chat messages for Socratic dialogue generation.
 
@@ -223,8 +236,17 @@ def build_socratic_dialogue_prompt(
     ``LLMService.complete_with_core_memory`` (and its ``complete_with_tools``
     sibling), not here. Do not resurrect any per-service core-memory-block
     getattr probe at the dialogue call site.
+
+    ``dialogue_tone_prompt`` (from ``soul.dialogue_tone_prompt``) is a
+    free-text full replacement for the tone-profile block: when non-empty
+    (after strip) it takes the place of ``_render_tone_profile(...)`` —
+    including any ``reply_style`` line — while every other system-prompt
+    segment stays byte-identical. Empty (default) changes nothing.
     """
     friend_label = _friend_label_from_mix(source_platform_mix)
+    tone_block = dialogue_tone_prompt.strip() or _render_tone_profile(
+        tone_profile, source_platform_mix, reply_style
+    )
     system_prompt = "\n\n".join(
         [
             "你是 OpenBiliClaw，一个像朋友一样理解用户的 AI 伙伴。",
@@ -238,7 +260,7 @@ def build_socratic_dialogue_prompt(
                 "不要声称这些信息只能留在当前聊天上下文。你不能修改 B 站或其他"
                 "内容平台自身的推荐算法，必须把本地推荐与平台推荐区分清楚。"
             ),
-            _render_tone_profile(tone_profile, source_platform_mix),
+            tone_block,
             "以下是当前用户的 core memory，请把它作为理解用户的背景，而不是机械复述：",
             core_memory_text,
         ]
@@ -463,6 +485,7 @@ def build_soul_profile_prompt(
     active_insights: list[dict[str, object]] | None = None,
     tone_profile: ToneProfile | None,
     source_platform_mix: dict[str, float] | None = None,
+    reply_style: str = "",
 ) -> list[dict[str, str]]:
     """Build a cache-friendly prompt for initial soul-profile generation."""
     preference_summary = preference_prompt_payload(preference_summary)
@@ -616,7 +639,7 @@ def build_soul_profile_prompt(
     user_prompt = "\n\n".join(
         [
             "<tone_profile>",
-            _render_tone_profile(tone_profile, source_platform_mix),
+            _render_tone_profile(tone_profile, source_platform_mix, reply_style),
             "</tone_profile>",
             "<preference_summary>",
             json.dumps(preference_summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -2121,6 +2144,7 @@ def build_recommendation_expression_prompt(
     content_summary: dict[str, object],
     tone_profile: ToneProfile | None,
     source_platform: str = "bilibili",
+    reply_style: str = "",
 ) -> list[dict[str, str]]:
     """Build a structured prompt for friend-style recommendation expression.
 
@@ -2143,7 +2167,7 @@ def build_recommendation_expression_prompt(
         source_platform or "bilibili",
         "</source_platform>",
         "<tone_profile>",
-        _render_tone_profile(tone_profile, {source_platform: 1.0}),
+        _render_tone_profile(tone_profile, {source_platform: 1.0}, reply_style),
         "</tone_profile>",
         "<content_summary>",
         json.dumps(
@@ -2209,6 +2233,7 @@ def build_batch_expression_prompt(
     content_items: list[dict[str, object]],
     tone_profile: ToneProfile | None,
     source_platform: str = "bilibili",
+    reply_style: str = "",
 ) -> list[dict[str, str]]:
     """Build a prompt that generates expressions for multiple items in one call.
 
@@ -2226,7 +2251,7 @@ def build_batch_expression_prompt(
         source_platform or "bilibili",
         "</source_platform>",
         "<tone_profile>",
-        _render_tone_profile(tone_profile, {source_platform: 1.0}),
+        _render_tone_profile(tone_profile, {source_platform: 1.0}, reply_style),
         "</tone_profile>",
         "<content_batch>",
         json.dumps(

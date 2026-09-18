@@ -135,12 +135,13 @@ def test_desktop_advanced_panel_owns_all_moved_controls_and_recommendation_field
         assert f'max="{maximum}"' in control.group(0)
         assert f'placeholder="{default}"' in control.group(0)
 
-    assert advanced_html.count("<section") == 5
+    assert advanced_html.count("<section") == 6
     assert advanced_html.count("候选评分模式") >= 1
     assert advanced_html.count("推荐增强") >= 1
     assert advanced_html.count("多模态处理") >= 1
     assert advanced_html.count("搜索词生成") >= 1
     assert advanced_html.count("认知循环预算") >= 1
+    assert advanced_html.count("回复语气") >= 1
 
 
 def test_desktop_settings_tabs_have_tabpanel_contract_and_advanced_registration() -> None:

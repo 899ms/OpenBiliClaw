@@ -18832,6 +18832,8 @@ def create_app(
                 awareness_event_batch_size=int(cfg.soul.awareness_event_batch_size),
                 insight_note_batch_size=int(cfg.soul.insight_note_batch_size),
                 cognition_max_tokens=int(cfg.soul.cognition_max_tokens),
+                reply_style=str(cfg.soul.reply_style),
+                dialogue_tone_prompt=str(cfg.soul.dialogue_tone_prompt),
             ),
             issues=issue_list,
         )
@@ -21817,6 +21819,13 @@ def create_app(
                         prompt_view_field,
                         str(sdata[prompt_view_field]).strip().lower(),
                     )
+            # Free-text tone fields (issue #255). Mirror _build_config
+            # normalization: reply_style collapses to one line;
+            # dialogue_tone_prompt keeps internal newlines, strip only.
+            if "reply_style" in sdata:
+                cfg.soul.reply_style = " ".join(str(sdata["reply_style"] or "").split())
+            if "dialogue_tone_prompt" in sdata:
+                cfg.soul.dialogue_tone_prompt = str(sdata["dialogue_tone_prompt"] or "").strip()
             if "posture_gate_mode" in sdata:
                 cfg.soul.posture_gate_mode = str(sdata["posture_gate_mode"]).strip().lower()
             if "posture_gate_force_enforce" in sdata:

@@ -154,6 +154,8 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         cognition_max_tokens=int(getattr(soul_cfg, "cognition_max_tokens", 32768)),
         posture_gate_mode=str(getattr(soul_cfg, "posture_gate_mode", "shadow")),
         posture_gate_force_enforce=bool(getattr(soul_cfg, "posture_gate_force_enforce", False)),
+        reply_style=str(getattr(soul_cfg, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(soul_cfg, "dialogue_tone_prompt", "")),
         module_overrides=module_overrides,
         llm_concurrency=llm_concurrency,
         llm_concurrency_gate=llm_gate,
@@ -209,6 +211,8 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         module_overrides=module_overrides,
         concurrency=llm_concurrency,
         concurrency_gate=llm_gate,
+        reply_style=str(getattr(soul_cfg, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(soul_cfg, "dialogue_tone_prompt", "")),
     )
     from openbiliclaw.llm.registry import build_embedding_service
     from openbiliclaw.recommendation.curator import PoolCurator
@@ -256,6 +260,7 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
             config.data_path / "runtime" / "serve_snapshot.json"
         ),
         serve_outbox=ServeOutbox(config.data_path / "runtime" / "serve_outbox.jsonl"),
+        reply_style=str(getattr(soul_cfg, "reply_style", "")),
     )
 
     from openbiliclaw.discovery.engine import DiscoveryConcurrencyController

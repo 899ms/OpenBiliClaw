@@ -2425,6 +2425,8 @@ class SoulConfigOut(BaseModel):
     awareness_event_batch_size: int = Field(default=300, ge=10, le=900)
     insight_note_batch_size: int = Field(default=150, ge=10, le=450)
     cognition_max_tokens: int = Field(default=32768, ge=1024, le=128000)
+    reply_style: str = ""
+    dialogue_tone_prompt: str = ""
 
 
 class DiscoveryConfigOut(BaseModel):

@@ -896,6 +896,8 @@ def _build_soul_engine() -> Any:
         cognition_max_tokens=int(getattr(cfg.soul, "cognition_max_tokens", 32768)),
         posture_gate_mode=cfg.soul.posture_gate_mode,
         posture_gate_force_enforce=cfg.soul.posture_gate_force_enforce,
+        reply_style=str(getattr(cfg.soul, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(cfg.soul, "dialogue_tone_prompt", "")),
         module_overrides=module_overrides_from_config(cfg),
         llm_concurrency=cfg.llm.concurrency,
         llm_concurrency_gate=_build_llm_concurrency_gate(),
@@ -964,6 +966,8 @@ def _build_recommendation_engine() -> Any:
         module_overrides=module_overrides_from_config(cfg),
         concurrency=cfg.llm.concurrency,
         concurrency_gate=_build_llm_concurrency_gate(),
+        reply_style=str(getattr(cfg.soul, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(cfg.soul, "dialogue_tone_prompt", "")),
     )
     from openbiliclaw.llm.registry import build_embedding_service
 
@@ -1007,6 +1011,7 @@ def _build_recommendation_engine() -> Any:
             cfg.data_path / "runtime" / "serve_snapshot.json"
         ),
         serve_outbox=ServeOutbox(cfg.data_path / "runtime" / "serve_outbox.jsonl"),
+        reply_style=str(getattr(cfg.soul, "reply_style", "")),
     )
 
 

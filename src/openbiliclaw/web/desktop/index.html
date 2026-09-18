@@ -1301,6 +1301,20 @@
               <label class="settings-field"><span>认知输出 token 上限</span><input id="cognitionMaxTokens" type="number" min="1024" max="128000" step="1" placeholder="32768" inputmode="numeric"></label>
             </div>
           </section>
+
+          <section class="settings-advanced-section" aria-labelledby="advancedReplyStyleHeading">
+            <div class="settings-advanced-section-head">
+              <p class="settings-section-kicker">Reply style</p>
+              <h3 id="advancedReplyStyleHeading">回复语气</h3>
+            </div>
+            <div class="settings-advanced-fields">
+              <label class="settings-field full"><span>回复风格指令</span><input id="replyStyle" type="text" maxlength="200" autocomplete="off" placeholder="例如：说话简短直接，少用表情包语气"></label>
+              <label class="settings-field full"><span>聊天语气块（整体替换）</span><textarea id="dialogueTonePrompt" rows="4" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="留空使用内置默认语气"></textarea></label>
+            </div>
+            <p class="settings-note-inline">回复风格指令：追加一条语气要求，影响对话、推荐文案与画像，≤200 字，留空恢复默认。聊天语气块：整体替换聊天 prompt 的语气部分，只影响聊天，支持多行，≤1000 字，留空恢复默认；设置后回复风格指令对聊天不再生效。</p>
+            <div class="drawer-actions"><button class="pill-btn" id="testToneBtn" type="button">测试语气</button></div>
+            <p class="settings-note-inline" id="testToneResult" aria-live="polite"></p>
+          </section>
         </div>
 
         <div id="settingsPanelGeneral" class="settings-panel" data-settings-panel="general" role="tabpanel" aria-labelledby="settingsTabGeneral" hidden>

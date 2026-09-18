@@ -13,7 +13,7 @@
 - **AwarenessAnalyzer** — 基于近期事件生成结构化觉察笔记
 - **InsightAnalyzer** — 基于觉察、偏好和画像生成洞察假设；合并同名假设时按 `user_verdict` 决定置信度走向（见下「假设置信度与用户判断」）
 - **DialogueInsightAnalyzer** — 从聊天中提取候选长期理解信号
-- **ToneProfile** — 从画像、偏好和近期反馈推断语气风格，用于推荐、画像总结和对话
+- **ToneProfile** — 从画像、偏好和近期反馈推断语气风格，用于推荐、画像总结和对话；`[soul] reply_style`（issue #255）可在语气块追加一行自由文本指令，`[soul] dialogue_tone_prompt` 可整体替换对话 prompt 的语气块（仅对话，其余 prompt 不受影响），两者为空时 prompt 均逐字节不变
 - **SocraticDialogue** — 苏格拉底式用户对话，通过追问深化理解
 - **AvoidanceSpeculator** — 主动确认用户可能想避开的内容方向
 - **SoulProfile** — 用户灵魂画像数据结构
@@ -1386,6 +1386,7 @@ tone = build_tone_profile(
 17. **聊天信号受控生效**：聊天先落 `dialogue` 事件和 `insight_candidates.json`，高置信度候选或重复出现的候选才会进入偏好更新
 18. **语气不单独持久化**：`ToneProfile` 是从画像、偏好和近期反馈实时推断出的派生层，避免把易调参的表达风格绑死在 `soul.json`
 19. **“老B友”是基础人格，不是固定模板**：聊天、推荐和画像总结共用同一套语气维度，但会随着用户画像和近期反馈在信息密度、温度、梗感和直给程度上细调
+20. **用户自定义语气只追加、不改写**：`[soul] reply_style`（issue #255）非空时在四类用户向 prompt 的语气块末尾追加一行 `- 回复风格: <文本>`（单一注入缝 `_render_tone_profile()`），为空时逐字节不变；经 `SoulEngine._reply_style` 分发给对话 `LLMService` 与 `ProfileBuilder`，推荐侧由 `RecommendationEngine._reply_style` 独立接线。唯一的替换例外是 `[soul] dialogue_tone_prompt`：仅对话 prompt 的语气块可被用户文本整体替换（身份、行为说明、能力边界、core memory 段落不动），推荐与画像 prompt 永远不接受替换
 20. **认知变化只在关键时刻生成**：只有新增高权重兴趣、明确避雷方向或画像明显转向时，才会形成 `cognition update`，避免把普通波动都做成提醒
 21. **账户同步只补事件，不单独改画像**：history / favorites / following 统一先转成事件，再复用现有偏好分析与画像更新链，避免出现第二套理解逻辑
 22. **画像先写“怎么理解世界”，再写“看了什么”**：`personality_portrait` 必须先围绕认知风格、驱动力和当前阶段组织，兴趣 topic 最多只作为少量证据出现，避免退化成偏好标签润色稿
