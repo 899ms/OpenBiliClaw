@@ -2395,3 +2395,79 @@ class TestReplyStyleInjection:
         )
 
         assert "- 回复风格: 多用短句" in messages[1]["content"]
+
+
+class TestDialogueTonePromptReplacement:
+    """``soul.dialogue_tone_prompt`` replaces the dialogue tone block; empty is byte-identical."""
+
+    _TONE = {
+        "density": "dense",
+        "warmth": "warm",
+        "playfulness": "medium",
+        "directness": "balanced",
+    }
+
+    def _dialogue_kwargs(self) -> dict[str, object]:
+        return {
+            "user_message": "我最近有点迷上纪录片",
+            "core_memory_text": "",
+            "tone_profile": self._TONE,
+            "history": [],
+        }
+
+    def test_empty_dialogue_tone_prompt_is_byte_identical(self) -> None:
+        kwargs = self._dialogue_kwargs()
+
+        baseline = build_socratic_dialogue_prompt(**kwargs)
+        assert baseline == build_socratic_dialogue_prompt(**kwargs, dialogue_tone_prompt="")
+        assert baseline == build_socratic_dialogue_prompt(**kwargs, dialogue_tone_prompt="  \n\t ")
+
+    def test_non_empty_replaces_tone_block_and_keeps_other_segments(self) -> None:
+        custom = "说话像一个爱看纪录片的老朋友：\n- 多用短句\n- 先问动机再给建议"
+        baseline = build_socratic_dialogue_prompt(
+            **self._dialogue_kwargs(), reply_style="像损友一样毒舌"
+        )
+        replaced = build_socratic_dialogue_prompt(
+            **self._dialogue_kwargs(),
+            reply_style="像损友一样毒舌",
+            dialogue_tone_prompt=custom,
+        )
+
+        baseline_system = baseline[0]["content"]
+        replaced_system = replaced[0]["content"]
+
+        # The whole rendered tone block (including the reply_style line) is gone.
+        assert "- 信息密度" in baseline_system
+        assert "- 回复风格: 像损友一样毒舌" in baseline_system
+        assert "- 信息密度" not in replaced_system
+        assert "- 情绪温度" not in replaced_system
+        assert "- 回复风格:" not in replaced_system
+        # The user text appears verbatim (multi-line preserved).
+        assert custom in replaced_system
+        # Identity / Socratic behaviour / capability boundary / core-memory
+        # lead-in segments stay byte-identical.
+        for segment in (
+            "你是 OpenBiliClaw，一个像朋友一样理解用户的 AI 伙伴。",
+            "请使用苏格拉底式对话风格",
+            "能力边界：",
+            "以下是当前用户的 core memory，请把它作为理解用户的背景，而不是机械复述：",
+        ):
+            assert segment in replaced_system
+
+    def test_dialogue_tone_prompt_is_stripped_but_not_collapsed(self) -> None:
+        messages = build_socratic_dialogue_prompt(
+            **self._dialogue_kwargs(),
+            dialogue_tone_prompt="\n  第一行\n  第二行  \n",
+        )
+
+        assert "第一行\n  第二行" in messages[0]["content"]
+
+    def test_other_builders_have_no_dialogue_tone_prompt_param(self) -> None:
+        import inspect
+
+        for builder in (
+            build_soul_profile_prompt,
+            build_recommendation_expression_prompt,
+            build_batch_expression_prompt,
+        ):
+            assert "dialogue_tone_prompt" not in inspect.signature(builder).parameters

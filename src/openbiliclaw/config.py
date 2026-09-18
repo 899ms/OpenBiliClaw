@@ -1634,6 +1634,9 @@ _COGNITION_PROMPT_VIEW_MODES = frozenset({"legacy", "compact-v1"})
 # Free-text reply-style instruction (issue #255). Capped so a paste accident
 # cannot blow up the user-facing prompt budgets.
 MAX_SOUL_REPLY_STYLE_CHARS = 200
+# Free-text full replacement for the dialogue prompt's tone block. Larger cap
+# than reply_style because multi-line instructions are legitimate input.
+MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS = 1000
 
 
 @dataclass
@@ -1674,6 +1677,13 @@ class SoulConfig:
     # extra line to the tone block of the dialogue / recommendation-copy /
     # soul-profile prompts. Capped at MAX_SOUL_REPLY_STYLE_CHARS.
     reply_style: str = ""
+    # Free-text full replacement for the Socratic-dialogue prompt's tone
+    # block. Empty (default) keeps the dialogue prompt byte-identical;
+    # non-empty (after strip) replaces the whole rendered tone block —
+    # including any ``reply_style`` line — in the dialogue prompt only.
+    # Newlines are preserved (multi-line is valid input). Capped at
+    # MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS.
+    dialogue_tone_prompt: str = ""
 
 
 @dataclass
@@ -2591,6 +2601,10 @@ def _build_config(
     # the value stays a single line — it is injected as one extra tone-block
     # line and must survive the save-time TOML render.
     raw_reply_style = " ".join(str(soul_raw.get("reply_style", "") or "").split())
+    # Free-text replacement for the dialogue tone block. Only strip the outer
+    # whitespace — interior newlines/indentation are meaningful (multi-line
+    # instructions are legal input) and must survive the save-time render.
+    raw_dialogue_tone_prompt = str(soul_raw.get("dialogue_tone_prompt", "") or "").strip()
     soul = SoulConfig(
         preference=SoulPreferenceConfig(
             satisfaction_filter_enabled=bool(
@@ -2624,6 +2638,7 @@ def _build_config(
             max_value=_MAX_COGNITION_MAX_TOKENS,
         ),
         reply_style=raw_reply_style,
+        dialogue_tone_prompt=raw_dialogue_tone_prompt,
     )
 
     api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
@@ -4489,6 +4504,19 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
             )
         )
 
+    if len(config.soul.dialogue_tone_prompt) > MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS:
+        issues.append(
+            ConfigIssue(
+                field="soul.dialogue_tone_prompt",
+                message=(
+                    f"dialogue_tone_prompt 过长: "
+                    f"{len(config.soul.dialogue_tone_prompt)} 字符,"
+                    f"上限 {MAX_SOUL_DIALOGUE_TONE_PROMPT_CHARS}。"
+                ),
+                severity="blocking",
+            )
+        )
+
     if (
         str(config.soul.topic_lifecycle_serialization or "").strip().lower()
         not in _TOPIC_LIFECYCLE_SERIALIZATION_MODES
@@ -6150,6 +6178,11 @@ def _render_config_toml(
             "# leaves every prompt byte-identical; non-empty appends one tone-",
             "# block line to dialogue / recommendation-copy / profile prompts.",
             f"reply_style = {_toml_string(config.soul.reply_style)}",
+            "# Free-text full replacement for the dialogue prompt's tone",
+            "# block. Empty (default) leaves the dialogue prompt byte-",
+            "# identical; non-empty swaps the whole tone block in the",
+            "# Socratic-dialogue prompt only (multi-line is allowed).",
+            f"dialogue_tone_prompt = {_toml_multiline_string(config.soul.dialogue_tone_prompt)}",
             "",
             "[soul.preference]",
             "# v0.3.x event-satisfaction signal. When true, preference",
@@ -6218,6 +6251,23 @@ def _render_provider_section(name: str, provider: LLMProviderConfig) -> list[str
 def _toml_string(value: str) -> str:
     """Render a TOML string literal."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_multiline_string(value: str) -> str:
+    """Render a TOML basic string that survives embedded newlines.
+
+    Unlike ``_toml_string`` this escapes ``\\n``/``\\r``/``\\t`` so multi-line
+    values (e.g. ``soul.dialogue_tone_prompt``) stay on one physical line and
+    round-trip byte-identically through ``tomllib``.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
     return f'"{escaped}"'
 
 

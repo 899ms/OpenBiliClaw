@@ -350,6 +350,7 @@ class SocraticDialogue:
             core_memory_text=core_memory,
             tone_profile=tone_profile,
             reply_style=str(getattr(service, "reply_style", "") or ""),
+            dialogue_tone_prompt=str(getattr(service, "dialogue_tone_prompt", "") or ""),
         )
         system = prompt_messages[0]["content"] if prompt_messages else ""
 
@@ -544,4 +545,5 @@ class SocraticDialogue:
             concurrency=int(getattr(self._soul_engine, "_llm_concurrency", 3)),
             concurrency_gate=getattr(self._soul_engine, "_llm_concurrency_gate", None),
             reply_style=str(getattr(self._soul_engine, "_reply_style", "") or ""),
+            dialogue_tone_prompt=str(getattr(self._soul_engine, "_dialogue_tone_prompt", "") or ""),
         )

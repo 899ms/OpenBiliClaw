@@ -1188,6 +1188,7 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 | `insight_note_batch_size` | int | `150` | 认知循环洞察每轮 LLM 调用最多携带的新觉察 note 数。默认按 256k+ 上下文模型设计；小上下文模型可调小。范围 `10..450` |
 | `cognition_max_tokens` | int | `32768` | 认知循环觉察/洞察 LLM 调用的输出 token 上限。默认匹配 256k+ 模型的 dense batch；小上下文模型或严格输出限制的 provider 可调小（如 8192）。范围 `1024..128000` |
 | `reply_style` | string | `""` | 自定义 AI 回复语气（issue #255，自由文本，上限 200 字符，超出为 blocking 校验错误）。解析时折叠所有空白为单行；为空时对话回复、推荐文案（单条+批量）、画像文本四类 prompt 输出逐字节不变，非空时在 `_render_tone_profile` 语气块末尾追加一行 `- 回复风格: <文本>`。经 `LLMService.reply_style` / `SoulEngine._reply_style` / `ProfileBuilder.reply_style` / `RecommendationEngine._reply_style` 透传，CLI、`serve-api` 热重载与 OpenClaw bootstrap 三处构造点均已接线 |
+| `dialogue_tone_prompt` | string | `""` | 对话语气块整体替换（issue #255，自由文本，允许多行，上限 1000 字符，超出为 blocking 校验错误）。仅作用于 `build_socratic_dialogue_prompt`：非空（strip 后）时用原文替换 `_render_tone_profile` 语气块整段（此时 `reply_style` 对对话的追加行一并被替换掉），system prompt 的身份、行为说明、能力边界与 core memory 引导段落逐字节不变；推荐文案与画像 prompt 不接受此参数，行为零变化。为空时对话 prompt 逐字节不变。渲染经 `_toml_multiline_string()` 转义换行，round-trip 逐字节还原。经 `LLMService.dialogue_tone_prompt` / `SoulEngine._dialogue_tone_prompt` 透传，CLI、`serve-api` 热重载与 OpenClaw bootstrap 均已接线 |
 
 三个 prompt view 从 TOML、`GET/PUT /api/config`、CLI runtime、API 热重载与 OpenClaw
 bootstrap 一路独立透传到 `SoulEngine`；其中 Awareness 值只进入 with-confusions seam，普通

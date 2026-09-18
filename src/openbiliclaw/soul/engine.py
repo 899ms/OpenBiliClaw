@@ -359,6 +359,7 @@ class SoulEngine:
         posture_gate_mode: str = "shadow",
         posture_gate_force_enforce: bool = False,
         reply_style: str = "",
+        dialogue_tone_prompt: str = "",
         database: Any | None = None,
     ) -> None:
         self._llm = llm
@@ -367,6 +368,9 @@ class SoulEngine:
         # Free-text reply-style instruction (issue #255), forwarded into the
         # dialogue service and the profile builder.
         self._reply_style = " ".join(str(reply_style or "").split())
+        # Free-text full replacement for the dialogue prompt's tone block.
+        # Strip only the outer whitespace — interior newlines are meaningful.
+        self._dialogue_tone_prompt = str(dialogue_tone_prompt or "").strip()
         self._preference_prompt_view = normalize_cognition_input_view(preference_prompt_view)
         self._awareness_prompt_view = normalize_cognition_input_view(awareness_prompt_view)
         self._insight_prompt_view = normalize_cognition_input_view(insight_prompt_view)
@@ -408,6 +412,7 @@ class SoulEngine:
             concurrency=llm_concurrency,
             concurrency_gate=llm_concurrency_gate,
             reply_style=self._reply_style,
+            dialogue_tone_prompt=self._dialogue_tone_prompt,
         )
         self._awareness_analyzer = AwarenessAnalyzer(
             self._llm_service,

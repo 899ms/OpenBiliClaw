@@ -155,6 +155,7 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         posture_gate_mode=str(getattr(soul_cfg, "posture_gate_mode", "shadow")),
         posture_gate_force_enforce=bool(getattr(soul_cfg, "posture_gate_force_enforce", False)),
         reply_style=str(getattr(soul_cfg, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(soul_cfg, "dialogue_tone_prompt", "")),
         module_overrides=module_overrides,
         llm_concurrency=llm_concurrency,
         llm_concurrency_gate=llm_gate,
@@ -211,6 +212,7 @@ def build_openclaw_adapter_services() -> OpenClawAdapterServices:
         concurrency=llm_concurrency,
         concurrency_gate=llm_gate,
         reply_style=str(getattr(soul_cfg, "reply_style", "")),
+        dialogue_tone_prompt=str(getattr(soul_cfg, "dialogue_tone_prompt", "")),
     )
     from openbiliclaw.llm.registry import build_embedding_service
     from openbiliclaw.recommendation.curator import PoolCurator

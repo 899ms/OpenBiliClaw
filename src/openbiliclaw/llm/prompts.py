@@ -217,6 +217,7 @@ def build_socratic_dialogue_prompt(
     history: list[dict[str, str]],
     source_platform_mix: dict[str, float] | None = None,
     reply_style: str = "",
+    dialogue_tone_prompt: str = "",
 ) -> list[dict[str, str]]:
     """Build chat messages for Socratic dialogue generation.
 
@@ -235,8 +236,17 @@ def build_socratic_dialogue_prompt(
     ``LLMService.complete_with_core_memory`` (and its ``complete_with_tools``
     sibling), not here. Do not resurrect any per-service core-memory-block
     getattr probe at the dialogue call site.
+
+    ``dialogue_tone_prompt`` (from ``soul.dialogue_tone_prompt``) is a
+    free-text full replacement for the tone-profile block: when non-empty
+    (after strip) it takes the place of ``_render_tone_profile(...)`` —
+    including any ``reply_style`` line — while every other system-prompt
+    segment stays byte-identical. Empty (default) changes nothing.
     """
     friend_label = _friend_label_from_mix(source_platform_mix)
+    tone_block = dialogue_tone_prompt.strip() or _render_tone_profile(
+        tone_profile, source_platform_mix, reply_style
+    )
     system_prompt = "\n\n".join(
         [
             "你是 OpenBiliClaw，一个像朋友一样理解用户的 AI 伙伴。",
@@ -250,7 +260,7 @@ def build_socratic_dialogue_prompt(
                 "不要声称这些信息只能留在当前聊天上下文。你不能修改 B 站或其他"
                 "内容平台自身的推荐算法，必须把本地推荐与平台推荐区分清楚。"
             ),
-            _render_tone_profile(tone_profile, source_platform_mix, reply_style),
+            tone_block,
             "以下是当前用户的 core memory，请把它作为理解用户的背景，而不是机械复述：",
             core_memory_text,
         ]

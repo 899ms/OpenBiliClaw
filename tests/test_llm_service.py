@@ -1174,3 +1174,39 @@ async def test_llm_service_default_reply_style_leaves_dialogue_prompt_untouched(
     await service.complete_socratic_dialogue(user_message="最近看点啥？", history=[])
 
     assert "- 回复风格:" not in registry.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_llm_service_forwards_dialogue_tone_prompt_into_dialogue_prompt(
+    tmp_path: Path,
+) -> None:
+    """soul.dialogue_tone_prompt replaces the dialogue tone block via LLMService."""
+    memory = MemoryManager(tmp_path)
+    registry = FakeRegistry(LLMResponse(content="好。", provider="openai"))
+    service = LLMService(
+        registry=registry,
+        memory=memory,
+        reply_style="像损友一样毒舌",
+        dialogue_tone_prompt="像一个老朋友：\n- 多用短句",
+    )
+
+    await service.complete_socratic_dialogue(user_message="最近看点啥？", history=[])
+
+    system_prompt = registry.calls[0][0]["content"]
+    assert "像一个老朋友：\n- 多用短句" in system_prompt
+    assert "- 信息密度" not in system_prompt
+    assert "- 回复风格:" not in system_prompt
+    assert "你是 OpenBiliClaw，一个像朋友一样理解用户的 AI 伙伴。" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_service_default_dialogue_tone_prompt_leaves_prompt_untouched(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryManager(tmp_path)
+    registry = FakeRegistry(LLMResponse(content="好。", provider="openai"))
+    service = LLMService(registry=registry, memory=memory)
+
+    await service.complete_socratic_dialogue(user_message="最近看点啥？", history=[])
+
+    assert "- 信息密度" in registry.calls[0][0]["content"]

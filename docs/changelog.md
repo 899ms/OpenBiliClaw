@@ -7,6 +7,7 @@
 ### 自定义回复语气配置（issue #255）
 
 - **`[soul]` 新增自由文本字段 `reply_style`（默认 `""`）**：非空时作为一行 `- 回复风格: <文本>` 追加进 `_render_tone_profile()` 语气块，覆盖对话回复、推荐文案（单条 + 批量）、画像文本四类 prompt；为空时所有 prompt 输出逐字节不变（回放门守护）。解析时把空白折叠为单行，上限 200 字符（`_collect_config_issues()` blocking 校验）。透传链：`SoulEngine._reply_style` → `LLMService.reply_style`（对话）+ `ProfileBuilder.reply_style`（画像），`RecommendationEngine._reply_style`（单条 + 批量文案）；CLI、`serve-api` 热重载与 OpenClaw bootstrap 三处构造点均已接线，`SocraticDialogue` 的 LLMService fallback 复用 `SoulEngine._reply_style`，工具调用路径（`_respond_with_tools`）同样从 `service.reply_style` 透传。新增 builder 级逐字节不变 / 注入断言（`tests/test_llm_prompts.py`）、config round-trip 与长度校验（`tests/test_config.py`）、LLMService / ProfileBuilder / RecommendationEngine / 工具路径接线回归。
+- **`[soul]` 新增 `dialogue_tone_prompt`（默认 `""`）：对话语气块整体替换**。`reply_style` 只能在语气块末尾追加一行；本字段非空（strip 后）时用用户原文（允许多行，上限 1000 字符 blocking 校验）整体替换 `build_socratic_dialogue_prompt` 里的 `_render_tone_profile()` 语气块——此时 `reply_style` 对对话的追加行一并被替换。system prompt 的身份、苏格拉底行为说明、能力边界与 core memory 引导段落逐字节不变；推荐文案与画像 prompt 不接受此参数（`inspect.signature` 断言锁定），功能行为零变化；为空时对话 prompt 逐字节不变。TOML 渲染新增 `_toml_multiline_string()`（换行转义为 `\n` 序列，round-trip 逐字节还原）。透传链：`SoulEngine._dialogue_tone_prompt` → `LLMService.dialogue_tone_prompt` → 对话 builder（含 `_respond_with_tools` 工具路径与 fallback 构造），CLI、`serve-api` 热重载与 OpenClaw bootstrap 均已接线；RecommendationEngine / ProfileBuilder 刻意不接。
 
 ### LLM 输出预算下限与评估分批自愈
 

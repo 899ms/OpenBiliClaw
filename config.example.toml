@@ -786,6 +786,12 @@ insight_prompt_view = "legacy"
 # 语气块，覆盖对话回复、推荐文案（单条 + 批量）、画像文本四类 prompt。
 # reply_style = "语气温和一点，少用网络梗，多给具体例子"
 
+# 整体替换聊天对话的语气块（自由文本，上限 1000 字符，支持多行）。
+# 默认空字符串时对话 prompt 逐字节不变；非空时仅对聊天对话 prompt，用这段
+# 原文整体替换自动生成的语气块（此时 reply_style 对对话不再追加）。身份、
+# 苏格拉底行为说明、能力边界、core memory 引导语不受影响；推荐与画像不受影响。
+# dialogue_tone_prompt = "说话像一个爱看纪录片的老朋友：\n- 多用短句\n- 先问动机再给建议"
+
 [soul.preference]
 # v0.3.x event-satisfaction signal.
 # When true, preference analysis ignores passive negative events such as

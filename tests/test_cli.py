@@ -2171,6 +2171,7 @@ def test_runtime_builders_share_database_instance(
             concurrency: int = 1,
             concurrency_gate: object | None = None,
             reply_style: str = "",
+            dialogue_tone_prompt: str = "",
         ) -> None:
             self.registry = registry
             self.memory = memory
@@ -2179,6 +2180,7 @@ def test_runtime_builders_share_database_instance(
             self.concurrency = concurrency
             self.concurrency_gate = concurrency_gate
             self.reply_style = reply_style
+            self.dialogue_tone_prompt = dialogue_tone_prompt
 
     class FakeRecommendationEngine:
         def __init__(
