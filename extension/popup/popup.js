@@ -147,6 +147,7 @@ import {
   submitProfileEdit,
   startChatTurn,
   streamChatTurn,
+  sendChatMessage,
   submitFeedback,
   updateConfig,
   fetchSavedItems,
@@ -10205,6 +10206,8 @@ function bindSettings() {
     setVal("cfgAwarenessEventBatchSize", cfg.soul?.awareness_event_batch_size ?? 300);
     setVal("cfgInsightNoteBatchSize", cfg.soul?.insight_note_batch_size ?? 150);
     setVal("cfgCognitionMaxTokens", cfg.soul?.cognition_max_tokens ?? 32768);
+    setVal("cfgReplyStyle", cfg.soul?.reply_style ?? "");
+    setVal("cfgDialogueTonePrompt", cfg.soul?.dialogue_tone_prompt ?? "");
 
     // Logging
     const logLevel = document.getElementById("cfgLogLevel");
@@ -10506,7 +10509,9 @@ function bindSettings() {
       soul: {
         awareness_event_batch_size: getInt("cfgAwarenessEventBatchSize", 300),
         insight_note_batch_size: getInt("cfgInsightNoteBatchSize", 150),
-        cognition_max_tokens: getInt("cfgCognitionMaxTokens", 32768)
+        cognition_max_tokens: getInt("cfgCognitionMaxTokens", 32768),
+        reply_style: getVal("cfgReplyStyle"),
+        dialogue_tone_prompt: getVal("cfgDialogueTonePrompt")
       },
       saved_sync: {
         auto_sync_enabled: checked("cfgSavedAutoSync"),
@@ -11139,6 +11144,32 @@ function bindSettings() {
         showToast(`生成建议失败: ${err.message}`, "error");
       } finally {
         suggestBtn.disabled = false;
+      }
+    });
+  }
+
+  const testToneBtn = document.getElementById("cfgTestTone");
+  if (testToneBtn) {
+    testToneBtn.addEventListener("click", async () => {
+      const result = document.getElementById("cfgTestToneResult");
+      testToneBtn.disabled = true;
+      if (result) result.textContent = "正在保存语气设置…";
+      try {
+        await updateConfig({
+          soul: {
+            reply_style: getVal("cfgReplyStyle"),
+            dialogue_tone_prompt: getVal("cfgDialogueTonePrompt"),
+          },
+        });
+        if (result) result.textContent = "正在生成测试回复…";
+        const chat = await sendChatMessage("用一两句话聊聊你现在的心情");
+        const reply = String(chat?.reply || "").trim();
+        if (result) result.textContent = reply || "（后端返回了空回复）";
+      } catch (err) {
+        if (result) result.textContent = `测试失败：${err?.message || "未知错误"}`;
+        showToast("语气测试失败，请查看结果区提示。", "error");
+      } finally {
+        testToneBtn.disabled = false;
       }
     });
   }

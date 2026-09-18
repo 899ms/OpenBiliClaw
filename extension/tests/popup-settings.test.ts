@@ -148,6 +148,9 @@ test("settings page exposes advanced config fields from backend schema", () => {
     "cfgSpeculationMaxActive",
     "cfgSpeculationMaxPrimary",
     "cfgSpeculationMaxSecondary",
+    "cfgReplyStyle",
+    "cfgDialogueTonePrompt",
+    "cfgTestTone",
     "cfgStorageDbPath",
     "cfgLogFileLevel",
     "cfgLogPath",
@@ -174,6 +177,12 @@ test("settings page exposes advanced config fields from backend schema", () => {
     popupJs,
     /refresh_check_interval_seconds: getInt\("cfgRefreshCheckInterval", 60\)/,
   );
+  assert.match(popupJs, /setVal\("cfgReplyStyle", cfg\.soul\?\.reply_style \?\? ""\)/);
+  assert.match(popupJs, /setVal\("cfgDialogueTonePrompt", cfg\.soul\?\.dialogue_tone_prompt \?\? ""\)/);
+  assert.match(popupJs, /reply_style: getVal\("cfgReplyStyle"\)/);
+  assert.match(popupJs, /dialogue_tone_prompt: getVal\("cfgDialogueTonePrompt"\)/);
+  assert.match(popupHtml, /id="cfgReplyStyle"[^>]*maxlength="200"/);
+  assert.match(popupHtml, /id="cfgDialogueTonePrompt"[^>]*maxlength="1000"/);
   assert.match(popupJs, /function formatBackendUpdateError/);
   assert.match(popupJs, /github_rate_limited:\s*"GitHub API 限流，请稍后再试"/);
 });
@@ -718,7 +727,7 @@ test("advanced settings keep recommendation signals together and preserve disabl
   const modelsPanel =
     popupHtml.match(/<div id="settingsPanelModels"[\s\S]*?<div id="settingsPanelSources"/)?.[0] ?? "";
 
-  assert.equal((advancedPanel.match(/<div class="settings-section">/g) ?? []).length, 5);
+  assert.equal((advancedPanel.match(/<div class="settings-section">/g) ?? []).length, 6);
   for (const id of [
     "cfgEvalScorer",
     "cfgVisualProfileEnabled",

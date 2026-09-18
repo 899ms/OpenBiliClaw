@@ -25,6 +25,7 @@
       events: "/events",
       click: "/recommendation-click",
       chatTurns: "/chat/turns",
+      chat: "/chat",
       chatStream: "/chat/stream",
       dialogueContexts: "/chat/contexts",
       pendingConfirmations: "/chat/pending-confirmations",
@@ -9609,6 +9610,8 @@ ${cardFeedbackBarHtml()}`;
       setInput("awarenessEventBatchSize", soul.awareness_event_batch_size ?? 300);
       setInput("insightNoteBatchSize", soul.insight_note_batch_size ?? 150);
       setInput("cognitionMaxTokens", soul.cognition_max_tokens ?? 32768);
+      setInput("replyStyle", soul.reply_style ?? "");
+      setInput("dialogueTonePrompt", soul.dialogue_tone_prompt ?? "");
 
       const discovery = config.discovery || {};
       setSelect("evalScorer", discovery.eval_scorer || "llm");
@@ -11257,7 +11260,9 @@ ${cardFeedbackBarHtml()}`;
         soul: {
           awareness_event_batch_size: getIntInput("awarenessEventBatchSize", 300),
           insight_note_batch_size: getIntInput("insightNoteBatchSize", 150),
-          cognition_max_tokens: getIntInput("cognitionMaxTokens", 32768)
+          cognition_max_tokens: getIntInput("cognitionMaxTokens", 32768),
+          reply_style: getInput("replyStyle"),
+          dialogue_tone_prompt: getInput("dialogueTonePrompt")
         },
         discovery: {
           ...(state.config?.discovery || {}),
@@ -12340,6 +12345,43 @@ ${cardFeedbackBarHtml()}`;
         ) return;
         markSettingsDirty(el);
       });
+    });
+
+    safeBind("#testToneBtn", "click", async () => {
+      const btn = $("#testToneBtn");
+      const result = $("#testToneResult");
+      if (btn?.disabled) return;
+      if (btn) btn.disabled = true;
+      if (result) result.textContent = "正在保存语气设置…";
+      try {
+        const saved = await requestJsonStrict(ENDPOINTS.config, {
+          method: "PUT",
+          timeoutMs: 60000,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            soul: {
+              reply_style: getInput("replyStyle"),
+              dialogue_tone_prompt: getInput("dialogueTonePrompt")
+            }
+          })
+        });
+        if (saved?.config) applyConfig(saved.config);
+        if (result) result.textContent = "正在生成测试回复…";
+        const chat = await requestJsonStrict(ENDPOINTS.chat, {
+          method: "POST",
+          timeoutMs: 150000,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: "用一两句话聊聊你现在的心情" })
+        });
+        const reply = String(chat?.reply || "").trim();
+        if (result) result.textContent = reply || "（后端返回了空回复）";
+      } catch (error) {
+        const message = configErrorMessage(error?.details) || error?.message || "未知错误";
+        if (result) result.textContent = `测试失败：${message}`;
+        showToast("语气测试失败，请查看结果区提示", { duration: 5200 });
+      } finally {
+        if (btn) btn.disabled = false;
+      }
     });
 
     safeBind("#settingsDiscardBtn", "click", () => {
