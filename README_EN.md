@@ -215,12 +215,10 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.223 (2026-09-17)**
+📌 Latest: **v0.3.224 (2026-09-19)**
 
-- **Web "Load more / Reshuffle" no longer 403s**: behind reverse proxies and external TLS termination, the recommendation proxy keeps the browser's original Host so the same-origin CSRF check passes again.
-- **Steadier Windows desktop startup and install (issue #250)**: workers wait out an unusable LLM config instead of quitting with error dialogs and auto-restart on crash; the uninstaller blocks while the app runs, and interactive installs launch only after Finish.
-- **Recommendation copy no longer calls old content "latest"**: expression prompts now carry each item's publish and evaluation time, so freshness is judged from data instead of titles or model knowledge.
-- **Mobile player gains a UP master card and follow**: the backend proxies Bilibili's user card and follow / unfollow endpoints, keeping cookies and CSRF tokens server-side.
+- **Custom AI reply tone (issues #255 / #65)**: `[soul] reply_style` appends a tone instruction (dialogue, recommendation copy and profile), while `dialogue_tone_prompt` replaces the chat tone block with your own words — persona, formal style, reply length, your call; defaults change nothing.
+- **Edit in settings and test in one click**: a new "Reply tone" section in the desktop web and extension settings pages, with a "Test tone" button that saves and instantly shows a real sample reply — no restart needed.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
