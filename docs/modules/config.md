@@ -1187,6 +1187,7 @@ TOML 与显式环境变量覆盖在构造 `SchedulerConfig` 前统一归一为�
 | `awareness_event_batch_size` | int | `300` | 认知循环觉察每轮 LLM 调用最多携带的未处理事件数（issue #169）。默认按 256k+ 上下文模型设计（~100 token/事件，正常 12h 窗口单次调用）；80-100K 上下文的本地模型（如 qwen3.8-27B）可调小到 80-150。范围 `10..900` |
 | `insight_note_batch_size` | int | `150` | 认知循环洞察每轮 LLM 调用最多携带的新觉察 note 数。默认按 256k+ 上下文模型设计；小上下文模型可调小。范围 `10..450` |
 | `cognition_max_tokens` | int | `32768` | 认知循环觉察/洞察 LLM 调用的输出 token 上限。默认匹配 256k+ 模型的 dense batch；小上下文模型或严格输出限制的 provider 可调小（如 8192）。范围 `1024..128000` |
+| `reply_style` | string | `""` | 自定义 AI 回复语气（issue #255，自由文本，上限 200 字符，超出为 blocking 校验错误）。解析时折叠所有空白为单行；为空时对话回复、推荐文案（单条+批量）、画像文本四类 prompt 输出逐字节不变，非空时在 `_render_tone_profile` 语气块末尾追加一行 `- 回复风格: <文本>`。经 `LLMService.reply_style` / `SoulEngine._reply_style` / `ProfileBuilder.reply_style` / `RecommendationEngine._reply_style` 透传，CLI、`serve-api` 热重载与 OpenClaw bootstrap 三处构造点均已接线 |
 
 三个 prompt view 从 TOML、`GET/PUT /api/config`、CLI runtime、API 热重载与 OpenClaw
 bootstrap 一路独立透传到 `SoulEngine`；其中 Awareness 值只进入 with-confusions seam，普通

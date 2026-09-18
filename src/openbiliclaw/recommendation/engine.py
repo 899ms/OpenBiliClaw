@@ -488,6 +488,7 @@ class RecommendationEngine:
         bilibili_client: Any | None = None,
         serve_snapshot_store: ServeSnapshotStore | None = None,
         serve_outbox: ServeOutbox | None = None,
+        reply_style: str = "",
     ) -> None:
         self._llm = llm
         self._database = database
@@ -518,6 +519,9 @@ class RecommendationEngine:
         self._visual_profile_rebuild_inflight = False
         self._xhs_self_info_provider = xhs_self_info_provider
         self._pool_inventory_commit_callback = pool_inventory_commit_callback
+        # Free-text reply-style instruction (issue #255) for the expression
+        # tone blocks; empty (default) keeps prompts byte-identical.
+        self._reply_style = " ".join(str(reply_style or "").split())
         self._copy_pending_callback: Callable[[str], None] | None = None
         self._expression_batch_concurrency = max(1, min(16, int(expression_batch_concurrency)))
         # ``0`` is the compatibility/rollback contract: drain the durable
@@ -4066,6 +4070,7 @@ class RecommendationEngine:
             content_items=content_items,
             tone_profile=tone_profile,
             source_platform=batch[0].source_platform if batch else "bilibili",
+            reply_style=self._reply_style,
         )
 
         complete_structured = self._llm.complete_structured_task
@@ -4457,6 +4462,7 @@ class RecommendationEngine:
             },
             tone_profile=tone_profile,
             source_platform=content.source_platform or "bilibili",
+            reply_style=self._reply_style,
         )
         try:
             complete_structured = self._llm.complete_structured_task

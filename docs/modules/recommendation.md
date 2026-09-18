@@ -159,7 +159,7 @@ items = await engine.generate_recommendations(
 - 排序主键先看 `candidate_tier`，再看 `relevance_score`、`last_scored_at/discovered_at`、`view_count`
 - 生成结果后会写入 `recommendations` 表，避免下次重复选中
 - 每条推荐都会调用 `generate_expression()` 生成 `expression` 和 `topic_label`
-- 推荐表达会先从当前画像、偏好摘要、`disliked_topics` 和近期反馈推断 `ToneProfile`，再生成更贴近用户口味且避开长期雷点的“老B友”式文案；内容 `style_key` 只用于决定从人物、场景、信息点或情绪等角度切入，不再把用户语气动态调轻
+- 推荐表达会先从当前画像、偏好摘要、`disliked_topics` 和近期反馈推断 `ToneProfile`，再生成更贴近用户口味且避开长期雷点的“老B友”式文案；内容 `style_key` 只用于决定从人物、场景、信息点或情绪等角度切入，不再把用户语气动态调轻。`[soul] reply_style`（issue #255）非空时会在语气块末尾追加一行 `- 回复风格: <文本>`，由 `RecommendationEngine._reply_style` 同时覆盖单条与批量路径，默认空值 prompt 逐字节不变
 - 推荐表达和推荐池分类 prompt 自身已经包含 compact 结构化 profile；`_recommendation_profile_summary()` 是单一收口点，统一应用 `compact_content_prompt_profile_summary()`，单条表达仍先把内容相关兴趣放进摘要再 compact，保护长尾兴趣。`LLMService` 会关闭额外 core memory 注入，画像按 core / life / interests / style / recent 分层渲染以稳定缓存前缀。Delight score 预计算直接复用 Evo 评分；卡片理由必须等待 `pool_expression / pool_topic_label` 完整并同步，绝不展示 evaluator 的内部判断 reason
 - 单条与批量表达都会把候选的 `published_at` / `published_label` 和评估时刻 `evaluated_at`（`DiscoveredContent.temporal_evaluated_at`）放进 user_prompt。文案判断时效只能对照这两个字段，不能用标题年份、“最新”字样或模型知识猜测；任一字段缺失时不得声称“最新 / 刚发布 / 近期”，也不得猜年龄。这些字段都在可变 user payload，system prompt 仍保持字节静态
 - CLI 展示后会把对应推荐记录标记为 `presented = 1`

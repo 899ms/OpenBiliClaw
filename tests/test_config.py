@@ -696,6 +696,45 @@ manage_ollama = true
         assert cfg.soul.insight_note_batch_size == 150
         assert cfg.soul.cognition_max_tokens == 32768
 
+    def test_reply_style_defaults_to_empty(self) -> None:
+        cfg = Config()
+
+        assert cfg.soul.reply_style == ""
+
+    def test_reply_style_round_trip_through_toml(self, tmp_path: Path) -> None:
+        cfg = Config()
+        cfg.soul.reply_style = "语气温和一点，多给具体例子"
+        target = tmp_path / "config.toml"
+
+        save_config(cfg, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert 'reply_style = "语气温和一点，多给具体例子"' in rendered
+        assert loaded.soul.reply_style == "语气温和一点，多给具体例子"
+
+    def test_reply_style_parse_collapses_whitespace_into_one_line(self) -> None:
+        config = _build_config({"soul": {"reply_style": "  温和一点\n\n少用  梗\t "}})
+
+        assert config.soul.reply_style == "温和一点 少用 梗"
+
+    def test_reply_style_over_limit_is_a_blocking_issue(self) -> None:
+        from openbiliclaw.config import MAX_SOUL_REPLY_STYLE_CHARS, _collect_config_issues
+
+        cfg = Config()
+        cfg.soul.reply_style = "x" * MAX_SOUL_REPLY_STYLE_CHARS
+        assert not [
+            issue for issue in _collect_config_issues(cfg) if issue.field == "soul.reply_style"
+        ]
+
+        cfg.soul.reply_style = "x" * (MAX_SOUL_REPLY_STYLE_CHARS + 1)
+        issues = [
+            issue for issue in _collect_config_issues(cfg) if issue.field == "soul.reply_style"
+        ]
+
+        assert len(issues) == 1
+        assert issues[0].severity == "blocking"
+
     def test_cognition_budget_knobs_reject_invalid_values(self) -> None:
         from openbiliclaw.config import _collect_config_issues
 

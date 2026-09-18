@@ -781,6 +781,11 @@ insight_prompt_view = "legacy"
 # insight_note_batch_size = 150      # awareness notes per insight LLM call (10..450)
 # cognition_max_tokens = 32768       # max output tokens per cognition call (1024..128000)
 
+# 自定义 AI 回复语气（issue #255，自由文本，上限 200 字符）。
+# 默认空字符串时所有 prompt 输出逐字节不变；非空时会作为一行附加指令注入
+# 语气块，覆盖对话回复、推荐文案（单条 + 批量）、画像文本四类 prompt。
+# reply_style = "语气温和一点，少用网络梗，多给具体例子"
+
 [soul.preference]
 # v0.3.x event-satisfaction signal.
 # When true, preference analysis ignores passive negative events such as

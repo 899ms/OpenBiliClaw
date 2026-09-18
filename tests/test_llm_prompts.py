@@ -2276,3 +2276,122 @@ class TestPreferencePromptCognitionContext:
         assert body.index("<active_insights>") < body.index("<event_batch>")
         assert "最近在深挖 Rust 底层" in body
         assert "可能是系统编程从业者" in body
+
+
+class TestReplyStyleInjection:
+    """issue #255: ``soul.reply_style`` appends one tone-block line; empty stays byte-identical."""
+
+    _TONE = {
+        "density": "dense",
+        "warmth": "warm",
+        "playfulness": "medium",
+        "directness": "balanced",
+    }
+
+    def test_render_tone_profile_empty_reply_style_is_byte_identical(self) -> None:
+        from openbiliclaw.llm.prompts import _render_tone_profile
+
+        baseline = _render_tone_profile(self._TONE)
+        assert baseline == _render_tone_profile(self._TONE, reply_style="")
+        assert baseline == _render_tone_profile(self._TONE, reply_style="  \n\t ")
+        assert "- 回复风格:" not in baseline
+
+    def test_render_tone_profile_appends_single_collapsed_line(self) -> None:
+        from openbiliclaw.llm.prompts import _render_tone_profile
+
+        rendered = _render_tone_profile(self._TONE, reply_style="语气温和\n\n少用  梗")
+
+        assert rendered.endswith("\n- 回复风格: 语气温和 少用 梗")
+        assert rendered.count("- 回复风格:") == 1
+
+    def test_dialogue_prompt_empty_reply_style_is_byte_identical(self) -> None:
+        kwargs = {
+            "user_message": "我最近有点迷上纪录片",
+            "core_memory_text": "",
+            "tone_profile": self._TONE,
+            "history": [],
+        }
+
+        assert build_socratic_dialogue_prompt(**kwargs) == build_socratic_dialogue_prompt(
+            **kwargs, reply_style=""
+        )
+
+    def test_dialogue_prompt_injects_reply_style(self) -> None:
+        messages = build_socratic_dialogue_prompt(
+            user_message="我最近有点迷上纪录片",
+            core_memory_text="",
+            tone_profile=self._TONE,
+            history=[],
+            reply_style="像损友一样毒舌",
+        )
+
+        assert "- 回复风格: 像损友一样毒舌" in messages[0]["content"]
+
+    def test_soul_profile_prompt_empty_reply_style_is_byte_identical(self) -> None:
+        kwargs = {
+            "history_summary": {"total": 3},
+            "preference_summary": {"interests": []},
+            "tone_profile": self._TONE,
+        }
+
+        assert build_soul_profile_prompt(**kwargs) == build_soul_profile_prompt(
+            **kwargs, reply_style=""
+        )
+
+    def test_soul_profile_prompt_injects_reply_style_into_tone_block(self) -> None:
+        messages = build_soul_profile_prompt(
+            history_summary={"total": 3},
+            preference_summary={"interests": []},
+            tone_profile=self._TONE,
+            reply_style="简洁直接",
+        )
+        user_prompt = messages[1]["content"]
+
+        tone_block = user_prompt.split("<tone_profile>", 1)[1].split("</tone_profile>", 1)[0]
+        assert "- 回复风格: 简洁直接" in tone_block
+
+    def test_recommendation_expression_prompt_empty_reply_style_is_byte_identical(self) -> None:
+        kwargs = {
+            "profile_summary": {"personality_portrait": "偏好高信息密度内容"},
+            "content_summary": {"title": "讲透国际局势", "up_name": "某UP"},
+            "tone_profile": self._TONE,
+            "source_platform": "bilibili",
+        }
+
+        assert build_recommendation_expression_prompt(
+            **kwargs
+        ) == build_recommendation_expression_prompt(**kwargs, reply_style="")
+
+    def test_recommendation_expression_prompt_injects_reply_style(self) -> None:
+        messages = build_recommendation_expression_prompt(
+            profile_summary={"personality_portrait": "偏好高信息密度内容"},
+            content_summary={"title": "讲透国际局势", "up_name": "某UP"},
+            tone_profile=self._TONE,
+            source_platform="bilibili",
+            reply_style="活泼一点",
+        )
+
+        assert "- 回复风格: 活泼一点" in messages[1]["content"]
+
+    def test_batch_expression_prompt_empty_reply_style_is_byte_identical(self) -> None:
+        kwargs = {
+            "profile_summary": {"core_traits": ["fallback"]},
+            "content_items": [{"bvid": "BV1", "title": "候选"}],
+            "tone_profile": self._TONE,
+            "source_platform": "bilibili",
+        }
+
+        assert build_batch_expression_prompt(**kwargs) == build_batch_expression_prompt(
+            **kwargs, reply_style=""
+        )
+
+    def test_batch_expression_prompt_injects_reply_style(self) -> None:
+        messages = build_batch_expression_prompt(
+            profile_summary={"core_traits": ["fallback"]},
+            content_items=[{"bvid": "BV1", "title": "候选"}],
+            tone_profile=self._TONE,
+            source_platform="bilibili",
+            reply_style="多用短句",
+        )
+
+        assert "- 回复风格: 多用短句" in messages[1]["content"]

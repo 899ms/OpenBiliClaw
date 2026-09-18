@@ -2505,6 +2505,7 @@ class TestBackendAPI:
                 module_overrides: object | None = None,
                 concurrency: int = 1,
                 concurrency_gate: object | None = None,
+                reply_style: str = "",
             ) -> None:
                 self.registry = registry
                 self.memory = memory
@@ -2512,6 +2513,7 @@ class TestBackendAPI:
                 self.module_overrides = module_overrides
                 self.concurrency = concurrency
                 self.concurrency_gate = concurrency_gate
+                self.reply_style = reply_style
 
         class FakeBilibiliClient:
             def __init__(self, *, cookie: str, proxy: str | None = None) -> None:
@@ -2756,6 +2758,7 @@ class TestBackendAPI:
                 module_overrides: object | None = None,
                 concurrency: int = 1,
                 concurrency_gate: object | None = None,
+                reply_style: str = "",
             ) -> None:
                 self.registry = registry
                 self.memory = memory
@@ -2763,6 +2766,7 @@ class TestBackendAPI:
                 self.module_overrides = module_overrides
                 self.concurrency = concurrency
                 self.concurrency_gate = concurrency_gate
+                self.reply_style = reply_style
 
         class FakeBilibiliClient:
             def __init__(self, *, cookie: str, proxy: str | None = None) -> None:

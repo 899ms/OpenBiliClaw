@@ -4,6 +4,10 @@
 
 ## v0.3.223：Windows 稳定性、推荐入口与画像一致性修复（2026-09-17）
 
+### 自定义回复语气配置（issue #255）
+
+- **`[soul]` 新增自由文本字段 `reply_style`（默认 `""`）**：非空时作为一行 `- 回复风格: <文本>` 追加进 `_render_tone_profile()` 语气块，覆盖对话回复、推荐文案（单条 + 批量）、画像文本四类 prompt；为空时所有 prompt 输出逐字节不变（回放门守护）。解析时把空白折叠为单行，上限 200 字符（`_collect_config_issues()` blocking 校验）。透传链：`SoulEngine._reply_style` → `LLMService.reply_style`（对话）+ `ProfileBuilder.reply_style`（画像），`RecommendationEngine._reply_style`（单条 + 批量文案）；CLI、`serve-api` 热重载与 OpenClaw bootstrap 三处构造点均已接线，`SocraticDialogue` 的 LLMService fallback 复用 `SoulEngine._reply_style`，工具调用路径（`_respond_with_tools`）同样从 `service.reply_style` 透传。新增 builder 级逐字节不变 / 注入断言（`tests/test_llm_prompts.py`）、config round-trip 与长度校验（`tests/test_config.py`）、LLMService / ProfileBuilder / RecommendationEngine / 工具路径接线回归。
+
 ### LLM 输出预算下限与评估分批自愈
 
 - **修复推理实例在结构化小任务上「reasoning-only + finish_reason=length」拖垮整条模块路由链**：这类模型的 `max_tokens` 同时覆盖思考与正文，历史调用点按期望输出长度给的 16 / 256 / 512 / 1024 预算会被 thinking 整段吃掉，`content` 为空后 provider 判失败，模块链里若没有非推理实例兜底就写 error 级 `all_providers_failed` 告警（DSH 面板「异常报警」里表现为两条 `bad_response` warning + 一条 error）。现在分三层处理：① `LLMService.complete_structured_task()` / `complete_multimodal_structured_task()` 统一以 `MIN_STRUCTURED_MAX_TOKENS=4096` 兜底 `max_tokens`（`max_tokens` 是上限不是预扣，正常答完不产生额外成本），`api.sentiment` 16→512，`recommendation.evaluate_batch` 8192→16384，统一关键词 planner 合并生成下限 4096→8192；② 新增 `llm.base.is_reasoning_budget_exhausted()`，沿 cause/context 链统一识别该签名，`soul.posture_gate` 与 `soul.preference_analyzer` 的私有判定改用它（行为不变）；③ 评估 / 表达式批量在该签名下把批减半递归重试 —— discovery `_evaluate_batch` 把整个子批标记 missing 后走既有 split-retry（深度 3、额外请求 6），recommendation 新增 `_classify_batch_with_split_retry`（`classify_pool_backlog` 入口）并让 `_precompute_batch_with_split_retry` 同样按预算错误拆分；限流 / 鉴权 / 超时 / 传输错误继续原样上抛（rate limit 仍走 claim 释放，不因拆分放大请求）。

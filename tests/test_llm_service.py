@@ -1148,3 +1148,29 @@ async def test_multimodal_structured_task_floors_small_max_tokens() -> None:
     )
 
     assert registry.max_tokens_seen == [MIN_STRUCTURED_MAX_TOKENS]
+
+
+@pytest.mark.asyncio
+async def test_llm_service_forwards_reply_style_into_dialogue_prompt(tmp_path: Path) -> None:
+    """issue #255: soul.reply_style reaches the dialogue tone block via LLMService."""
+    memory = MemoryManager(tmp_path)
+    registry = FakeRegistry(LLMResponse(content="好。", provider="openai"))
+    service = LLMService(registry=registry, memory=memory, reply_style="像损友一样毒舌")
+
+    await service.complete_socratic_dialogue(user_message="最近看点啥？", history=[])
+
+    system_prompt = registry.calls[0][0]["content"]
+    assert "- 回复风格: 像损友一样毒舌" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_service_default_reply_style_leaves_dialogue_prompt_untouched(
+    tmp_path: Path,
+) -> None:
+    memory = MemoryManager(tmp_path)
+    registry = FakeRegistry(LLMResponse(content="好。", provider="openai"))
+    service = LLMService(registry=registry, memory=memory)
+
+    await service.complete_socratic_dialogue(user_message="最近看点啥？", history=[])
+
+    assert "- 回复风格:" not in registry.calls[0][0]["content"]

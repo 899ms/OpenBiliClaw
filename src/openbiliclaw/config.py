@@ -1631,6 +1631,9 @@ POSTURE_GATE_ENFORCE_MIN_RECENT_COUNT = 1
 _POSTURE_GATE_MODES = frozenset({"shadow", "enforce", "off"})
 _TOPIC_LIFECYCLE_SERIALIZATION_MODES = frozenset({"off", "on"})
 _COGNITION_PROMPT_VIEW_MODES = frozenset({"legacy", "compact-v1"})
+# Free-text reply-style instruction (issue #255). Capped so a paste accident
+# cannot blow up the user-facing prompt budgets.
+MAX_SOUL_REPLY_STYLE_CHARS = 200
 
 
 @dataclass
@@ -1666,6 +1669,11 @@ class SoulConfig:
     awareness_event_batch_size: int = _DEFAULT_COGNITION_AWARENESS_EVENT_BATCH_SIZE
     insight_note_batch_size: int = _DEFAULT_COGNITION_INSIGHT_NOTE_BATCH_SIZE
     cognition_max_tokens: int = _DEFAULT_COGNITION_MAX_TOKENS
+    # Free-text reply-style instruction (issue #255). Empty (default) keeps
+    # every user-facing prompt byte-identical; non-empty is appended as one
+    # extra line to the tone block of the dialogue / recommendation-copy /
+    # soul-profile prompts. Capped at MAX_SOUL_REPLY_STYLE_CHARS.
+    reply_style: str = ""
 
 
 @dataclass
@@ -2579,6 +2587,10 @@ def _build_config(
     raw_lifecycle = (
         str(soul_raw.get("topic_lifecycle_serialization", "off") or "off").strip().lower()
     )
+    # Free-text tone instruction (issue #255). Collapse all whitespace runs so
+    # the value stays a single line — it is injected as one extra tone-block
+    # line and must survive the save-time TOML render.
+    raw_reply_style = " ".join(str(soul_raw.get("reply_style", "") or "").split())
     soul = SoulConfig(
         preference=SoulPreferenceConfig(
             satisfaction_filter_enabled=bool(
@@ -2611,6 +2623,7 @@ def _build_config(
             min_value=_MIN_COGNITION_MAX_TOKENS,
             max_value=_MAX_COGNITION_MAX_TOKENS,
         ),
+        reply_style=raw_reply_style,
     )
 
     api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
@@ -4464,6 +4477,18 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
                 )
             )
 
+    if len(config.soul.reply_style) > MAX_SOUL_REPLY_STYLE_CHARS:
+        issues.append(
+            ConfigIssue(
+                field="soul.reply_style",
+                message=(
+                    f"reply_style 过长: {len(config.soul.reply_style)} 字符,"
+                    f"上限 {MAX_SOUL_REPLY_STYLE_CHARS}。"
+                ),
+                severity="blocking",
+            )
+        )
+
     if (
         str(config.soul.topic_lifecycle_serialization or "").strip().lower()
         not in _TOPIC_LIFECYCLE_SERIALIZATION_MODES
@@ -6121,6 +6146,10 @@ def _render_config_toml(
             f"awareness_event_batch_size = {max(0, int(config.soul.awareness_event_batch_size))}",
             f"insight_note_batch_size = {max(0, int(config.soul.insight_note_batch_size))}",
             f"cognition_max_tokens = {max(0, int(config.soul.cognition_max_tokens))}",
+            "# Free-text reply-style instruction (issue #255). Empty (default)",
+            "# leaves every prompt byte-identical; non-empty appends one tone-",
+            "# block line to dialogue / recommendation-copy / profile prompts.",
+            f"reply_style = {_toml_string(config.soul.reply_style)}",
             "",
             "[soul.preference]",
             "# v0.3.x event-satisfaction signal. When true, preference",
