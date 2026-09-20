@@ -6441,6 +6441,7 @@ class TestBackendAPI:
             "last_update_error": "",
             "backend_update_state": "disabled",
             "backend_update_reason": "none",
+            "publication_date_filter": {},
         }
 
     def test_runtime_status_endpoint_surfaces_account_sync_error_kind(self) -> None:
@@ -6533,6 +6534,41 @@ class TestBackendAPI:
         assert body["last_update_error"] == ""
         assert body["backend_update_state"] == "update_available"
         assert body["backend_update_reason"] == "none"
+
+    def test_runtime_status_endpoint_includes_publication_date_filter_stats(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class FakeRuntimeController:
+            def get_runtime_status(self) -> dict[str, object]:
+                return {
+                    "initialized": True,
+                    "recommendation_count": 1,
+                    "pending_signal_events": 0,
+                    "unread_count": 0,
+                    "publication_date_filter": {
+                        "youtube": {
+                            "input": 20,
+                            "filtered_by_publication_date": 20,
+                            "inserted": 0,
+                        }
+                    },
+                }
+
+        app = create_app(
+            memory_manager=object(),
+            database=object(),
+            soul_engine=object(),
+            runtime_controller=FakeRuntimeController(),
+        )
+        client = TestClient(app)
+
+        response = client.get("/api/runtime-status")
+
+        assert response.status_code == 200
+        stats = response.json()["publication_date_filter"]
+        assert stats["youtube"]["input"] == 20
+        assert stats["youtube"]["filtered_by_publication_date"] == 20
+        assert stats["youtube"]["inserted"] == 0
 
     def test_update_status_returns_backend_only_and_ignores_extension_metadata(self) -> None:
         from fastapi.testclient import TestClient

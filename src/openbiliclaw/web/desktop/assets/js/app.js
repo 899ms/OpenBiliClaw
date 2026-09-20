@@ -10939,7 +10939,7 @@ ${cardFeedbackBarHtml()}`;
         if (!body || body.querySelector('[data-date-source="' + slug + '"]')) continue;
         const html = '<section class="source-seg" data-date-source="' + slug + '">'
           + '<h4>发布日期偏好</h4>'
-          + '<p class="seg-note">默认「全部日期」；设置后会在 LLM 评估前过滤该来源的范围外候选。</p>'
+          + '<p class="seg-note">默认「全部日期」；权重 = 1 时在入库/评估前过滤范围外候选，权重 < 1 时保留候选（非 B 站不降权）。</p>'
           + '<div class="inline-row">'
           + '<label class="settings-field"><span>日期范围</span><select id="' + slug + 'DatePreset">'
           + '<option value="all">全部日期</option>'
@@ -10949,7 +10949,7 @@ ${cardFeedbackBarHtml()}`;
           + '<option value="last_1_year">最近一年</option>'
           + '<option value="custom">自定义</option>'
           + '</select></label>'
-          + '<label class="settings-field"><span>范围外权重（0 到 1）</span><input id="' + slug + 'DateWeight" type="number" min="0" max="1" step="0.01" inputmode="decimal"></label>'
+          + '<label class="settings-field"><span>范围外权重（1 = 过滤，&lt;1 = 保留）</span><input id="' + slug + 'DateWeight" type="number" min="0" max="1" step="0.01" inputmode="decimal"></label>'
           + '</div>'
           + '<div class="inline-row" id="' + slug + 'DateCustomFields" hidden>'
           + '<label class="settings-field"><span>开始日期</span><input id="' + slug + 'DateStart" type="date"></label>'

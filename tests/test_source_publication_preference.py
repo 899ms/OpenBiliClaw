@@ -7,6 +7,8 @@ from openbiliclaw.config import Config, load_config, save_config
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 from openbiliclaw.discovery.candidate_pool import discovered_content_to_candidate_write
 from openbiliclaw.discovery.engine import DiscoveredContent, DiscoveryStrategy
 from openbiliclaw.recommendation.publication_preference import (
@@ -89,6 +91,56 @@ def test_filter_candidates_for_eval_removes_out_of_window_before_eval() -> None:
     assert [item.bvid for item in filtered] == ["recent"]
 
 
+def test_filter_candidates_for_eval_keeps_soft_mode_and_missing_dates() -> None:
+    """Soft mode mirrors the raw enqueue gate: no pre-eval hard filtering."""
+
+    now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    recent = DiscoveredContent(
+        bvid="recent",
+        source_platform="youtube",
+        published_at=(now - timedelta(days=1)).isoformat(),
+    )
+    old = DiscoveredContent(
+        bvid="old",
+        source_platform="youtube",
+        published_at="2000-01-01T00:00:00Z",
+    )
+    missing = DiscoveredContent(
+        bvid="missing",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+    strategy = _FakeStrategy()
+    strategy.date_preference = PublicationDatePreference(
+        preset=PRESET_LAST_7_DAYS,
+        weight=0.5,
+    )
+
+    filtered = strategy.filter_candidates_for_eval([recent, old, missing], now=now)
+
+    assert [item.bvid for item in filtered] == ["recent", "old", "missing"]
+
+
+def test_filter_candidates_for_eval_strict_mode_drops_missing_dates() -> None:
+    now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    missing = DiscoveredContent(
+        bvid="missing",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+    strategy = _FakeStrategy()
+    strategy.date_preference = PublicationDatePreference(
+        preset=PRESET_LAST_7_DAYS,
+        weight=1.0,
+    )
+
+    filtered = strategy.filter_candidates_for_eval([missing], now=now)
+
+    assert filtered == []
+
+
 def test_filter_candidates_for_eval_all_preset_keeps_candidates() -> None:
     now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
     recent = DiscoveredContent(
@@ -157,3 +209,95 @@ def test_database_enqueue_filters_raw_candidates_by_source_date_preference(tmp_p
     )
 
     assert inserted == 1
+
+
+def test_database_enqueue_keeps_soft_mode_out_of_window_candidates(tmp_path: Path) -> None:
+    """Soft mode must not silently starve sources whose dates are unknown/old."""
+
+    db = Database(tmp_path / "enqueue-soft-date-filter.db")
+    db.initialize()
+    db.set_source_publication_date_preferences(
+        {
+            "youtube": PublicationDatePreference(
+                preset=PRESET_LAST_7_DAYS,
+                weight=0.5,
+            )
+        }
+    )
+
+    now = datetime.now(UTC)
+    recent = DiscoveredContent(
+        bvid="soft-recent-yt",
+        content_id="soft-recent-yt",
+        source_platform="youtube",
+        published_at=(now - timedelta(days=1)).isoformat(),
+    )
+    old = DiscoveredContent(
+        bvid="soft-old-yt",
+        content_id="soft-old-yt",
+        source_platform="youtube",
+        published_at="2000-01-01T00:00:00Z",
+    )
+    # YouTube's primary scrapetube/InnerTube path only exposes a relative label.
+    unknown = DiscoveredContent(
+        bvid="soft-unknown-yt",
+        content_id="soft-unknown-yt",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+
+    inserted = db.enqueue_discovery_candidates(
+        [
+            discovered_content_to_candidate_write(recent, source_context="yt_search"),
+            discovered_content_to_candidate_write(old, source_context="yt_search"),
+            discovered_content_to_candidate_write(unknown, source_context="yt_search"),
+        ]
+    )
+
+    assert inserted == 3
+    stats = db.publication_date_filter_stats()["youtube"]
+    assert stats["input"] == 3
+    assert stats["filtered_by_publication_date"] == 0
+    assert stats["inserted"] == 3
+
+
+def test_database_enqueue_strict_mode_excludes_missing_published_at(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit strict preference still drops candidates with no date."""
+
+    caplog.set_level("WARNING")
+
+    db = Database(tmp_path / "enqueue-strict-missing-date.db")
+    db.initialize()
+    db.set_source_publication_date_preferences(
+        {
+            "youtube": PublicationDatePreference(
+                preset=PRESET_LAST_7_DAYS,
+                weight=1.0,
+            )
+        }
+    )
+
+    unknown = DiscoveredContent(
+        bvid="strict-unknown-yt",
+        content_id="strict-unknown-yt",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+
+    inserted = db.enqueue_discovery_candidates(
+        [discovered_content_to_candidate_write(unknown, source_context="yt_search")]
+    )
+
+    assert inserted == 0
+    stats = db.publication_date_filter_stats()["youtube"]
+    assert stats["input"] == 1
+    assert stats["filtered_by_publication_date"] == 1
+    assert stats["inserted"] == 0
+    assert any(
+        "filtered all 1 candidate(s) from source=youtube" in message for message in caplog.messages
+    )

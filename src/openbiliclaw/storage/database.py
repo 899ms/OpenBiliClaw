@@ -203,6 +203,11 @@ _TEMPORAL_RANKING_AUDIT_RETENTION_DAYS = 30
 _TEMPORAL_RANKING_AUDIT_MAX_ROWS = 5_000
 _TEMPORAL_RANKING_AUDIT_POLICY = "temporal-ranking-shadow-v1"
 
+# A source whose batch is 100% rejected by its publication-date preference has
+# effectively stopped supplying candidates; warn once per source per interval
+# so a misconfigured strict preference is visible without flooding the log.
+_PUBLICATION_DATE_FILTER_WARN_INTERVAL_SECONDS = 600.0
+
 
 def _validated_card_settlement_ref(ref: object) -> str:
     """Return a bounded, non-control settlement ref for stable-key derivation."""
@@ -2026,6 +2031,13 @@ class Database:
         # Per-source publication-date preferences for raw candidate enqueue
         # filtering (discovery_candidates). None / empty = platform-neutral.
         self._source_publication_date_preferences: dict[str, Any] | None = None
+        # Diagnostic-only counters for the raw-candidate date gate. They reset
+        # with the process and never feed admission decisions; a WARNING is
+        # emitted when one round filters every candidate of a source (the
+        # failure mode from issue #257 that used to be invisible to callers).
+        self._publication_date_filter_stats: dict[str, dict[str, Any]] = {}
+        self._publication_date_filter_stats_lock = threading.Lock()
+        self._publication_date_filter_warned_at: dict[str, float] = {}
         self._preserve_read_transaction = False
         self._snapshot_delight_thresholds: dict[float, float] | None = None
         self._snapshot_available_query_rows: (
@@ -2066,13 +2078,26 @@ class Database:
             self._source_publication_date_preferences = dict(preferences)
         else:
             self._source_publication_date_preferences = None
+        # A configuration change invalidates the warning throttle: if the next
+        # productive-looking round is still 100% filtered, warn immediately.
+        with self._publication_date_filter_stats_lock:
+            self._publication_date_filter_warned_at.clear()
 
     def _source_publication_date_candidate_is_eligible(
         self,
         source_platform: str,
         published_at: object,
     ) -> bool:
-        """Apply a source date preference before a raw candidate is enqueued."""
+        """Apply a source date preference before a raw candidate is enqueued.
+
+        ``PublicationDateDecision.eligible`` is the admission contract: strict
+        mode (``weight == 1``) excludes out-of-window and unparseable
+        timestamps here, while soft mode keeps them (the ``1 - weight``
+        multiplier is a Bilibili pool-scoring behavior and is not applied to
+        other sources).  Missing timestamps therefore do not block enqueue for
+        a soft preference (multi-platform publication metadata contract); only
+        an explicit strict preference excludes them.
+        """
         preferences = self._source_publication_date_preferences
         if not preferences:
             return True
@@ -2087,13 +2112,88 @@ class Database:
             return evaluate_source_publication_preference(
                 published_at=published_at,
                 preference=preference,
-            ).in_range
+            ).eligible
         except (TypeError, ValueError):
             logger.warning(
                 "Ignoring invalid publication preference during candidate enqueue",
                 exc_info=True,
             )
             return True
+
+    def _record_publication_date_filter_batch(
+        self,
+        *,
+        input_by_source: Mapping[str, int],
+        filtered_by_source: Mapping[str, int],
+        inserted_by_source: Mapping[str, int],
+    ) -> None:
+        """Accumulate date-gate diagnostics and warn on 100%-filtered rounds.
+
+        A source that fetches candidates every cycle but has all of them
+        rejected by an active publication preference otherwise looks healthy
+        (the producer ledger only sees the fetch); issue #257 stayed invisible
+        for a month for exactly that reason.  Counters are process-local and
+        diagnostic-only, while the WARNING is rate limited per source so a
+        permanently-misconfigured preference cannot flood the log.
+        """
+        if not input_by_source:
+            return
+        now_iso = datetime.now(UTC).isoformat()
+        monotonic_now = time.monotonic()
+        warnings: list[tuple[str, int, bool]] = []
+        with self._publication_date_filter_stats_lock:
+            for source, offered in input_by_source.items():
+                offered = int(offered)
+                if offered <= 0:
+                    continue
+                stats = self._publication_date_filter_stats.setdefault(
+                    source,
+                    {
+                        "input": 0,
+                        "filtered_by_publication_date": 0,
+                        "inserted": 0,
+                        "last_input_at": "",
+                        "last_filtered_at": "",
+                    },
+                )
+                stats["input"] = int(stats["input"]) + offered
+                stats["last_input_at"] = now_iso
+                filtered = int(filtered_by_source.get(source, 0))
+                if filtered > 0:
+                    stats["filtered_by_publication_date"] = (
+                        int(stats["filtered_by_publication_date"]) + filtered
+                    )
+                    stats["last_filtered_at"] = now_iso
+                stats["inserted"] = int(stats["inserted"]) + int(inserted_by_source.get(source, 0))
+                if filtered < offered:
+                    continue
+                last_warned = self._publication_date_filter_warned_at.get(source, 0.0)
+                if monotonic_now - last_warned < _PUBLICATION_DATE_FILTER_WARN_INTERVAL_SECONDS:
+                    continue
+                self._publication_date_filter_warned_at[source] = monotonic_now
+                preference = (self._source_publication_date_preferences or {}).get(source)
+                strict = bool(
+                    preference is not None
+                    and float(getattr(preference, "weight", 0.5) or 0.0) >= 1.0
+                )
+                warnings.append((source, offered, strict))
+        for source, offered, strict in warnings:
+            logger.warning(
+                "publication date preference filtered all %d candidate(s) from source=%s "
+                "(strict=%s); this source will stop supplying until the preference, "
+                "published_at coverage or weight changes",
+                offered,
+                source,
+                strict,
+            )
+
+    def publication_date_filter_stats(self) -> dict[str, dict[str, Any]]:
+        """Return per-source publication-date gate counters for diagnostics."""
+
+        with self._publication_date_filter_stats_lock:
+            return {
+                source: dict(stats) for source, stats in self._publication_date_filter_stats.items()
+            }
 
     def _publication_date_row_is_eligible(self, row: Mapping[str, Any]) -> bool:
         """Apply strict Bilibili date preference without deleting stored rows."""
@@ -5896,16 +5996,22 @@ class Database:
         inserted = 0
         filtered_by_date = 0
         touched_sources: set[str] = set()
+        input_by_source: dict[str, int] = defaultdict(int)
+        filtered_by_source: dict[str, int] = defaultdict(int)
+        inserted_by_source: dict[str, int] = defaultdict(int)
         for candidate in candidates:
             candidate_key = str(self._candidate_value(candidate, "candidate_key", "") or "").strip()
             if not candidate_key:
                 continue
             source_platform = str(self._candidate_value(candidate, "source_platform", "") or "")
+            stats_source = source_platform or "unknown"
+            input_by_source[stats_source] += 1
             if not self._source_publication_date_candidate_is_eligible(
                 source_platform,
                 self._candidate_value(candidate, "published_at", ""),
             ):
                 filtered_by_date += 1
+                filtered_by_source[stats_source] += 1
                 continue
             tags = self._candidate_json_payload(
                 self._candidate_value(candidate, "tags", []),
@@ -6011,6 +6117,7 @@ class Database:
                 touched_sources.add(source_platform)
             if cursor.rowcount > 0:
                 inserted += 1
+                inserted_by_source[stats_source] += 1
                 continue
             self._execute_write(
                 """
@@ -6046,10 +6153,21 @@ class Database:
                     candidate_key,
                 ),
             )
+        self._record_publication_date_filter_batch(
+            input_by_source=input_by_source,
+            filtered_by_source=filtered_by_source,
+            inserted_by_source=inserted_by_source,
+        )
         if filtered_by_date:
+            breakdown = ", ".join(
+                f"{source}={count}"
+                for source, count in sorted(filtered_by_source.items())
+                if count > 0
+            )
             logger.info(
-                "candidate enqueue: filtered %d raw candidate(s) by publication date",
+                "candidate enqueue: filtered %d raw candidate(s) by publication date (%s)",
                 filtered_by_date,
+                breakdown,
             )
         if max_pending_per_source is not None:
             max_pending = max(0, int(max_pending_per_source))
