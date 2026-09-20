@@ -623,15 +623,13 @@ daemon，保留当前 v2 文件和自动备份，再由操作者显式把导出�
 | `recommendation_date_preset` | string | `"all"` | 发布日期范围：`all`、`last_7_days`、`last_30_days`、`last_6_months`、`last_1_year` 或 `custom` |
 | `recommendation_date_start` | string | `""` | `custom` 的包含式起始自然日，格式为 `YYYY-MM-DD`；留空表示无下界 |
 | `recommendation_date_end` | string | `""` | `custom` 的包含式结束自然日，格式为 `YYYY-MM-DD`；留空表示无上界 |
-| `recommendation_date_weight` | float | `0.5` | 范围外候选的分数乘数为 `1 - weight`；`1` = 严格排除 |
+| `recommendation_date_weight` | float | `0.5` | 范围外权重：`1` = 严格过滤；`<1` = 软模式保留候选。「分数乘数 `1 - weight`」仅 B 站池/推荐打分生效 |
 
-发布日期范围按用户本地自然日换算为包含式 UTC 边界。统一候选入队门按
-`PublicationDateDecision.eligible` 判定：严格模式（`weight=1`）在入库前丢弃范围外或无法判定
-发布时间的候选，不消耗评估预算；软模式（`weight<1`）保留这些候选入队，判定携带的
-`1 - weight` 分数乘数由候选池打分与推荐服务阶段应用。注意当前降权落点只有 B 站池/推荐打分
-路径：其它来源的软模式会保留候选但暂不降权（后续切片补齐）。缺失或无法解析发布时间不能用
-发现时间代替；严格模式下按范围外排除，软模式下不再阻止入队。策略内联 LLM 评估路径（非统一
-raw candidate 入队路径）仍会在评估前过滤范围外候选以保护评估预算。
+发布日期范围按用户本地自然日换算为包含式 UTC 边界，所有来源共用同一套 discovery 判定：严格
+模式（`weight=1`）在入库 / LLM 评估前丢弃范围外或无法判定发布时间的候选，不消耗评估预算；
+软模式（`weight<1`）保留这些候选（缺失时间不再阻止入库），不再按发布日期做硬过滤。`1 - weight`
+的分数乘数只作用于 B 站候选池打分与推荐服务阶段（B 站历史语义）；非 B 站来源的日期偏好只做
+discovery 层分流，软模式保留候选但不降权。缺失或无法解析发布时间不能用发现时间代替。
 
 配置文件、`GET /api/config` 和 `PUT /api/config` 使用同一组字段。保存阶段会拒绝非法 preset、日期
 或权重，不会先写入再在运行时悄悄修正；合法保存沿用现有备份、原子写入和 RuntimeContext 热更新事务。

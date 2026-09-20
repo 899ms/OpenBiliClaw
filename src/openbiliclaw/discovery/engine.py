@@ -1044,8 +1044,11 @@ class DiscoveryStrategy(ABC):
     ) -> list[DiscoveredContent]:
         """Apply this source's date preference before LLM evaluation.
 
-        Out-of-window candidates are removed regardless of ``weight`` so the
-        evaluator never spends tokens on content the user explicitly excluded.
+        ``eligible`` mirrors the raw-candidate enqueue gate: strict mode
+        (``weight == 1``) drops out-of-window and unparseable timestamps so the
+        evaluator never spends tokens on content the user explicitly excluded,
+        while soft mode keeps them so a source is never silently starved by a
+        preference it cannot satisfy.
         """
 
         preference = getattr(self, "date_preference", None) or getattr(
@@ -1071,7 +1074,7 @@ class DiscoveryStrategy(ABC):
                 published_at=getattr(item, "published_at", ""),
                 preference=preference,
                 now=current,
-            ).in_range
+            ).eligible
         ]
 
     @abstractmethod

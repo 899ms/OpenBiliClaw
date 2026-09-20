@@ -89,6 +89,56 @@ def test_filter_candidates_for_eval_removes_out_of_window_before_eval() -> None:
     assert [item.bvid for item in filtered] == ["recent"]
 
 
+def test_filter_candidates_for_eval_keeps_soft_mode_and_missing_dates() -> None:
+    """Soft mode mirrors the raw enqueue gate: no pre-eval hard filtering."""
+
+    now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    recent = DiscoveredContent(
+        bvid="recent",
+        source_platform="youtube",
+        published_at=(now - timedelta(days=1)).isoformat(),
+    )
+    old = DiscoveredContent(
+        bvid="old",
+        source_platform="youtube",
+        published_at="2000-01-01T00:00:00Z",
+    )
+    missing = DiscoveredContent(
+        bvid="missing",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+    strategy = _FakeStrategy()
+    strategy.date_preference = PublicationDatePreference(
+        preset=PRESET_LAST_7_DAYS,
+        weight=0.5,
+    )
+
+    filtered = strategy.filter_candidates_for_eval([recent, old, missing], now=now)
+
+    assert [item.bvid for item in filtered] == ["recent", "old", "missing"]
+
+
+def test_filter_candidates_for_eval_strict_mode_drops_missing_dates() -> None:
+    now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    missing = DiscoveredContent(
+        bvid="missing",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+    strategy = _FakeStrategy()
+    strategy.date_preference = PublicationDatePreference(
+        preset=PRESET_LAST_7_DAYS,
+        weight=1.0,
+    )
+
+    filtered = strategy.filter_candidates_for_eval([missing], now=now)
+
+    assert filtered == []
+
+
 def test_filter_candidates_for_eval_all_preset_keeps_candidates() -> None:
     now = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
     recent = DiscoveredContent(

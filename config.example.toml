@@ -276,8 +276,8 @@ recommendation_date_preset = "all"
 # custom 时填写 YYYY-MM-DD；留空表示该边界不限制。
 recommendation_date_start = ""
 recommendation_date_end = ""
-# 范围外候选的分数乘数为 (1 - weight)。默认 0.5 = 软模式（保留候选、下游降权，
-# 当前降权落点仅 B 站池/推荐打分）；1 = 严格排除（入库/评估前过滤）。
+# 范围外候选：1 = 严格过滤（入库/评估前排除）；默认 0.5 = 软模式（保留候选）。
+# 分数乘数 (1 - weight) 仅 B 站池/推荐打分生效，非 B 站来源只做 discovery 层分流。
 recommendation_date_weight = 0.5
 
 # ── 小红书（xhs）专用配置 ──
