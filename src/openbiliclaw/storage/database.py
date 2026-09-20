@@ -2072,7 +2072,16 @@ class Database:
         source_platform: str,
         published_at: object,
     ) -> bool:
-        """Apply a source date preference before a raw candidate is enqueued."""
+        """Apply a source date preference before a raw candidate is enqueued.
+
+        ``PublicationDateDecision.eligible`` is the admission contract: strict
+        mode (``weight == 1``) excludes out-of-window and unparseable
+        timestamps here, while soft mode keeps them and carries the
+        ``1 - weight`` score multiplier for downstream scoring.  Missing
+        timestamps therefore do not block enqueue for a soft preference
+        (multi-platform publication metadata contract); only an explicit
+        strict preference excludes them.
+        """
         preferences = self._source_publication_date_preferences
         if not preferences:
             return True
@@ -2087,7 +2096,7 @@ class Database:
             return evaluate_source_publication_preference(
                 published_at=published_at,
                 preference=preference,
-            ).in_range
+            ).eligible
         except (TypeError, ValueError):
             logger.warning(
                 "Ignoring invalid publication preference during candidate enqueue",

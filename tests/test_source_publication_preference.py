@@ -157,3 +157,79 @@ def test_database_enqueue_filters_raw_candidates_by_source_date_preference(tmp_p
     )
 
     assert inserted == 1
+
+
+def test_database_enqueue_keeps_soft_mode_out_of_window_candidates(tmp_path: Path) -> None:
+    """Soft mode must not silently starve sources whose dates are unknown/old."""
+
+    db = Database(tmp_path / "enqueue-soft-date-filter.db")
+    db.initialize()
+    db.set_source_publication_date_preferences(
+        {
+            "youtube": PublicationDatePreference(
+                preset=PRESET_LAST_7_DAYS,
+                weight=0.5,
+            )
+        }
+    )
+
+    now = datetime.now(UTC)
+    recent = DiscoveredContent(
+        bvid="soft-recent-yt",
+        content_id="soft-recent-yt",
+        source_platform="youtube",
+        published_at=(now - timedelta(days=1)).isoformat(),
+    )
+    old = DiscoveredContent(
+        bvid="soft-old-yt",
+        content_id="soft-old-yt",
+        source_platform="youtube",
+        published_at="2000-01-01T00:00:00Z",
+    )
+    # YouTube's primary scrapetube/InnerTube path only exposes a relative label.
+    unknown = DiscoveredContent(
+        bvid="soft-unknown-yt",
+        content_id="soft-unknown-yt",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+
+    inserted = db.enqueue_discovery_candidates(
+        [
+            discovered_content_to_candidate_write(recent, source_context="yt_search"),
+            discovered_content_to_candidate_write(old, source_context="yt_search"),
+            discovered_content_to_candidate_write(unknown, source_context="yt_search"),
+        ]
+    )
+
+    assert inserted == 3
+
+
+def test_database_enqueue_strict_mode_excludes_missing_published_at(tmp_path: Path) -> None:
+    """An explicit strict preference still drops candidates with no date."""
+
+    db = Database(tmp_path / "enqueue-strict-missing-date.db")
+    db.initialize()
+    db.set_source_publication_date_preferences(
+        {
+            "youtube": PublicationDatePreference(
+                preset=PRESET_LAST_7_DAYS,
+                weight=1.0,
+            )
+        }
+    )
+
+    unknown = DiscoveredContent(
+        bvid="strict-unknown-yt",
+        content_id="strict-unknown-yt",
+        source_platform="youtube",
+        published_at="",
+        published_label="5 years ago",
+    )
+
+    inserted = db.enqueue_discovery_candidates(
+        [discovered_content_to_candidate_write(unknown, source_context="yt_search")]
+    )
+
+    assert inserted == 0

@@ -443,11 +443,12 @@ from openbiliclaw.recommendation.curator import PoolCurator
 
 发布时间偏好由 `PublicationDatePreference` 提供独立覆盖层，按来源配置
 （`[sources.<name>].recommendation_date_*`）。`all` 保持旧行为；其它预设或 `custom`
-按用户本地自然日解析为包含式 UTC 边界。发现策略在 LLM 评估之前会直接过滤掉范围外候选，
-不消耗评估预算。候选池打分保留 `weight` 语义：范围外候选的最终分数乘以
-`1 - weight`，默认 `weight=0.5`；`weight=1` 时，`RecommendationEngine` 在 MMR 和最终选择前
-忽略这些候选。候选不会因此从数据库或候选池删除。缺失发布时间在活动范围
-下视为范围外，不会拿发现时间冒充发布时间。
+按用户本地自然日解析为包含式 UTC 边界。统一候选入队门按 `eligible` 判定：`weight=1`
+（严格）时在入库前过滤范围外与无法判定发布时间的候选，不消耗评估预算；`weight<1`（软）
+时保留候选入队，候选池打分把最终分数乘以 `1 - weight`（默认 `weight=0.5`；该乘数当前只
+作用于 B 站池/推荐打分路径，非 B 站来源软模式暂只保留、不降权）。`weight=1` 时，
+`RecommendationEngine` 在 MMR 和最终选择前忽略这些候选。候选不会因此从数据库或候选池删除。
+缺失发布时间在严格模式下视为范围外，软模式下不阻止入队，不会拿发现时间冒充发布时间。
 
 数据库的有效库存读取也复用严格 eligibility：物理 `content_cache` 行保持不变，`count_pool_candidates()`、
 来源配额统计、候选池 fullness 和刷新补货只把当前范围内的 B 站行计入目标。软模式仍把范围外行计入

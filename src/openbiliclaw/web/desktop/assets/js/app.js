@@ -10939,7 +10939,7 @@ ${cardFeedbackBarHtml()}`;
         if (!body || body.querySelector('[data-date-source="' + slug + '"]')) continue;
         const html = '<section class="source-seg" data-date-source="' + slug + '">'
           + '<h4>发布日期偏好</h4>'
-          + '<p class="seg-note">默认「全部日期」；设置后会在 LLM 评估前过滤该来源的范围外候选。</p>'
+          + '<p class="seg-note">默认「全部日期」；权重 = 1 时在评估/入库前过滤范围外候选，权重 < 1 时保留候选。</p>'
           + '<div class="inline-row">'
           + '<label class="settings-field"><span>日期范围</span><select id="' + slug + 'DatePreset">'
           + '<option value="all">全部日期</option>'
