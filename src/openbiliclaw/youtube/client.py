@@ -482,14 +482,14 @@ def _extract_channel_id(raw: dict[str, Any]) -> str:
     it in ``channel_id`` / ``channel_url``.
     """
     for key in ("channel_id", "channelId"):
-        value = str(raw.get(key) or "").strip()
-        if value.startswith("UC"):
-            return value
+        direct = str(raw.get(key) or "").strip()
+        if direct.startswith("UC"):
+            return direct
     for key in ("ownerText", "shortBylineText", "longBylineText", "bylineText"):
-        value = raw.get(key)
-        if not isinstance(value, dict):
+        container = raw.get(key)
+        if not isinstance(container, dict):
             continue
-        for run in value.get("runs") or []:
+        for run in container.get("runs") or []:
             if not isinstance(run, dict):
                 continue
             endpoint = ((run.get("navigationEndpoint") or {}).get("browseEndpoint")) or {}
