@@ -7,6 +7,8 @@ from openbiliclaw.config import Config, load_config, save_config
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 from openbiliclaw.discovery.candidate_pool import discovered_content_to_candidate_write
 from openbiliclaw.discovery.engine import DiscoveredContent, DiscoveryStrategy
 from openbiliclaw.recommendation.publication_preference import (
@@ -254,10 +256,19 @@ def test_database_enqueue_keeps_soft_mode_out_of_window_candidates(tmp_path: Pat
     )
 
     assert inserted == 3
+    stats = db.publication_date_filter_stats()["youtube"]
+    assert stats["input"] == 3
+    assert stats["filtered_by_publication_date"] == 0
+    assert stats["inserted"] == 3
 
 
-def test_database_enqueue_strict_mode_excludes_missing_published_at(tmp_path: Path) -> None:
+def test_database_enqueue_strict_mode_excludes_missing_published_at(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """An explicit strict preference still drops candidates with no date."""
+
+    caplog.set_level("WARNING")
 
     db = Database(tmp_path / "enqueue-strict-missing-date.db")
     db.initialize()
@@ -283,3 +294,10 @@ def test_database_enqueue_strict_mode_excludes_missing_published_at(tmp_path: Pa
     )
 
     assert inserted == 0
+    stats = db.publication_date_filter_stats()["youtube"]
+    assert stats["input"] == 1
+    assert stats["filtered_by_publication_date"] == 1
+    assert stats["inserted"] == 0
+    assert any(
+        "filtered all 1 candidate(s) from source=youtube" in message for message in caplog.messages
+    )

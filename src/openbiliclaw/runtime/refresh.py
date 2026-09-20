@@ -725,6 +725,10 @@ class ContinuousRefreshController:
             "pending_delight_count": pending_delight_count,
             "last_delight_notification_at": str(state.get("last_delight_notification_at", "")),
         }
+        date_filter_stats = getattr(self.database, "publication_date_filter_stats", None)
+        if callable(date_filter_stats):
+            with suppress(Exception):
+                payload["publication_date_filter"] = date_filter_stats()
         status_payload = getattr(self.candidate_eval_coordinator, "status_payload", None)
         if callable(status_payload):
             with suppress(Exception):

@@ -498,6 +498,10 @@ class RuntimeStatusResponse(BaseModel):
     last_update_error: str = ""
     backend_update_state: str = "unknown"
     backend_update_reason: str = "none"
+    # Per-source raw-candidate publication-date gate diagnostics (issue #257):
+    # {source: {input, filtered_by_publication_date, inserted, last_input_at,
+    # last_filtered_at}}. Process-local counters, never admission inputs.
+    publication_date_filter: dict[str, dict[str, object]] = Field(default_factory=dict)
 
 
 class ActivityFeedItemOut(BaseModel):

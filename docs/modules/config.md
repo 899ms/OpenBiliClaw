@@ -631,6 +631,11 @@ daemon，保留当前 v2 文件和自动备份，再由操作者显式把导出�
 的分数乘数只作用于 B 站候选池打分与推荐服务阶段（B 站历史语义）；非 B 站来源的日期偏好只做
 discovery 层分流，软模式保留候选但不降权。缺失或无法解析发布时间不能用发现时间代替。
 
+运行时诊断：`GET /api/runtime-status` 的 `publication_date_filter` 按来源透出入队门计数
+（`input` / `filtered_by_publication_date` / `inserted` / `last_*`）。当某来源一轮候选被日期
+偏好 100% 丢弃时会写 WARNING（同一来源 10 分钟最多一次），避免「生产者 ledger 仍显示成功、
+来源已被静默饿死」的盲区。
+
 配置文件、`GET /api/config` 和 `PUT /api/config` 使用同一组字段。保存阶段会拒绝非法 preset、日期
 或权重，不会先写入再在运行时悄悄修正；合法保存沿用现有备份、原子写入和 RuntimeContext 热更新事务。
 桌面 Web「设置 → 平台源 → Bilibili」提供这些字段的编辑控件；本次切片不在插件 popup 或移动 Web
