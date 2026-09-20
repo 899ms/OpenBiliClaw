@@ -631,6 +631,11 @@ daemon，保留当前 v2 文件和自动备份，再由操作者显式把导出�
 的分数乘数只作用于 B 站候选池打分与推荐服务阶段（B 站历史语义）；非 B 站来源的日期偏好只做
 discovery 层分流，软模式保留候选但不降权。缺失或无法解析发布时间不能用发现时间代替。
 
+YouTube 在配置非 `all` 日期偏好时，会对缺精确发布时间的候选按可解析的 `UC...` channel id
+抓取频道公开 Atom feed（RSS，最多覆盖该频道最近约 15 条）补 `published_at`；只写入 feed 的精确
+`<published>`，相对 `publishedTimeText` 永远只作为 label，不会伪造成精确时间。feed 未覆盖的旧
+视频或无法解析 channel 的候选保持 label-only，严格模式下按无法判定排除。
+
 运行时诊断：`GET /api/runtime-status` 的 `publication_date_filter` 按来源透出入队门计数
 （`input` / `filtered_by_publication_date` / `inserted` / `last_*`）。当某来源一轮候选被日期
 偏好 100% 丢弃时会写 WARNING（同一来源 10 分钟最多一次），避免「生产者 ledger 仍显示成功、
