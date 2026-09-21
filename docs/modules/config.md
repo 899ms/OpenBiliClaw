@@ -636,6 +636,11 @@ YouTube 在配置非 `all` 日期偏好时，会对缺精确发布时间的候�
 `<published>`，相对 `publishedTimeText` 永远只作为 label，不会伪造成精确时间。feed 未覆盖的旧
 视频或无法解析 channel 的候选保持 label-only，严格模式下按无法判定排除。
 
+小红书搜索 / 收藏卡片接口本身不返回发布时间。配置非 `all` 日期偏好时，后端会在下发扩展任务时带
+`need_published_at`：扩展从 `user_posted` 响应补 `time`（epoch ms），并对仍缺时间的候选用同源隐藏
+iframe 打开笔记页（单任务最多 5 条、并发 2），读取 `__INITIAL_STATE__.note.noteDetailMap[noteId].note.time`
+（epoch ms）。默认 `all` 不产生额外请求；卡片没有时间字段时严格模式仍按无法判定排除。
+
 运行时诊断：`GET /api/runtime-status` 的 `publication_date_filter` 按来源透出入队门计数
 （`input` / `filtered_by_publication_date` / `inserted` / `last_*`）。当某来源一轮候选被日期
 偏好 100% 丢弃时会写 WARNING（同一来源 10 分钟最多一次），避免「生产者 ledger 仍显示成功、

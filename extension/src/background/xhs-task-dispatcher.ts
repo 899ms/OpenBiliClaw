@@ -86,6 +86,8 @@ export interface XhsLegacyTask {
   max_scroll_rounds?: number;
   scroll_wait_ms?: number;
   max_stagnant_scroll_rounds?: number;
+  /** Backend sets this when the xhs date preference is not "all". */
+  need_published_at?: boolean;
 }
 
 export type XhsTask = XhsLegacyTask | NativeSaveTask;
@@ -207,6 +209,9 @@ function buildExecuteMessageData(task: XhsLegacyTask): Record<string, unknown> {
   if (task.scroll_wait_ms !== undefined) data.scroll_wait_ms = task.scroll_wait_ms;
   if (task.max_stagnant_scroll_rounds !== undefined) {
     data.max_stagnant_scroll_rounds = task.max_stagnant_scroll_rounds;
+  }
+  if (task.need_published_at !== undefined) {
+    data.need_published_at = task.need_published_at;
   }
   return data;
 }
