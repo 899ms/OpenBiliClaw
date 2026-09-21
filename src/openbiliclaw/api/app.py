@@ -2924,16 +2924,12 @@ def create_app(
             body = await request.body()
             recommendation_port = os.environ.get(RECOMMENDATION_PORT_ENV, "").strip()
             if recommendation_port:
-                target_url = (
-                    f"http://127.0.0.1:{recommendation_port}{request.url.path}"
-                )
+                target_url = f"http://127.0.0.1:{recommendation_port}{request.url.path}"
                 client_kwargs: dict[str, Any] = {"timeout": 30.0, "trust_env": False}
             else:
                 target_url = f"http://localhost{request.url.path}"
                 client_kwargs = {
-                    "transport": _httpx.AsyncHTTPTransport(
-                        uds=os.environ[RECOMMENDATION_SOCK_ENV]
-                    ),
+                    "transport": _httpx.AsyncHTTPTransport(uds=os.environ[RECOMMENDATION_SOCK_ENV]),
                     "timeout": 30.0,
                     "trust_env": False,
                 }
@@ -15324,9 +15320,19 @@ def create_app(
         import json as _json
 
         payload = _json.loads(task["payload_json"]) if task.get("payload_json") else {}
+        # Search / collect cards expose no publish time; when this source has a
+        # non-"all" date preference the extension fills exact times by fetching
+        # up to five note-detail pages. "all" keeps the extra requests off.
+        need_published_at = False
+        with suppress(Exception):
+            from openbiliclaw.config import publication_date_preference_for_source
+
+            preference = publication_date_preference_for_source(xhs_cfg)
+            need_published_at = str(getattr(preference, "preset", "all") or "all") != "all"
         return {
             "id": task["id"],
             "type": task["type"],
+            "need_published_at": need_published_at,
             **payload,
         }
 

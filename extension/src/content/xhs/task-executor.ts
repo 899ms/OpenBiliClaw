@@ -62,6 +62,9 @@ import {
   readXhsSearchResponseNotes,
   requestXhsSearchResponseReplay,
 } from "./search-response-buffer.js";
+import { readXhsPublishedTimes } from "./published-time-buffer.js";
+import { enrichNotesWithPublishedAt } from "./published-at-enrich.js";
+import { mergePublishedTimes } from "../../shared/xhs-published-at.js";
 
 const MAX_URLS = 20;
 // Remote background-tab traces on 2026-08-03 showed the old 5s ceiling could
@@ -71,6 +74,11 @@ const RENDER_WAIT_MS = 12_000;
 const CHECK_INTERVAL_MS = 300;
 const PROFILE_CLICK_DELAY_MS = 150;
 const PROFILE_CONTENT_WAIT_MS = 8_000;
+// Exact publish times are only required when the source has a non-"all" date
+// preference (backend flag). Cards expose no time, so search tasks fetch at
+// most five note pages; runs concurrently under a 4s per-page timeout.
+const PUBLISHED_AT_ENRICH_MAX_NOTES = 5;
+const PUBLISHED_AT_ENRICH_TIMEOUT_MS = 4_000;
 
 export interface TaskExecuteMessage {
   task_id: string;
@@ -80,6 +88,12 @@ export interface TaskExecuteMessage {
   max_scroll_rounds?: number;
   scroll_wait_ms?: number;
   max_stagnant_scroll_rounds?: number;
+  /**
+   * Backend sets this when `[sources.xiaohongshu].recommendation_date_preset`
+   * is not "all". Cards expose no time field, so the executor then fetches up
+   * to five note-detail pages to fill exact `published_at` (epoch ms).
+   */
+  need_published_at?: boolean;
 }
 
 export interface TaskResultPayload {
@@ -873,6 +887,20 @@ async function executeTaskInPage(
     const selfInfo = state ? extractSelfInfoFromState(state) : null;
     const filteredNotes = filterSelfAuthoredNotes(notes, selfInfo);
 
+    // Exact publish time: profile API payloads (`user_posted`) are buffered by
+    // the MAIN-world sniffer; search / collect cards expose no time at all, so
+    // a non-"all" date preference additionally fetches a bounded number of
+    // note-detail HTML pages and reads noteDetailMap[noteId].note.time.
+    const snifferMerged = mergePublishedTimes(filteredNotes, readXhsPublishedTimes());
+    let fetchedPublishedAt = 0;
+    if (msg.need_published_at) {
+      fetchedPublishedAt = await enrichNotesWithPublishedAt(filteredNotes, {
+        maxNotes: PUBLISHED_AT_ENRICH_MAX_NOTES,
+        timeoutMs: PUBLISHED_AT_ENRICH_TIMEOUT_MS,
+        document: doc,
+      });
+    }
+
     // Background tabs never upgrade lazy-loaded card images past their
     // data: placeholder, so DOM extraction alone yields coverless notes on
     // exactly the search/creator paths this executor serves. Backfill real
@@ -890,6 +918,9 @@ async function executeTaskInPage(
         xhs_discovery: {
           source: source === "response" ? "search_api" : "rendered_dom",
           task_type: msg.type,
+          published_at_sniffer_merged: snifferMerged,
+          published_at_fetched: fetchedPublishedAt,
+          published_at_total: filteredNotes.filter((note) => Boolean(note.published_at)).length,
         },
       },
     };
@@ -994,6 +1025,7 @@ export async function executeBootstrapTaskInPage(
   const notes = mergeBootstrapNotes([...stateNotes, ...domNotes], scopes, {
     maxItemsPerScope,
   });
+  mergePublishedTimes(notes, readXhsPublishedTimes());
   const urls = [...new Set(notes.map((note) => note.url).filter(Boolean))];
   const scope_counts = buildScopeCounts(scopes, notes);
   const finalStateCounts = state
