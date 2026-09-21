@@ -75,10 +75,11 @@ const CHECK_INTERVAL_MS = 300;
 const PROFILE_CLICK_DELAY_MS = 150;
 const PROFILE_CONTENT_WAIT_MS = 8_000;
 // Exact publish times are only required when the source has a non-"all" date
-// preference (backend flag). Cards expose no time, so search tasks fetch at
-// most five note pages; runs concurrently under a 4s per-page timeout.
+// preference (backend flag). Cards expose no time, so search tasks ask the
+// MAIN-world bridge to load at most five note pages; runs concurrently under a
+// 6s per-page timeout.
 const PUBLISHED_AT_ENRICH_MAX_NOTES = 5;
-const PUBLISHED_AT_ENRICH_TIMEOUT_MS = 4_000;
+const PUBLISHED_AT_ENRICH_TIMEOUT_MS = 6_000;
 
 export interface TaskExecuteMessage {
   task_id: string;
@@ -892,12 +893,13 @@ async function executeTaskInPage(
     // a non-"all" date preference additionally fetches a bounded number of
     // note-detail HTML pages and reads noteDetailMap[noteId].note.time.
     const snifferMerged = mergePublishedTimes(filteredNotes, readXhsPublishedTimes());
+    const publishedAtStats = { targets: 0, attempted: 0, enriched: 0 };
     let fetchedPublishedAt = 0;
     if (msg.need_published_at) {
       fetchedPublishedAt = await enrichNotesWithPublishedAt(filteredNotes, {
         maxNotes: PUBLISHED_AT_ENRICH_MAX_NOTES,
         timeoutMs: PUBLISHED_AT_ENRICH_TIMEOUT_MS,
-        document: doc,
+        stats: publishedAtStats,
       });
     }
 
@@ -918,6 +920,9 @@ async function executeTaskInPage(
         xhs_discovery: {
           source: source === "response" ? "search_api" : "rendered_dom",
           task_type: msg.type,
+          published_at_requested: Boolean(msg.need_published_at),
+          published_at_targets: publishedAtStats.targets,
+          published_at_attempted: publishedAtStats.attempted,
           published_at_sniffer_merged: snifferMerged,
           published_at_fetched: fetchedPublishedAt,
           published_at_total: filteredNotes.filter((note) => Boolean(note.published_at)).length,

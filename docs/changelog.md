@@ -20,9 +20,9 @@
 ### 小红书精确发布时间补全（issue #260）
 
 - **真实登录态审计**：搜索 `/api/sns/web/v2/search/notes` 与收藏 `note/collect/page` 的卡片不返回任何时间字段；个人页 `user_posted` 每条含 `time`（epoch ms）；笔记详情页 hydration 后 `__INITIAL_STATE__.note.noteDetailMap[noteId].note.time` 为精确发布时间。
-- **扩展**：MAIN-world sniffer 从 API payload 提取 `(note_id, time)` 并随现有 `obc-xhs-sniffer` 消息下发；task executor 合并到 creator / bootstrap 结果；后端在 `[sources.xiaohongshu].recommendation_date_preset != "all"` 时于 next-task 下发 `need_published_at`，扩展用同源隐藏 iframe 打开缺失时间的候选笔记页（单任务最多 5 条、并发 2、每条 4s 超时），读取 `noteDetailMap[noteId].note.time`，失败不影响任务。默认 `all` 零额外请求。
+- **扩展**：MAIN-world sniffer 从 API payload 提取 `(note_id, time)` 并随现有 `obc-xhs-sniffer` 消息下发；task executor 合并到 creator / bootstrap 结果；后端在 `[sources.xiaohongshu].recommendation_date_preset != "all"` 时于 next-task 下发 `need_published_at`，content script 通过 MAIN-world state bridge 在隐藏同源 iframe 中打开缺失时间的候选笔记页（单任务最多 5 条、并发 2、每条 6s 超时），读 `noteDetailMap[noteId].note.time` 后即销毁 iframe；isolated world 不直接读页面 state，失败不影响任务。默认 `all` 零额外请求。
 - **后端**：现有 `normalize_published_time` 已支持 13 位 epoch ms；`need_published_at` 只作为扩展抓取提示，不改变准入规则。
-- **真实数据验证**：真实账号 `user_posted` 18/18 提取出 epoch ms；真实 note 详情 state 提取出 `time=1789303814000` 等精确值；同源隐藏 iframe 读取路径真机验证通过。回归：`extension/tests/xhs-published-at*.test.ts`；`tests/test_xhs_tasks.py` 覆盖 `need_published_at` 默认关闭 / 日期偏好开启；扩展 `tsc --noEmit` 与全量测试通过（唯一失败是与本改动无关、main 上同样失败的 popup chat 测试）。
+- **真实数据验证**：真实账号 `user_posted` 18/18 提取出 epoch ms；真实 note 详情 state 提取出 `time=1789303814000` 等精确值；并完成实时后端 + 已装扩展热更新的端到端验证：真实搜索任务 debug `published_at_requested=true / targets=5 / attempted=5 / fetched=5 / total=5`，入库核验 4/5（1 条为自有笔记被 self-filter）。回归：`extension/tests/xhs-published-at*.test.ts`；`tests/test_xhs_tasks.py` 覆盖 `need_published_at` 默认关闭 / 日期偏好开启；扩展 `tsc --noEmit` 与全量测试通过（唯一失败是与本改动无关、main 上同样失败的 popup chat 测试）。
 
 ### 自定义回复语气配置（issue #255）
 

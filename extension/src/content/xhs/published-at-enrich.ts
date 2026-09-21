@@ -2,19 +2,23 @@
  * Fill exact Xiaohongshu publish times from a hydrated note page.
  *
  * Search / collect cards expose no time field, so when the backend flags a
- * non-"all" date preference the task executor loads up to five note URLs in
- * hidden same-origin iframes and reads
- * `__INITIAL_STATE__.note.noteDetailMap[noteId].note.time` (epoch ms). The
- * iframe is removed as soon as the value is read (or on timeout); failures are
+ * non-"all" date preference the task executor asks the MAIN-world state bridge
+ * to load up to five note URLs in hidden same-origin iframes and read
+ * `__INITIAL_STATE__.note.noteDetailMap[noteId].note.time` (epoch ms).
+ *
+ * The content script itself runs in an isolated world and cannot read the
+ * page's `__INITIAL_STATE__`, so the iframe work happens in the MAIN world and
+ * only `(note_id, published_at)` crosses back via postMessage. Failures are
  * best-effort and never fail the task.
  */
 
 import {
   extractNoteIdFromUrl,
-  extractPublishedAtFromState,
+  type XhsPublishedTime,
 } from "../../shared/xhs-published-at.ts";
 
-const POLL_INTERVAL_MS = 300;
+const REQUEST_SOURCE = "obc-xhs-note-time-request";
+const RESULT_SOURCE = "obc-xhs-note-time-result";
 const MAX_CONCURRENCY = 3;
 
 export type PublishedAtLoader = (
@@ -23,12 +27,18 @@ export type PublishedAtLoader = (
   timeoutMs: number,
 ) => Promise<number | undefined>;
 
+export interface EnrichPublishedAtStats {
+  targets: number;
+  attempted: number;
+  enriched: number;
+}
+
 export interface EnrichPublishedAtOptions {
   maxNotes?: number;
   timeoutMs?: number;
   concurrency?: number;
-  document?: Document;
   loader?: PublishedAtLoader;
+  stats?: EnrichPublishedAtStats;
 }
 
 export function isXhsNoteUrl(rawUrl: string): boolean {
@@ -42,49 +52,48 @@ export function isXhsNoteUrl(rawUrl: string): boolean {
   }
 }
 
-/** Load one note in a hidden iframe and read its exact epoch-ms publish time. */
-export function loadPublishedAtFromIframe(
+/**
+ * Ask the MAIN-world bridge to resolve one note's exact publish time.
+ * The bridge answers with `obc-xhs-note-time-result` carrying
+ * `{request_id, note_id, published_at}`; null means not resolvable.
+ */
+export function requestNoteTimeViaBridge(
   url: string,
   noteId: string,
   timeoutMs: number,
-  doc: Document = document,
 ): Promise<number | undefined> {
   return new Promise((resolve) => {
-    const frame = doc.createElement("iframe");
-    frame.setAttribute("aria-hidden", "true");
-    frame.style.cssText = "width:1px;height:1px;opacity:0;position:fixed;left:-9999px;top:-9999px";
-
+    const requestId = `obc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     let settled = false;
-    const finish = (value?: number): void => {
+    const finish = (publishedAt?: number): void => {
       if (settled) return;
       settled = true;
-      clearInterval(pollTimer);
-      clearTimeout(timeoutTimer);
-      try {
-        frame.remove();
-      } catch {
-        // removal is best effort
-      }
-      resolve(value);
+      window.clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      resolve(publishedAt);
     };
-
-    const timeoutTimer = setTimeout(() => finish(undefined), timeoutMs);
-    const pollTimer = setInterval(() => {
-      try {
-        const frameWindow = frame.contentWindow as
-          | (Window & { __INITIAL_STATE__?: unknown })
-          | null;
-        if (!frameWindow) return;
-        const publishedAt = extractPublishedAtFromState(frameWindow.__INITIAL_STATE__, noteId);
-        if (publishedAt !== undefined) finish(publishedAt);
-      } catch {
-        // Cross-origin or mid-navigation; keep polling until the timeout.
-      }
-    }, POLL_INTERVAL_MS);
-
+    const onMessage = (event: MessageEvent): void => {
+      if (event.source !== window) return;
+      const data = event.data as
+        | { source?: string; request_id?: string; published_at?: number | null }
+        | null;
+      if (!data || data.source !== RESULT_SOURCE || data.request_id !== requestId) return;
+      if (typeof data.published_at === "number") finish(data.published_at);
+      else finish(undefined);
+    };
+    const timer = window.setTimeout(() => finish(undefined), timeoutMs + 1_000);
+    window.addEventListener("message", onMessage);
     try {
-      frame.src = url;
-      (doc.body ?? doc.documentElement).appendChild(frame);
+      window.postMessage(
+        {
+          source: REQUEST_SOURCE,
+          request_id: requestId,
+          url,
+          note_id: noteId,
+          timeout_ms: timeoutMs,
+        },
+        "*",
+      );
     } catch {
       finish(undefined);
     }
@@ -98,14 +107,12 @@ export async function enrichNotesWithPublishedAt<
   const maxNotes = Math.max(0, options.maxNotes ?? 5);
   const timeoutMs = Math.max(1_000, options.timeoutMs ?? 6_000);
   const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, options.concurrency ?? 2));
-  const loader =
-    options.loader ??
-    ((url: string, noteId: string, timeout: number): Promise<number | undefined> =>
-      loadPublishedAtFromIframe(url, noteId, timeout, options.document));
+  const loader = options.loader ?? requestNoteTimeViaBridge;
 
   const targets = notes
     .filter((note) => !note.published_at && typeof note.url === "string" && isXhsNoteUrl(note.url))
     .slice(0, maxNotes);
+  if (options.stats) options.stats.targets = targets.length;
   if (targets.length === 0) return 0;
 
   let cursor = 0;
@@ -116,12 +123,14 @@ export async function enrichNotesWithPublishedAt<
       cursor += 1;
       const noteId = extractNoteIdFromUrl(note.url ?? "");
       if (!noteId) continue;
+      if (options.stats) options.stats.attempted += 1;
       const publishedAt = await loader(note.url as string, noteId, timeoutMs).catch(
         () => undefined,
       );
       if (publishedAt === undefined) continue;
       note.published_at = publishedAt;
       enriched += 1;
+      if (options.stats) options.stats.enriched += 1;
     }
   };
   await Promise.all(
@@ -129,3 +138,6 @@ export async function enrichNotesWithPublishedAt<
   );
   return enriched;
 }
+
+// Re-exported for callers that want the shared type without a second import.
+export type { XhsPublishedTime };
