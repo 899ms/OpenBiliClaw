@@ -779,6 +779,8 @@ export async function startChatTurn({
   subjectId = "",
   subjectTitle = "",
   replyToTurnId = "",
+  sessionId = "",
+  skill = "",
   streaming = false,
   message,
 }) {
@@ -792,6 +794,8 @@ export async function startChatTurn({
     streaming,
   };
   if (replyToTurnId) payload.reply_to_turn_id = replyToTurnId;
+  if (sessionId) payload.session_id = sessionId;
+  if (skill) payload.skill = skill;
   return requestJson("/chat/turns", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -925,6 +929,197 @@ export async function actOnChatCard(turnId, action, { signal } = {}) {
     signal,
     timeoutMs: 60_000,
   });
+}
+
+// ── Chat agent loop (「聊一聊」 M9) ─────────────────────────────
+// SSE frame parsing and the process-flow run model are shared with the
+// mobile/desktop web via popup/shared/agent-chat.js (copied from
+// src/openbiliclaw/web/shared at build time).
+function agentChatShared() {
+  const shared = globalThis.OpenBiliClawAgentChat;
+  if (!shared) throw new Error("agent-chat shared helper did not load");
+  return shared;
+}
+
+async function postAuthenticatedSse(path, body) {
+  const fetchImpl = globalThis.fetch.bind(globalThis);
+  const backendUrl = await getBackendBaseUrl();
+  const sessionToken = await ensurePopupSession({ fetchImpl });
+  const response = await popupAuthenticatedFetch(
+    `${backendUrl}${path}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    fetchImpl,
+    { sessionToken },
+  );
+  if (!response.ok) {
+    let details = null;
+    try { details = await response.json(); } catch { details = null; }
+    const error = new Error(`${path} request failed: ${response.status}`);
+    error.status = response.status;
+    error.details = details;
+    throw error;
+  }
+  return response;
+}
+
+async function readAgentSseStream(response, onEvent) {
+  const parser = agentChatShared().createAgentSseParser(onEvent);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parser.push(decoder.decode(value, { stream: true }));
+  }
+  parser.end();
+}
+
+/**
+ * Stream one multi-hop agent turn (POST /api/chat/agent/stream).
+ * ``onEvent(eventName, data)`` receives every AgentEvent; resolves with the
+ * terminal ``done`` payload or null. Throws with ``status === 503`` when the
+ * loop is disabled so callers can fall back to the legacy stream; an SSE
+ * ``error`` frame rejects with ``agentStreamError = true``.
+ */
+export async function streamAgentChatTurn({
+  turnId = "",
+  sessionId = "",
+  skill = "",
+  session = "popup",
+  message,
+  onEvent,
+} = {}) {
+  const body = { message };
+  if (turnId) body.turn_id = turnId;
+  if (sessionId) body.session_id = sessionId;
+  if (skill) body.skill = skill;
+  if (session) body.session = session;
+  let donePayload = null;
+  const response = await postAuthenticatedSse("/chat/agent/stream", body);
+  await readAgentSseStream(response, (name, data) => {
+    if (name === "done") donePayload = data;
+    if (name === "error") {
+      const error = new Error(String(data?.error || "对话失败了，请稍后重试。"));
+      error.agentStreamError = true;
+      onEvent?.(name, data);
+      throw error;
+    }
+    onEvent?.(name, data);
+  });
+  return donePayload;
+}
+
+export async function fetchChatSkills() {
+  const data = await requestJson("/chat/skills", { timeoutMs: 5_000 });
+  return agentChatShared().normalizeChatSkillList(data);
+}
+
+export async function fetchChatSessions({ includeArchived = false, limit = 100 } = {}) {
+  const params = new URLSearchParams({ limit: String(Math.max(1, Math.min(500, limit))) });
+  if (includeArchived) params.set("include_archived", "true");
+  const data = await requestJson(`/chat/sessions?${params.toString()}`);
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+export async function createChatSession({ title = "", sessionId = "" } = {}) {
+  const body = {};
+  if (sessionId) body.session_id = sessionId;
+  if (title) body.title = title;
+  return requestJson("/chat/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateChatSession(sessionId, { title, archived } = {}) {
+  const body = {};
+  if (typeof title === "string") body.title = title;
+  if (typeof archived === "boolean") body.archived = archived;
+  return requestJson(`/chat/sessions/${encodeURIComponent(String(sessionId || ""))}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchChatSessionDetail(sessionId, { limit = 100, offset = 0 } = {}) {
+  const params = new URLSearchParams({
+    limit: String(Math.max(1, Math.min(200, limit))),
+    offset: String(Math.max(0, offset)),
+  });
+  return requestJson(
+    `/chat/sessions/${encodeURIComponent(String(sessionId || "default"))}?${params.toString()}`,
+  );
+}
+
+export async function fetchChatApprovals({ status = "pending", limit = 50 } = {}) {
+  const params = new URLSearchParams({ limit: String(Math.max(1, Math.min(200, limit))) });
+  if (status) params.set("status", status);
+  const data = await requestJson(`/chat/approvals?${params.toString()}`, { timeoutMs: 5_000 });
+  return agentChatShared().normalizeApprovalList(data);
+}
+
+export async function approveChatApproval(approvalId) {
+  return requestJson(
+    `/chat/approvals/${encodeURIComponent(String(approvalId || ""))}/approve`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+  );
+}
+
+export async function rejectChatApproval(approvalId, reason = "") {
+  return requestJson(
+    `/chat/approvals/${encodeURIComponent(String(approvalId || ""))}/reject`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+export async function createAgentTask({ prompt, sessionId = "", title = "", skill = "" } = {}) {
+  const body = { prompt: String(prompt || "") };
+  if (sessionId) body.session_id = sessionId;
+  if (title) body.title = title;
+  if (skill) body.skill = skill;
+  return requestJson("/chat/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchAgentTasks({ status = "", sessionId = "", limit = 50, offset = 0 } = {}) {
+  const params = new URLSearchParams({
+    limit: String(Math.max(1, Math.min(200, limit))),
+    offset: String(Math.max(0, offset)),
+  });
+  if (status) params.set("status", status);
+  if (sessionId) params.set("session_id", sessionId);
+  const data = await requestJson(`/chat/tasks?${params.toString()}`);
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return {
+    items: items.map((item) => agentChatShared().normalizeAgentTask(item)).filter(Boolean),
+    total: Math.max(0, Number(data?.total) || 0),
+  };
+}
+
+export async function fetchAgentTask(taskId) {
+  const data = await requestJson(`/chat/tasks/${encodeURIComponent(String(taskId || ""))}`);
+  return agentChatShared().normalizeAgentTask(data);
+}
+
+export async function cancelAgentTask(taskId) {
+  const data = await requestJson(
+    `/chat/tasks/${encodeURIComponent(String(taskId || ""))}/cancel`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+  );
+  return agentChatShared().normalizeAgentTask(data);
 }
 
 export async function respondToInterestProbe(domain, responseType, message = "") {

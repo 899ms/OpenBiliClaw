@@ -4331,3 +4331,55 @@ class TestUnifiedInterestLineFlag:
             example = tomllib.load(handle)
 
         assert example["scheduler"]["unified_interest_line"] is True
+
+
+class TestAgentConfig:
+    """``[agent]`` chat agent-loop budgets (M1)."""
+
+    def test_defaults(self) -> None:
+        config = Config()
+        assert config.agent.loop_enabled is True
+        assert config.agent.loop_max_steps == 64
+        assert config.agent.tool_result_max_chars == 4000
+
+    def test_loop_enabled_round_trip(self, tmp_path: Path) -> None:
+        config = Config()
+        config.agent.loop_enabled = False
+        target = tmp_path / "config.toml"
+
+        save_config(config, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert "loop_enabled = false" in rendered
+        assert loaded.agent.loop_enabled is False
+
+    def test_round_trip_through_toml(self, tmp_path: Path) -> None:
+        config = Config()
+        config.agent.loop_max_steps = 12
+        config.agent.tool_result_max_chars = 800
+        target = tmp_path / "config.toml"
+
+        save_config(config, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert "[agent]" in rendered
+        assert "loop_max_steps = 12" in rendered
+        assert "tool_result_max_chars = 800" in rendered
+        assert loaded.agent.loop_max_steps == 12
+        assert loaded.agent.tool_result_max_chars == 800
+
+    def test_out_of_range_values_fall_back_to_defaults(self) -> None:
+        config = _build_config({"agent": {"loop_max_steps": 0, "tool_result_max_chars": 10}})
+        assert config.agent.loop_max_steps == 64
+        assert config.agent.tool_result_max_chars == 4000
+
+    def test_example_config_parses(self) -> None:
+        example_path = Path(__file__).parents[1] / "config.example.toml"
+
+        with example_path.open("rb") as handle:
+            example = tomllib.load(handle)
+
+        # The [agent] section ships with the defaults commented out.
+        assert "agent" in example

@@ -1015,8 +1015,53 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # Schema version for migrations.  V4 adds the atomic temporal-evidence and
 # review lifecycle fields to both discovery candidates and cached content; V6
-# records the event source-attribution schema marker.
-_SCHEMA_VERSION = 6
+# records the event source-attribution schema marker; V7 adds the chat
+# multi-session model (chat_sessions + chat_turns.session_id); V8 adds the
+# durable background task center (agent_tasks).
+_SCHEMA_VERSION = 8
+
+# Well-known chat session that owns every legacy chat turn whose session_id
+# stayed ''.  It can be renamed but never archived.
+DEFAULT_CHAT_SESSION_ID = "default"
+DEFAULT_CHAT_SESSION_TITLE = "默认会话"
+
+# Durable agent task center (「聊一聊」 M6).  ``interrupted`` marks tasks a
+# previous process (or a config hot reload) left in pending/running; it is a
+# terminal state — tasks are never auto-resumed, the user re-issues them.
+AGENT_TASK_STATUSES: tuple[str, ...] = (
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+AGENT_TASK_TERMINAL_STATUSES: tuple[str, ...] = (
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+AGENT_TASK_ACTIVE_STATUSES: tuple[str, ...] = ("pending", "running")
+# Bounds on the JSON step log kept inline in agent_tasks.steps: at most 200
+# entries, each entry's text truncated to 2000 chars, and the serialized
+# array capped at 200_000 chars (a truncation marker replaces further
+# appends).  Reports and suggestions have their own caps.
+MAX_AGENT_TASK_STEPS = 200
+MAX_AGENT_TASK_STEP_CHARS = 2000
+MAX_AGENT_TASK_STEPS_CHARS = 200_000
+MAX_AGENT_TASK_SUGGESTIONS = 20
+MAX_AGENT_TASK_REPORT_CHARS = 8000
+
+# SQL fragment matching the turns owned by one chat session (sessions aliased
+# ``s``, turns aliased ``t``).  The default session also owns legacy turns
+# whose session_id stayed ''.
+_CHAT_SESSION_TURN_MEMBERSHIP_SQL = (
+    f"(s.session_id = '{DEFAULT_CHAT_SESSION_ID}' "
+    f"AND t.session_id IN ('', '{DEFAULT_CHAT_SESSION_ID}')) "
+    f"OR (s.session_id <> '{DEFAULT_CHAT_SESSION_ID}' "
+    "AND t.session_id = s.session_id)"
+)
 
 _SCHEMA_SQL = """
 -- Event log (behavioral data from browser extension)
@@ -1272,6 +1317,7 @@ CREATE TABLE IF NOT EXISTS chat_turns (
     reply         TEXT NOT NULL DEFAULT '',
     error         TEXT NOT NULL DEFAULT '',
     payload       TEXT NOT NULL DEFAULT '{}',
+    session_id    TEXT NOT NULL DEFAULT '',
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1279,6 +1325,50 @@ CREATE INDEX IF NOT EXISTS idx_chat_turns_session_created
     ON chat_turns(session, created_at, turn_id);
 CREATE INDEX IF NOT EXISTS idx_chat_turns_scope_subject
     ON chat_turns(scope, subject_id, created_at);
+
+-- Multi-session chat model (「聊一聊」 M5).  One row per user-facing
+-- conversation; chat_turns.session_id links turns to it.  ``metadata`` is
+-- an additive JSON bag reserved for skill bindings (M4).  The well-known
+-- row ``default`` owns every legacy turn whose session_id stayed ''.
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    session_id      TEXT PRIMARY KEY,
+    title           TEXT NOT NULL DEFAULT '',
+    archived        INTEGER NOT NULL DEFAULT 0,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_message_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_archived_activity
+    ON chat_sessions(archived, last_message_at);
+
+-- Durable background task center (「聊一聊」 M6).  Tasks are first-class
+-- persistent objects independent of their originating chat session: each
+-- row carries its read-only execution log (``steps``, a capped JSON array
+-- of AgentEvent-shaped entries), the final ``report`` and the structured
+-- ``suggestions`` list handed back to the conversation for user-confirmed
+-- writes.  ``started_at``/``finished_at`` bracket the actual execution.
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    task_id     TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    prompt      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    skill       TEXT NOT NULL DEFAULT '',
+    progress    TEXT NOT NULL DEFAULT '',
+    report      TEXT NOT NULL DEFAULT '',
+    suggestions TEXT NOT NULL DEFAULT '[]',
+    steps       TEXT NOT NULL DEFAULT '[]',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at  TIMESTAMP,
+    finished_at TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created
+    ON agent_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_created
+    ON agent_tasks(session_id, created_at);
 
 -- Atomic winner receipt for durable dialogue-confirmation cards. Dialogue
 -- effects are serialized by the single in-process settlement worker.
@@ -2256,6 +2346,8 @@ class Database:
         self._normalize_legacy_style_keys()
         self._ensure_llm_usage_cache_columns()
         self._ensure_chat_turns_table()
+        self._ensure_chat_sessions_table()
+        self._ensure_agent_tasks_table()
         self._ensure_profile_update_ledger_table()
         self._ensure_confusions_table()
         self._ensure_watch_later_table()
@@ -3291,6 +3383,229 @@ class Database:
     # Durable popup chat turns
     # ------------------------------------------------------------------
 
+    # --- Multi-session chat model (「聊一聊」 M5) ---
+
+    @staticmethod
+    def _normalize_chat_session_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Decode the additive session metadata while tolerating corrupt rows."""
+        normalized = dict(row)
+        raw_metadata = normalized.get("metadata", "{}")
+        try:
+            parsed = json.loads(str(raw_metadata or "{}"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = {}
+        normalized["metadata"] = parsed if isinstance(parsed, dict) else {}
+        normalized["archived"] = bool(normalized.get("archived", 0))
+        normalized["title"] = str(normalized.get("title", "") or "")
+        normalized["last_message_at"] = str(normalized.get("last_message_at", "") or "")
+        return normalized
+
+    def ensure_default_chat_session(self) -> dict[str, Any]:
+        """Create the well-known default chat session if missing and return it."""
+        self._execute_write(
+            "INSERT OR IGNORE INTO chat_sessions (session_id, title) VALUES (?, ?)",
+            (DEFAULT_CHAT_SESSION_ID, DEFAULT_CHAT_SESSION_TITLE),
+        )
+        row = self.get_chat_session(DEFAULT_CHAT_SESSION_ID)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError("Failed to create the default chat session")
+        return row
+
+    def create_chat_session(
+        self,
+        *,
+        session_id: str,
+        title: str = "",
+        metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Create one chat session; idempotent on the session id."""
+        normalized_id = session_id.strip()
+        if not normalized_id:
+            raise ValueError("Chat session id is required")
+        serialized_metadata = json.dumps(dict(metadata or {}), ensure_ascii=False, sort_keys=True)
+        self._execute_write(
+            """
+            INSERT OR IGNORE INTO chat_sessions (session_id, title, metadata)
+            VALUES (?, ?, ?)
+            """,
+            (normalized_id, title.strip(), serialized_metadata),
+        )
+        row = self.get_chat_session(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError(f"Failed to create chat session {normalized_id!r}")
+        return row
+
+    def get_chat_session(self, session_id: str) -> dict[str, Any] | None:
+        """Return one chat session by id."""
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT session_id, title, archived, metadata,
+                   created_at, updated_at, last_message_at
+            FROM chat_sessions
+            WHERE session_id = ?
+            """,
+            (session_id.strip(),),
+        ).fetchone()
+        return self._normalize_chat_session_row(row) if row is not None else None
+
+    def list_chat_sessions(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return chat sessions ordered by latest activity, most recent first.
+
+        Each row carries a ``last_message_preview`` (truncated latest user
+        message), ``turn_count``, ``active_turns`` (pending replies) and the
+        computed ``last_activity`` used for ordering.  The default session
+        also owns legacy turns whose ``session_id`` stayed ''.
+        """
+        self._ensure_fresh_read()
+        membership = _CHAT_SESSION_TURN_MEMBERSHIP_SQL
+        cursor = self.conn.execute(
+            f"""
+            SELECT s.session_id, s.title, s.archived, s.metadata,
+                   s.created_at, s.updated_at, s.last_message_at,
+                   (SELECT COUNT(*) FROM chat_turns t WHERE {membership}) AS turn_count,
+                   (SELECT COUNT(*) FROM chat_turns t
+                    WHERE ({membership}) AND t.status = 'pending') AS active_turns,
+                   (SELECT substr(t.message, 1, 120) FROM chat_turns t
+                    WHERE {membership}
+                    ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1) AS last_message_preview,
+                   COALESCE(
+                       s.last_message_at,
+                       (SELECT MAX(t.created_at) FROM chat_turns t WHERE {membership}),
+                       s.updated_at
+                   ) AS last_activity
+            FROM chat_sessions s
+            WHERE (? OR s.archived = 0)
+            ORDER BY last_activity DESC, turn_count DESC, s.session_id ASC
+            LIMIT ?
+            """,
+            (1 if include_archived else 0, max(1, int(limit))),
+        )
+        return [self._normalize_chat_session_row(row) for row in cursor.fetchall()]
+
+    def get_chat_session_summary(self, session_id: str) -> dict[str, Any] | None:
+        """Return one session with the same aggregate preview fields as the list."""
+        self._ensure_fresh_read()
+        membership = _CHAT_SESSION_TURN_MEMBERSHIP_SQL
+        row = self.conn.execute(
+            f"""
+            SELECT s.session_id, s.title, s.archived, s.metadata,
+                   s.created_at, s.updated_at, s.last_message_at,
+                   (SELECT COUNT(*) FROM chat_turns t WHERE {membership}) AS turn_count,
+                   (SELECT COUNT(*) FROM chat_turns t
+                    WHERE ({membership}) AND t.status = 'pending') AS active_turns,
+                   (SELECT substr(t.message, 1, 120) FROM chat_turns t
+                    WHERE {membership}
+                    ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1) AS last_message_preview,
+                   COALESCE(
+                       s.last_message_at,
+                       (SELECT MAX(t.created_at) FROM chat_turns t WHERE {membership}),
+                       s.updated_at
+                   ) AS last_activity
+            FROM chat_sessions s
+            WHERE s.session_id = ?
+            """,
+            (session_id.strip(),),
+        ).fetchone()
+        return self._normalize_chat_session_row(row) if row is not None else None
+
+    def rename_chat_session(self, session_id: str, *, title: str) -> bool:
+        """Rename one chat session; returns False when the session is missing."""
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET title = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (title.strip(), session_id.strip()),
+        )
+        return cursor.rowcount == 1
+
+    def set_chat_session_archived(self, session_id: str, *, archived: bool) -> bool:
+        """Archive/unarchive one session. The default session cannot be archived."""
+        normalized_id = session_id.strip()
+        if normalized_id == DEFAULT_CHAT_SESSION_ID and archived:
+            raise ValueError("The default chat session cannot be archived")
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET archived = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (1 if archived else 0, normalized_id),
+        )
+        return cursor.rowcount == 1
+
+    def touch_chat_session(self, session_id: str) -> bool:
+        """Bump one session's last-message activity timestamp."""
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET last_message_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (session_id.strip(),),
+        )
+        return cursor.rowcount == 1
+
+    def list_chat_turns_by_session(
+        self,
+        *,
+        session_id: str,
+        scope: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page one session's turns (newest page first) plus the total count.
+
+        Rows come back in ascending display order within the requested page,
+        matching ``list_chat_turns``.  The default session includes legacy
+        turns whose ``session_id`` stayed ''.
+        """
+        self._ensure_fresh_read()
+        normalized_id = session_id.strip()
+        if normalized_id == DEFAULT_CHAT_SESSION_ID:
+            clauses = ["session_id IN ('', ?)"]
+            params: list[Any] = [DEFAULT_CHAT_SESSION_ID]
+        else:
+            clauses = ["session_id = ?"]
+            params = [normalized_id]
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        where = " AND ".join(clauses)
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM chat_turns WHERE {where}",
+            params,
+        ).fetchone()
+        total = int(total_row["count"] if total_row is not None else 0)
+        cursor = self.conn.execute(
+            f"""
+            SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
+                   status, reply, error, payload, session_id, created_at, updated_at
+            FROM (
+                SELECT rowid AS insertion_rowid,
+                       turn_id, session, scope, subject_id, subject_title,
+                       reply_to_turn_id, message,
+                       status, reply, error, payload, session_id, created_at, updated_at
+                FROM chat_turns
+                WHERE {where}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ? OFFSET ?
+            )
+            ORDER BY created_at ASC, insertion_rowid ASC
+            """,
+            [*params, max(1, int(limit)), max(0, int(offset))],
+        )
+        rows = [self._normalize_chat_turn_row(row) for row in cursor.fetchall()]
+        return rows, total
+
     def create_chat_turn(
         self,
         *,
@@ -3302,16 +3617,18 @@ class Database:
         subject_title: str = "",
         reply_to_turn_id: str = "",
         payload: Mapping[str, object] | None = None,
+        session_id: str = "",
     ) -> dict[str, Any]:
         """Create a pending popup chat turn if it does not already exist."""
         serialized_payload = json.dumps(dict(payload or {}), ensure_ascii=False, sort_keys=True)
+        normalized_session_id = session_id.strip()
         self._execute_write(
             """
             INSERT OR IGNORE INTO chat_turns (
                 turn_id, session, scope, subject_id, subject_title, reply_to_turn_id,
-                message, status, payload
+                message, status, payload, session_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 turn_id,
@@ -3322,8 +3639,11 @@ class Database:
                 reply_to_turn_id or "",
                 message,
                 serialized_payload,
+                normalized_session_id,
             ),
         )
+        if normalized_session_id:
+            self.touch_chat_session(normalized_session_id)
         row = self.get_chat_turn(turn_id)
         if row is None:
             raise RuntimeError(f"Failed to create chat turn {turn_id!r}")
@@ -3531,6 +3851,8 @@ class Database:
             """,
             (reply, turn_id),
         )
+        if cursor.rowcount == 1:
+            self._touch_chat_session_for_turn(turn_id)
         return cursor.rowcount == 1
 
     def fail_chat_turn(self, turn_id: str, *, error: str, reply: str = "") -> bool:
@@ -3547,7 +3869,23 @@ class Database:
             """,
             (reply, error, turn_id),
         )
+        if cursor.rowcount == 1:
+            self._touch_chat_session_for_turn(turn_id)
         return cursor.rowcount == 1
+
+    def _touch_chat_session_for_turn(self, turn_id: str) -> None:
+        """Reflect a turn outcome in its owning session's activity timestamp."""
+        self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET last_message_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = (
+                SELECT session_id FROM chat_turns WHERE turn_id = ?
+            )
+            """,
+            (turn_id,),
+        )
 
     def get_chat_turn(self, turn_id: str) -> dict[str, Any] | None:
         """Return one durable popup chat turn by id."""
@@ -3556,7 +3894,7 @@ class Database:
             """
             SELECT turn_id, session, scope, subject_id, subject_title,
                    reply_to_turn_id, message,
-                   status, reply, error, payload, created_at, updated_at
+                   status, reply, error, payload, session_id, created_at, updated_at
             FROM chat_turns
             WHERE turn_id = ?
             """,
@@ -3583,18 +3921,63 @@ class Database:
         cursor = self.conn.execute(
             f"""
             SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
-                   status, reply, error, payload, created_at, updated_at
+                   status, reply, error, payload, session_id, created_at, updated_at
             FROM (
                    SELECT rowid AS insertion_rowid,
                        turn_id, session, scope, subject_id, subject_title,
                        reply_to_turn_id, message,
-                       status, reply, error, payload, created_at, updated_at
+                       status, reply, error, payload, session_id, created_at, updated_at
                 FROM chat_turns
                 WHERE {" AND ".join(clauses)}
                 ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
             )
             ORDER BY created_at ASC, insertion_rowid ASC
+            """,
+            params,
+        )
+        return [self._normalize_chat_turn_row(row) for row in cursor.fetchall()]
+
+    def search_chat_turns(
+        self,
+        *,
+        keyword: str = "",
+        session: str = "",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search durable chat turns by keyword and optional time range, newest first.
+
+        Backs the agent-loop ``search_history`` tool: keyword matches against
+        both the user message and the assistant reply.
+        """
+        self._ensure_fresh_read()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            clauses.append("(message LIKE ? OR reply LIKE ?)")
+            params.extend([like, like])
+        if session:
+            clauses.append("session = ?")
+            params.append(session)
+        if start_time is not None:
+            clauses.append("created_at >= ?")
+            params.append(start_time.isoformat(sep=" "))
+        if end_time is not None:
+            clauses.append("created_at <= ?")
+            params.append(end_time.isoformat(sep=" "))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        cursor = self.conn.execute(
+            f"""
+            SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
+                   status, reply, error, payload, session_id, created_at, updated_at
+            FROM chat_turns
+            {where}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
             """,
             params,
         )
@@ -3661,6 +4044,9 @@ class Database:
         # Additive relation migration: legacy rows have no relation and must
         # hydrate as explicitly unbound rather than crashing or guessing.
         normalized.setdefault("reply_to_turn_id", "")
+        # Additive multi-session migration (M5): legacy rows have no owning
+        # session entity and are read through the default session.
+        normalized.setdefault("session_id", "")
         return normalized
 
     def update_chat_turn_payload_state(
@@ -3717,6 +4103,317 @@ class Database:
             (f"$.{receipt_key}", serialized, turn_id),
         )
         return int(cursor.rowcount or 0) == 1
+
+    def store_chat_turn_agent_events(
+        self,
+        turn_id: str,
+        *,
+        events: list[Mapping[str, object]],
+    ) -> bool:
+        """Persist one agent-loop event stream inside the turn payload.
+
+        The events (``AgentEvent.to_dict()`` shapes: thinking / tool_call /
+        tool_result / step_limit_reached / final) live under
+        ``payload.agent_events`` so chat history replay can re-render the
+        loop's steps without a schema migration.
+        """
+        serialized = json.dumps([dict(event) for event in events], ensure_ascii=False)
+        cursor = self._execute_write(
+            """
+            UPDATE chat_turns
+            SET payload = json_set(
+                    CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                    '$.agent_events',
+                    json(?)
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE turn_id = ?
+            """,
+            (serialized, turn_id),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    # --- Durable agent task center (「聊一聊」 M6) ---
+
+    @staticmethod
+    def _normalize_agent_task_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Decode the JSON columns while tolerating corrupt rows."""
+        normalized = dict(row)
+        json_list_fields: tuple[tuple[str, list[Any]], ...] = (
+            ("suggestions", []),
+            ("steps", []),
+        )
+        for field_name, fallback in json_list_fields:
+            raw_value = normalized.get(field_name, fallback)
+            try:
+                parsed = json.loads(str(raw_value)) if isinstance(raw_value, str) else raw_value
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = fallback
+            normalized[field_name] = parsed if isinstance(parsed, list) else []
+        for field_name in (
+            "session_id",
+            "title",
+            "prompt",
+            "status",
+            "skill",
+            "progress",
+            "report",
+            "error",
+        ):
+            normalized[field_name] = str(normalized.get(field_name, "") or "")
+        for field_name in ("created_at", "started_at", "finished_at", "updated_at"):
+            normalized[field_name] = str(normalized.get(field_name, "") or "")
+        return normalized
+
+    def create_agent_task(
+        self,
+        *,
+        task_id: str,
+        session_id: str = "",
+        title: str = "",
+        prompt: str,
+        skill: str = "",
+    ) -> dict[str, Any]:
+        """Create one durable background task in ``pending`` state (idempotent)."""
+        normalized_id = task_id.strip()
+        if not normalized_id:
+            raise ValueError("Agent task id is required")
+        if not prompt.strip():
+            raise ValueError("Agent task prompt is required")
+        self._execute_write(
+            """
+            INSERT OR IGNORE INTO agent_tasks (task_id, session_id, title, prompt, skill)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_id,
+                session_id.strip(),
+                title.strip(),
+                prompt.strip(),
+                skill.strip(),
+            ),
+        )
+        row = self.get_agent_task(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError(f"Failed to create agent task {normalized_id!r}")
+        return row
+
+    def get_agent_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return one agent task by id, with ``suggestions``/``steps`` decoded."""
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT task_id, session_id, title, prompt, status, skill, progress,
+                   report, suggestions, steps, error,
+                   created_at, started_at, finished_at, updated_at
+            FROM agent_tasks
+            WHERE task_id = ?
+            """,
+            (task_id.strip(),),
+        ).fetchone()
+        return self._normalize_agent_task_row(row) if row is not None else None
+
+    def list_agent_tasks(
+        self,
+        *,
+        status: str = "",
+        session_id: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page agent tasks (newest first) plus the total count.
+
+        ``status`` filters one exact status; ``session_id`` filters the
+        originating conversation.  Step logs are included per row — the API
+        layer strips them from list responses.
+        """
+        self._ensure_fresh_read()
+        clauses: list[str] = []
+        params: list[Any] = []
+        normalized_status = status.strip()
+        if normalized_status:
+            if normalized_status not in AGENT_TASK_STATUSES:
+                raise ValueError(f"Unknown agent task status: {normalized_status}")
+            clauses.append("status = ?")
+            params.append(normalized_status)
+        if session_id.strip():
+            clauses.append("session_id = ?")
+            params.append(session_id.strip())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM agent_tasks {where}",
+            params,
+        ).fetchone()
+        total = int(total_row["count"] if total_row is not None else 0)
+        cursor = self.conn.execute(
+            f"""
+            SELECT task_id, session_id, title, prompt, status, skill, progress,
+                   report, suggestions, steps, error,
+                   created_at, started_at, finished_at, updated_at
+            FROM agent_tasks
+            {where}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, max(1, int(limit)), max(0, int(offset))],
+        )
+        rows = [self._normalize_agent_task_row(row) for row in cursor.fetchall()]
+        return rows, total
+
+    def update_agent_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        progress: str = "",
+        error: str = "",
+        expected: tuple[str, ...] | None = None,
+    ) -> bool:
+        """CAS one task into ``status``; returns False when the transition lost.
+
+        ``expected`` defaults to the active states (pending/running) so
+        terminal rows are never overwritten.  Entering ``running`` stamps
+        ``started_at``; entering any terminal status stamps ``finished_at``.
+        """
+        if status not in AGENT_TASK_STATUSES:
+            raise ValueError(f"Unknown agent task status: {status}")
+        allowed = expected if expected is not None else AGENT_TASK_ACTIVE_STATUSES
+        if not allowed:
+            return False
+        placeholders = ", ".join("?" for _ in allowed)
+        assignments = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+        params: list[Any] = [status]
+        if progress:
+            assignments.append("progress = ?")
+            params.append(progress)
+        if error or status in AGENT_TASK_TERMINAL_STATUSES:
+            assignments.append("error = ?")
+            params.append(error)
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)")
+        if status in AGENT_TASK_TERMINAL_STATUSES:
+            assignments.append("finished_at = CURRENT_TIMESTAMP")
+        cursor = self._execute_write(
+            f"""
+            UPDATE agent_tasks
+            SET {", ".join(assignments)}
+            WHERE task_id = ?
+              AND status IN ({placeholders})
+            """,
+            (*params, task_id.strip(), *allowed),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def append_agent_task_step(self, task_id: str, *, step: Mapping[str, object]) -> bool:
+        """Append one execution-log entry to a non-terminal task's step log.
+
+        Entries are ``AgentEvent.to_dict()``-shaped dicts with text truncated
+        to ``MAX_AGENT_TASK_STEP_CHARS``.  The log is bounded: once it reaches
+        ``MAX_AGENT_TASK_STEPS`` entries or ``MAX_AGENT_TASK_STEPS_CHARS``
+        serialized, further appends collapse into a single trailing
+        ``steps_truncated`` marker.  The task's ``progress`` summary follows
+        the latest step.
+        """
+        row = self.conn.execute(
+            "SELECT status, steps FROM agent_tasks WHERE task_id = ?",
+            (task_id.strip(),),
+        ).fetchone()
+        if row is None or str(row["status"] or "") in AGENT_TASK_TERMINAL_STATUSES:
+            return False
+        try:
+            steps = json.loads(str(row["steps"] or "[]"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            steps = []
+        if not isinstance(steps, list):
+            steps = []
+        entry = dict(step)
+        text = str(entry.get("text", "") or "")
+        if len(text) > MAX_AGENT_TASK_STEP_CHARS:
+            entry["text"] = text[:MAX_AGENT_TASK_STEP_CHARS] + "…（已截断）"
+            entry["truncated"] = True
+        steps.append(entry)
+        serialized = json.dumps(steps, ensure_ascii=False)
+        if len(steps) > MAX_AGENT_TASK_STEPS or len(serialized) > MAX_AGENT_TASK_STEPS_CHARS:
+            marker = {
+                "type": "steps_truncated",
+                "text": (
+                    f"执行记录已达上限（{MAX_AGENT_TASK_STEPS} 条 / "
+                    f"{MAX_AGENT_TASK_STEPS_CHARS} 字符），后续步骤省略。"
+                ),
+            }
+            steps = steps[: MAX_AGENT_TASK_STEPS - 1] + [marker]
+            serialized = json.dumps(steps, ensure_ascii=False)
+        progress = str(entry.get("summary", "") or "") or text[:120]
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET steps = ?,
+                progress = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+            """,
+            (serialized, progress, task_id.strip()),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def set_agent_task_report(
+        self,
+        task_id: str,
+        *,
+        report: str,
+        suggestions: list[Mapping[str, object]] | None = None,
+    ) -> bool:
+        """Publish the final report + suggestion list and complete the task.
+
+        CAS from the active states only, so a cancel or failure that landed
+        first is never overwritten by a late report.
+        """
+        trimmed_report = report.strip()
+        if len(trimmed_report) > MAX_AGENT_TASK_REPORT_CHARS:
+            trimmed_report = trimmed_report[:MAX_AGENT_TASK_REPORT_CHARS] + "…（报告已截断）"
+        normalized_suggestions = [
+            dict(item) for item in (suggestions or [])[:MAX_AGENT_TASK_SUGGESTIONS]
+        ]
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET status = 'completed',
+                report = ?,
+                suggestions = ?,
+                error = '',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND status IN ('pending', 'running')
+            """,
+            (
+                trimmed_report,
+                json.dumps(normalized_suggestions, ensure_ascii=False),
+                task_id.strip(),
+            ),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def interrupt_stale_agent_tasks(self) -> int:
+        """Mark tasks a previous process left active as ``interrupted``.
+
+        Called once at app startup: in-flight asyncio tasks never survive a
+        restart, so any row still pending/running belongs to a dead process.
+        Tasks are never auto-resumed — the user re-issues them from the task
+        center.  Returns the number of rows marked.
+        """
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET status = 'interrupted',
+                error = '服务重启或热重载中断了该任务，可从任务中心重新发起。',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('pending', 'running')
+            """,
+        )
+        return int(cursor.rowcount or 0)
 
     def try_create_card_settlement(
         self,
@@ -14106,10 +14803,61 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE chat_turns ADD COLUMN reply_to_turn_id TEXT NOT NULL DEFAULT ''"
             )
+        if "session_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE chat_turns ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+            )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_turns_reply_to ON chat_turns(reply_to_turn_id)"
         )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_turns_session_id_created "
+            "ON chat_turns(session_id, created_at, turn_id)"
+        )
         self._migrate_card_settlements_to_wave_2()
+
+    def _ensure_chat_sessions_table(self) -> None:
+        """Create the multi-session chat model for existing databases (M5)."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id      TEXT PRIMARY KEY,
+                title           TEXT NOT NULL DEFAULT '',
+                archived        INTEGER NOT NULL DEFAULT 0,
+                metadata        TEXT NOT NULL DEFAULT '{}',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_message_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_archived_activity
+                ON chat_sessions(archived, last_message_at);
+        """)
+        self.ensure_default_chat_session()
+
+    def _ensure_agent_tasks_table(self) -> None:
+        """Create the durable agent task center for existing databases (M6)."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                task_id     TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL DEFAULT '',
+                title       TEXT NOT NULL DEFAULT '',
+                prompt      TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'pending',
+                skill       TEXT NOT NULL DEFAULT '',
+                progress    TEXT NOT NULL DEFAULT '',
+                report      TEXT NOT NULL DEFAULT '',
+                suggestions TEXT NOT NULL DEFAULT '[]',
+                steps       TEXT NOT NULL DEFAULT '[]',
+                error       TEXT NOT NULL DEFAULT '',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at  TIMESTAMP,
+                finished_at TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created
+                ON agent_tasks(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_created
+                ON agent_tasks(session_id, created_at);
+        """)
 
     def _migrate_card_settlements_to_wave_2(self) -> None:
         """Rebuild legacy claim/segment receipts into the Wave 2 winner schema."""

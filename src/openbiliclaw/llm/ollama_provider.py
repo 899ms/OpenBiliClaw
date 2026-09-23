@@ -52,6 +52,10 @@ class OllamaProvider(OpenAIProvider):
             provider_name="ollama",
             timeout=timeout,
         )
+        # M1 keeps Ollama on the prompt-simulation tool path: native FC is
+        # only verified for the hosted OpenAI-compatible chat-completions
+        # endpoints, and Ollama's /v1 shim tool support varies by model.
+        self.supports_tool_calling = False
         self._embed_timeout = timeout
         # v0.3.x+: when >0, chat completions route through Ollama's *native*
         # ``/api/chat`` endpoint so we can pass ``options.num_ctx``. The

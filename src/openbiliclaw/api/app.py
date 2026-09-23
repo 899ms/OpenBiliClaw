@@ -50,6 +50,9 @@ from starlette.background import BackgroundTask
 from openbiliclaw.api.models import (
     ActivityFeedItemOut,
     ActivityFeedResponse,
+    AgentTaskCreateIn,
+    AgentTaskListResponse,
+    AgentTaskOut,
     AutostartApplyIn,
     AutostartConfigOut,
     AutostartStatusOut,
@@ -61,6 +64,11 @@ from openbiliclaw.api.models import (
     BilibiliCookieResponse,
     BilibiliSourceConfigOut,
     ChatIn,
+    ChatSessionCreateIn,
+    ChatSessionDetailResponse,
+    ChatSessionListResponse,
+    ChatSessionOut,
+    ChatSessionPatchIn,
     ChatTurnIn,
     ChatTurnListResponse,
     ChatTurnOut,
@@ -256,7 +264,11 @@ from openbiliclaw.sources.platforms import (
 from openbiliclaw.sources.platforms import (
     infer_source_platform_from_url as _registry_infer_source_platform_from_url,
 )
-from openbiliclaw.storage.database import CONTENT_HISTORY_RETENTION_DAYS
+from openbiliclaw.storage.database import (
+    AGENT_TASK_TERMINAL_STATUSES,
+    CONTENT_HISTORY_RETENTION_DAYS,
+    DEFAULT_CHAT_SESSION_ID,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -1904,6 +1916,59 @@ def _is_masked_proxy_echo(value: str) -> bool:
 _BILIBILI_RELATED_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _BILIBILI_RELATED_CACHE_TTL_SECONDS = 300.0
 
+# --- Chat session auto-titling (「聊一聊」 M5) ---
+
+SESSION_TITLE_MAX_CHARS = 30
+_SESSION_TITLE_TIMEOUT_SECONDS = 30.0
+_SESSION_TITLE_SYSTEM_PROMPT = (
+    "你是会话标题生成器。根据用户的首条消息，生成一个简短的中文会话标题。"
+    "要求：不超过 20 个字符，概括话题，不带标点后缀，不带引号。"
+    '输出 JSON：{"title": "..."}'
+)
+# Strong references for fire-and-forget title tasks so the event loop cannot
+# garbage-collect them mid-flight.
+_SESSION_TITLE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def fallback_session_title(message: str) -> str:
+    """Truncated first-message prefix used when LLM titling is unavailable."""
+    return " ".join(message.split())[:SESSION_TITLE_MAX_CHARS]
+
+
+async def generate_session_title(
+    llm_service: Any,
+    message: str,
+    *,
+    timeout: float = _SESSION_TITLE_TIMEOUT_SECONDS,
+) -> str:
+    """Generate a short session title via the LLM, falling back to a prefix.
+
+    The call goes through ``LLMService.complete_structured_task`` so it
+    shares the app-wide LLM concurrency gate; any failure (timeout, provider
+    error, malformed JSON, empty title) falls back to the truncated first
+    message instead of propagating.
+    """
+    try:
+        response = await asyncio.wait_for(
+            llm_service.complete_structured_task(
+                system_instruction=_SESSION_TITLE_SYSTEM_PROMPT,
+                user_input=message[:2000],
+                temperature=0.3,
+                max_tokens=256,
+                caller="chat.session_title",
+                reasoning_effort="",
+                inject_core_memory=False,
+            ),
+            timeout=timeout,
+        )
+        parsed = json.loads(str(response.content))
+        title = str(parsed.get("title", "")).strip().strip("\"' ").strip()
+        if title:
+            return title[:SESSION_TITLE_MAX_CHARS]
+    except Exception:
+        logger.debug("Chat session title generation failed; using fallback", exc_info=True)
+    return fallback_session_title(message)
+
 
 def create_app(
     *,
@@ -2310,6 +2375,15 @@ def create_app(
     if initial_available is not None and callable(update_inventory):
         update_inventory(available=initial_available, target=_inventory_target())
     app.state.runtime_context = ctx
+    # 「聊一聊」 M6: agent tasks still pending/running belong to a dead
+    # process (in-flight asyncio tasks never survive a restart) — mark them
+    # interrupted once at boot; they are never auto-resumed.
+    with suppress(Exception):
+        interrupt_stale = getattr(
+            getattr(ctx, "database", None), "interrupt_stale_agent_tasks", None
+        )
+        if callable(interrupt_stale):
+            interrupt_stale()
     auto_replenishment_task: asyncio.Task[None] | None = None
     auto_replenishment_started_at = 0.0
     first_page_topup_attempted_at = 0.0
@@ -3237,6 +3311,9 @@ def create_app(
     # Keeping it on app.state also makes drain/publication invariants directly
     # testable without forcing a config.toml write through the HTTP surface.
     app.state._rebuild_runtime_with_lane_handoff = _rebuild_runtime_with_lane_handoff
+    # M7: the update_config tool (post-approval) hot-reloads through the same
+    # lane-handoff path instead of rebuilding raw inside a chat turn.
+    ctx.config_reload_delegate = _rebuild_runtime_with_lane_handoff
 
     def _set_config_apply_status(
         state: Literal["idle", "queued", "applying", "applied", "failed"],
@@ -4048,6 +4125,7 @@ def create_app(
             status=str(row.get("status", "pending") or "pending"),
             error=str(row.get("error", "") or ""),
             payload=payload,
+            session_id=str(row.get("session_id", "") or ""),
             created_at=str(row.get("created_at", "") or ""),
             updated_at=str(row.get("updated_at", "") or ""),
         )
@@ -4283,6 +4361,11 @@ def create_app(
             return False
         if str(row.get("session", "popup") or "popup") != (payload.session.strip() or "popup"):
             return False
+        # Explicit multi-session ownership (M5) is part of request identity;
+        # omitted session_id stays compatible with pre-M5 rows.
+        requested_session_id = payload.session_id.strip()
+        if requested_session_id and str(row.get("session_id", "") or "") != requested_session_id:
+            return False
         if str(row.get("reply_to_turn_id", "") or "") != payload.reply_to_turn_id.strip():
             return False
         if stored_binding is None or stored_binding.mode.value != "bound":
@@ -4506,6 +4589,7 @@ def create_app(
         *,
         turn_id: str,
         structured_payload: dict[str, object] | None = None,
+        session_id: str = "",
     ) -> dict[str, Any]:
         create_chat_turn = _chat_db_method("create_chat_turn")
         if create_chat_turn is not None:
@@ -4520,6 +4604,7 @@ def create_app(
                     message=payload.message.strip(),
                     reply_to_turn_id=payload.reply_to_turn_id.strip(),
                     payload=structured_payload or {},
+                    session_id=session_id,
                 ),
             )
 
@@ -4540,6 +4625,7 @@ def create_app(
                 "reply": "",
                 "error": "",
                 "payload": dict(structured_payload or {}),
+                "session_id": session_id,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -4838,6 +4924,151 @@ def create_app(
             )
             return True
         return False
+
+    def _store_chat_turn_agent_events(turn_id: str, events: list[dict[str, Any]]) -> bool:
+        """Persist the agent-loop event stream into the turn payload for replay."""
+        store = _chat_db_method("store_chat_turn_agent_events")
+        if store is not None:
+            return bool(store(turn_id, events=events))
+        row = fallback_chat_turns.get(turn_id)
+        if row is None:
+            return False
+        stored_payload = row.get("payload")
+        if not isinstance(stored_payload, dict):
+            stored_payload = {}
+            row["payload"] = stored_payload
+        stored_payload["agent_events"] = [dict(event) for event in events]
+        return True
+
+    # --- Multi-session chat helpers (「聊一聊」 M5) ---
+
+    def _chat_session_db_method(name: str) -> Any:
+        method = _chat_db_method(name)
+        if method is None:
+            raise HTTPException(status_code=503, detail="Chat session storage not available.")
+        return method
+
+    def _normalize_chat_session(row: Mapping[str, Any]) -> ChatSessionOut:
+        return ChatSessionOut(
+            session_id=str(row.get("session_id", "")),
+            title=str(row.get("title", "") or ""),
+            archived=bool(row.get("archived", False)),
+            metadata=dict(row.get("metadata", {}) or {}),
+            turn_count=int(row.get("turn_count", 0) or 0),
+            active_turns=int(row.get("active_turns", 0) or 0),
+            last_message_preview=str(row.get("last_message_preview", "") or ""),
+            last_activity=str(row.get("last_activity", "") or ""),
+            created_at=str(row.get("created_at", "") or ""),
+            updated_at=str(row.get("updated_at", "") or ""),
+            last_message_at=str(row.get("last_message_at", "") or ""),
+        )
+
+    def _resolve_chat_session_id(payload: ChatTurnIn) -> str:
+        """Resolve the owning session for a new turn, validating explicit ids."""
+        requested = payload.session_id.strip()
+        if not requested:
+            return DEFAULT_CHAT_SESSION_ID
+        getter = _chat_db_method("get_chat_session")
+        row = getter(requested) if callable(getter) else None
+        if row is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        return requested
+
+    # --- Durable agent task center helpers (「聊一聊」 M6) ---
+
+    def _agent_task_db_method(name: str) -> Any:
+        method = _chat_db_method(name)
+        if method is None:
+            raise HTTPException(status_code=503, detail="Agent task storage not available.")
+        return method
+
+    def _resolve_agent_task_runner() -> Any:
+        """Return the runtime task runner, building it lazily if unwired.
+
+        The runner resolves loop/registry/catalog from ``ctx`` at run start,
+        so one instance survives the hot-reload atomic swap — same lazy
+        pattern as ``_resolve_skill_catalog``.
+        """
+        runner = getattr(ctx, "agent_task_runner", None)
+        if runner is not None:
+            return runner
+        from openbiliclaw.agent.tasks import AgentTaskRunner
+
+        database = getattr(ctx, "database", None)
+        if not callable(getattr(database, "create_agent_task", None)):
+            raise HTTPException(status_code=503, detail="Agent task storage not available.")
+        runner = AgentTaskRunner(
+            database,
+            runtime=ctx,
+            task_registry=getattr(ctx, "task_registry", None),
+        )
+        ctx.agent_task_runner = runner
+        return runner
+
+    def _normalize_agent_task(
+        row: Mapping[str, Any], *, include_steps: bool = True
+    ) -> AgentTaskOut:
+        return AgentTaskOut(
+            task_id=str(row.get("task_id", "")),
+            session_id=str(row.get("session_id", "") or ""),
+            title=str(row.get("title", "") or ""),
+            prompt=str(row.get("prompt", "") or ""),
+            status=str(row.get("status", "") or ""),
+            skill=str(row.get("skill", "") or ""),
+            progress=str(row.get("progress", "") or ""),
+            report=str(row.get("report", "") or ""),
+            suggestions=[dict(item) for item in row.get("suggestions", []) or []],
+            steps=[dict(step) for step in row.get("steps", []) or []] if include_steps else [],
+            error=str(row.get("error", "") or ""),
+            created_at=str(row.get("created_at", "") or ""),
+            started_at=str(row.get("started_at", "") or ""),
+            finished_at=str(row.get("finished_at", "") or ""),
+            updated_at=str(row.get("updated_at", "") or ""),
+        )
+
+    def _resolve_chat_title_llm_service() -> Any | None:
+        """Find an LLMService capable of the structured title task."""
+        for owner in (
+            getattr(ctx, "agent_loop", None),
+            getattr(ctx, "dialogue", None),
+            getattr(ctx, "soul_engine", None),
+        ):
+            service = getattr(owner, "_llm", None) or getattr(owner, "_llm_service", None)
+            if service is not None and callable(getattr(service, "complete_structured_task", None)):
+                return service
+        return None
+
+    def _schedule_session_title(session_id: str, message: str) -> None:
+        """Best-effort async auto-title for a session's first chat message."""
+        get_session = _chat_db_method("get_chat_session")
+        rename_session = _chat_db_method("rename_chat_session")
+        if not callable(get_session) or not callable(rename_session):
+            return
+        row = get_session(session_id)
+        if row is None or str(row.get("title", "")).strip():
+            return
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        enabled = bool(getattr(agent_config, "session_title_enabled", True))
+        llm_service = _resolve_chat_title_llm_service() if enabled else None
+
+        async def _run() -> None:
+            try:
+                if llm_service is not None:
+                    title = await generate_session_title(llm_service, message)
+                else:
+                    title = fallback_session_title(message)
+            except Exception:
+                logger.debug("Chat session title task failed", exc_info=True)
+                title = fallback_session_title(message)
+            current = get_session(session_id)
+            if current is None or str(current.get("title", "")).strip():
+                # A manual rename or another writer already set the title.
+                return
+            rename_session(session_id, title=title)
+
+        task = asyncio.create_task(_run())
+        _SESSION_TITLE_TASKS.add(task)
+        task.add_done_callback(_SESSION_TITLE_TASKS.discard)
 
     def _health_profile_ready() -> bool | None:
         soul_engine = getattr(ctx, "soul_engine", None)
@@ -11151,6 +11382,181 @@ def create_app(
             },
         )
 
+    @app.post("/api/chat/agent/stream")
+    async def chat_agent_stream(payload: ChatTurnIn) -> StreamingResponse:
+        """True-streaming multi-hop agent chat endpoint (「聊一聊」 M2).
+
+        Runs ``AgentLoop`` under the app-wide dialogue execution lease and
+        forwards every ``AgentEvent`` as one SSE event named by its type
+        (``thinking`` / ``tool_call`` / ``tool_result`` /
+        ``step_limit_reached`` / ``final``), followed by a terminal ``done``
+        carrying the final reply. LLM failures map to a single ``error``
+        event. With a ``turn_id`` (created via ``POST /api/chat/turns`` with
+        ``streaming=True``) the turn is completed/failed durably and the
+        loop's events are persisted into the turn payload's ``agent_events``
+        for history replay; without a ``turn_id`` the run is ephemeral. The
+        legacy single-hop ``/api/chat`` and ``/api/chat/stream`` endpoints
+        are unaffected.
+
+        M4 skill binding: the optional ``skill`` field selects a chat skill
+        (default 口味伙伴). The loop's tools are restricted to the skill's
+        whitelist (``registry.subset``) plus the ``suggest_skill`` meta tool,
+        and the skill's persona prompt is layered onto the system prompt.
+        Switching skills mid-session is just sending the next turn with a
+        different ``skill`` value; the agent itself can only *propose* a
+        switch via the ``suggest_skill`` tool call.
+
+        M5 multi-session: the optional ``session_id`` selects the owning
+        conversation (default session when empty, 404 when unknown). With a
+        durable ``turn_id`` the turn's own ``session_id`` (assigned at
+        ``POST /api/chat/turns``) wins; the terminal ``done`` event always
+        carries the effective ``session_id``.
+        """
+        message = payload.message.strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="Chat message is required.")
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        if agent_config is not None and not bool(getattr(agent_config, "loop_enabled", True)):
+            raise HTTPException(status_code=503, detail="Agent loop chat is disabled.")
+        skill_catalog = _resolve_skill_catalog()
+        skill_name = payload.skill.strip()
+        if skill_name:
+            skill_definition = skill_catalog.get(skill_name)
+            if skill_definition is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Unknown chat skill: {skill_name}. "
+                        f"Available: {', '.join(skill_catalog.names)}"
+                    ),
+                )
+        else:
+            skill_definition = skill_catalog.default()
+        turn_id = payload.turn_id.strip()
+        row = _get_chat_turn_row(turn_id) if turn_id else None
+        turn = _normalize_chat_turn(row) if row else None
+        requested_session_id = payload.session_id.strip()
+        if turn is not None:
+            effective_session_id = turn.session_id or DEFAULT_CHAT_SESSION_ID
+        elif requested_session_id:
+            get_session = _chat_db_method("get_chat_session")
+            if callable(get_session) and get_session(requested_session_id) is None:
+                raise HTTPException(status_code=404, detail="Chat session not found.")
+            effective_session_id = requested_session_id
+        else:
+            effective_session_id = DEFAULT_CHAT_SESSION_ID
+
+        async def _event_stream() -> AsyncIterator[str]:
+            import json as _json
+
+            def sse(event: str, data: dict[str, Any]) -> str:
+                return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+
+            loop_events: list[dict[str, Any]] = []
+            final_reply = ""
+            try:
+                async with _dialogue_execution_lease() as current_dialogue:
+                    agent_loop = getattr(ctx, "agent_loop", None)
+                    stream_fn = getattr(current_dialogue, "stream_agent_reply", None)
+                    if agent_loop is None or not callable(stream_fn):
+                        raise RuntimeError("Agent chat is not configured.")
+                    chat_message = _contextual_chat_message(turn) if turn is not None else message
+                    async for event in stream_fn(
+                        agent_loop,
+                        chat_message,
+                        session=payload.session.strip() or (turn.session if turn else "popup"),
+                        scope=turn.scope if turn is not None else "chat",
+                        turn_id=turn_id,
+                        session_id=effective_session_id,
+                        skill=skill_definition,
+                        tools=_skill_tool_subset(skill_definition, skill_catalog),
+                        skill_switch_guide=(
+                            skill_catalog.render_switch_guide(skill_definition.name)
+                            if skill_definition is not None
+                            else ""
+                        ),
+                    ):
+                        data = event.to_dict()
+                        loop_events.append(data)
+                        if event.type == "final":
+                            final_reply = event.text
+                        yield sse(event.type, data)
+            except Exception as exc:
+                logger.exception("Agent chat stream failed")
+                error_message = safe_llm_failure_message(exc)
+                if turn_id:
+                    _store_chat_turn_agent_events(turn_id, loop_events)
+                    _fail_chat_turn_row(turn_id, error=error_message)
+                yield sse("error", {"error": error_message})
+                return
+
+            if turn is not None and turn_id:
+                _store_chat_turn_agent_events(turn_id, loop_events)
+                _complete_chat_turn_row(turn_id, reply=final_reply)
+            yield sse(
+                "done",
+                {
+                    "reply": final_reply,
+                    "turn_id": turn_id,
+                    "skill": skill_definition.name if skill_definition is not None else "",
+                    "session_id": effective_session_id,
+                },
+            )
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    def _resolve_skill_catalog() -> Any:
+        """Return the runtime skill catalog, building it lazily if unwired.
+
+        Production wiring builds ``ctx.skill_catalog`` on every config
+        rebuild; tests and minimal contexts fall back to loading builtin
+        skills plus ``{data_dir}/skills`` on first use.
+        """
+        from openbiliclaw.agent.skill import load_skill_catalog
+
+        catalog = getattr(ctx, "skill_catalog", None)
+        if catalog is not None:
+            return catalog
+        data_dir = str(getattr(getattr(ctx, "config", None), "data_dir", "data") or "data")
+        catalog = load_skill_catalog(user_dir=Path(data_dir) / "skills")
+        ctx.skill_catalog = catalog
+        return catalog
+
+    def _skill_tool_subset(skill_definition: Any, skill_catalog: Any) -> Any:
+        """Skill whitelist subset of the full registry + meta tools.
+
+        Returns ``None`` when no full registry is wired (legacy tests that
+        inject only ``ctx.agent_loop``) so the loop falls back to its own
+        registry, preserving pre-M4 behavior. Meta tools: ``suggest_skill``
+        (M4) proposes a skill switch; ``start_background_task`` (M6) proposes
+        a durable background task — both are read-level and side-effect free,
+        the user confirms via the frontend.
+        """
+        if skill_definition is None:
+            return None
+        base_registry = getattr(ctx, "agent_tool_registry", None)
+        if base_registry is None:
+            return None
+        from openbiliclaw.agent.tasks import build_start_background_task_tool
+        from openbiliclaw.agent.tools import build_suggest_skill_tool
+
+        subset = base_registry.subset(skill_definition.tools)
+        subset.register(build_suggest_skill_tool(skill_catalog.names))
+        subset.register(build_start_background_task_tool(skill_catalog.names))
+        return subset
+
+    @app.get("/api/chat/skills")
+    async def list_chat_skills() -> JSONResponse:
+        """List available chat skills (builtin + user ``data/skills/``)."""
+        return JSONResponse(content={"skills": _resolve_skill_catalog().to_public_list()})
+
     def _record_probe_cognition(
         summary: str,
         domain: str,
@@ -12588,6 +12994,8 @@ def create_app(
                 chat_reply_scheduler.schedule(turn.turn_id)
             return turn
 
+        resolved_session_id = _resolve_chat_session_id(payload)
+
         if normalized_scope == "hypothesis":
             if payload.reply_to_turn_id.strip():
                 _dialogue_context_error(
@@ -12599,6 +13007,7 @@ def create_app(
                 payload,
                 turn_id=turn_id,
                 structured_payload=_hypothesis_card_payload(payload),
+                session_id=resolved_session_id,
             )
             _complete_chat_turn_row(turn_id, reply="")
             completed = _get_chat_turn_row(turn_id)
@@ -12673,9 +13082,12 @@ def create_app(
             canonical_request,
             turn_id=turn_id,
             structured_payload=structured_payload,
+            session_id=resolved_session_id,
         )
         if not payload.streaming:
             chat_reply_scheduler.schedule(turn_id)
+        if canonical_scope == "chat" and not payload.reply_to_turn_id.strip():
+            _schedule_session_title(resolved_session_id, message)
         return _normalize_chat_turn(row)
 
     @app.get("/api/chat/pending-confirmations", response_model=None)
@@ -12721,6 +13133,199 @@ def create_app(
             user_initiated=True,
         )
         return turn
+
+    # ── M7: L2 hard-write approval gate ─────────────────────────────
+    # The agent loop parks hard_write tool calls as durable approval records
+    # (``ctx.chat_approval_store``, JSON-backed, no schema migration) and
+    # streams an ``approval_request`` SSE event. These endpoints are the only
+    # execution path: approve re-dispatches the recorded tool call exactly
+    # once (idempotent), reject closes the record. Both write the audit
+    # ledger (``soul/ledger.py`` → ``profile_update_ledger``) and append an
+    # ``approval_result`` event to the originating turn's ``agent_events``
+    # so history replay shows the outcome inline.
+
+    _chat_approval_execution_lock = asyncio.Lock()
+
+    def _chat_approval_store_or_503() -> Any:
+        store = getattr(ctx, "chat_approval_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Chat approvals are not configured.")
+        return store
+
+    def _chat_approval_or_404(store: Any, approval_id: str) -> Any:
+        record = store.get(approval_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Approval not found.")
+        return record
+
+    def _record_chat_approval_ledger(
+        record: Any,
+        *,
+        verdict: str,
+        outcome: str,
+        error: str = "",
+    ) -> None:
+        """Best-effort audit row: who/when/tool/arguments/result per decision."""
+        from openbiliclaw.soul.ledger import ProfileLedger
+
+        ProfileLedger(getattr(ctx, "database", None)).record(
+            write_point=f"agent.approval.{record.tool_name}",
+            source="chat_agent_loop",
+            before={
+                "approval_id": record.approval_id,
+                "summary": record.summary,
+                "arguments": record.arguments,
+            },
+            after={"status": record.status, "result": record.result},
+            outcome=outcome,
+            turn_id=getattr(record, "turn_id", ""),
+            gate_verdict=verdict,
+            held_id=record.approval_id,
+            error=error,
+        )
+
+    def _append_chat_turn_agent_event(turn_id: str, event: dict[str, Any]) -> bool:
+        """Append one event to a durable turn's ``payload.agent_events``."""
+        if not turn_id.strip():
+            return False
+        row = _read_chat_turn_row(turn_id.strip())
+        if row is None:
+            return False
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        existing = payload.get("agent_events")
+        events = (
+            [dict(item) for item in existing if isinstance(item, dict)]
+            if isinstance(existing, list)
+            else []
+        )
+        events.append(dict(event))
+        return _store_chat_turn_agent_events(turn_id.strip(), events)
+
+    def _approval_result_event(
+        record: Any, *, decision: str, ok: bool, text: str
+    ) -> dict[str, Any]:
+        return {
+            "type": "approval_result",
+            "approval_id": record.approval_id,
+            "tool_name": record.tool_name,
+            "decision": decision,
+            "ok": ok,
+            "text": text[:2000],
+        }
+
+    @app.get("/api/chat/approvals", response_model=None)
+    async def list_chat_approvals(
+        status: str = Query(default=""),
+        limit: int = Query(default=50),
+    ) -> dict[str, Any]:
+        """List hard-write approvals (default: all states, newest first)."""
+        store = _chat_approval_store_or_503()
+        normalized = status.strip()
+        if normalized and normalized not in {
+            "pending",
+            "approved",
+            "rejected",
+            "executed",
+            "expired",
+        }:
+            raise HTTPException(status_code=422, detail=f"Unknown approval status: {status}")
+        records = store.list(status=normalized, limit=limit)
+        return {"count": len(records), "items": [record.to_dict() for record in records]}
+
+    @app.post("/api/chat/approvals/{approval_id}/approve", response_model=None)
+    async def approve_chat_approval(approval_id: str) -> dict[str, Any]:
+        """Approve one parked hard-write action and execute it exactly once.
+
+        Idempotent: re-approving an executed record returns the stored result
+        without re-running the tool. Rejected/expired records conflict (409).
+        Execution results feed the audit ledger and the originating turn's
+        event stream; the next chat turn sees the outcome in history.
+        """
+        from openbiliclaw.agent.approvals import ApprovalConflictError
+
+        store = _chat_approval_store_or_503()
+        _chat_approval_or_404(store, approval_id)
+        # One execution at a time: the lock makes approve→execute→mark atomic
+        # against concurrent duplicate clicks.
+        async with _chat_approval_execution_lock:
+            try:
+                record = store.approve(approval_id)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="Approval not found.") from exc
+            except ApprovalConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if record.status == "executed":
+                return {
+                    "approval": record.to_dict(),
+                    "executed": False,
+                    "already_executed": True,
+                    "ok": not record.error,
+                    "result": record.result,
+                }
+            registry = getattr(ctx, "agent_tool_registry", None)
+            dispatch = getattr(registry, "dispatch", None)
+            if not callable(dispatch):
+                raise HTTPException(status_code=503, detail="Agent tools are not configured.")
+            outcome = await dispatch(record.tool_name, dict(record.arguments))
+            record = store.mark_executed(
+                approval_id,
+                ok=outcome.ok,
+                result=outcome.content,
+                error="" if outcome.ok else (outcome.error or "执行失败"),
+            )
+        _record_chat_approval_ledger(
+            record,
+            verdict="approved",
+            outcome="success" if outcome.ok else "failed",
+            error="" if outcome.ok else outcome.content,
+        )
+        _append_chat_turn_agent_event(
+            record.turn_id,
+            _approval_result_event(
+                record, decision="approved", ok=outcome.ok, text=outcome.content
+            ),
+        )
+        return {
+            "approval": record.to_dict(),
+            "executed": True,
+            "already_executed": False,
+            "ok": outcome.ok,
+            "result": outcome.content,
+        }
+
+    @app.post("/api/chat/approvals/{approval_id}/reject", response_model=None)
+    async def reject_chat_approval(
+        approval_id: str,
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> dict[str, Any]:
+        """Reject one pending approval; the action is never executed."""
+        from openbiliclaw.agent.approvals import ApprovalConflictError
+
+        store = _chat_approval_store_or_503()
+        # Snapshot the status: the store returns the live mutable record.
+        before_status = _chat_approval_or_404(store, approval_id).status
+        reason = str((payload or {}).get("reason") or "").strip()
+        try:
+            record = store.reject(approval_id, reason=reason)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Approval not found.") from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if before_status != "rejected":
+            # Skip the audit row / replay event on idempotent re-rejects.
+            _record_chat_approval_ledger(record, verdict="rejected", outcome="success")
+            _append_chat_turn_agent_event(
+                record.turn_id,
+                _approval_result_event(
+                    record,
+                    decision="rejected",
+                    ok=True,
+                    text="用户拒绝了该操作，未执行。",
+                ),
+            )
+        return {"approval": record.to_dict(), "ok": True}
 
     @app.post("/api/chat/cards/{turn_id}/action", response_model=None)
     async def act_on_chat_card(
@@ -12836,6 +13441,177 @@ def create_app(
         if turn.status == "pending":
             chat_reply_scheduler.schedule(turn.turn_id)
         return turn
+
+    # --- Multi-session chat endpoints (「聊一聊」 M5) ---
+
+    @app.post("/api/chat/sessions", response_model=ChatSessionOut)
+    async def create_chat_session(payload: ChatSessionCreateIn) -> ChatSessionOut:
+        """Create one chat conversation; title auto-generates on first message."""
+        create_session = _chat_session_db_method("create_chat_session")
+        session_id = payload.session_id.strip() or f"chat-{uuid.uuid4().hex}"
+        row = create_session(
+            session_id=session_id,
+            title=payload.title.strip(),
+            metadata=payload.metadata,
+        )
+        return _normalize_chat_session(row)
+
+    @app.get("/api/chat/sessions", response_model=ChatSessionListResponse)
+    async def list_chat_sessions(
+        include_archived: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> ChatSessionListResponse:
+        """List conversations by latest activity with previews and active counts."""
+        list_sessions = _chat_session_db_method("list_chat_sessions")
+        rows = list_sessions(include_archived=include_archived, limit=limit)
+        return ChatSessionListResponse(items=[_normalize_chat_session(row) for row in rows])
+
+    @app.get("/api/chat/sessions/{session_id}", response_model=ChatSessionDetailResponse)
+    async def get_chat_session_detail(
+        session_id: str,
+        scope: str = Query(default=""),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> ChatSessionDetailResponse:
+        """Return one conversation plus a page of its turns (display order)."""
+        get_summary = _chat_session_db_method("get_chat_session_summary")
+        list_by_session = _chat_session_db_method("list_chat_turns_by_session")
+        row = get_summary(session_id.strip())
+        if row is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        normalized_scope = _normalize_chat_scope(scope) if scope else ""
+        turns, total = list_by_session(
+            session_id=session_id.strip(),
+            scope=normalized_scope,
+            limit=limit,
+            offset=offset,
+        )
+        return ChatSessionDetailResponse(
+            session=_normalize_chat_session(row),
+            items=[_normalize_chat_turn(turn) for turn in turns],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.patch("/api/chat/sessions/{session_id}", response_model=ChatSessionOut)
+    async def update_chat_session(session_id: str, payload: ChatSessionPatchIn) -> ChatSessionOut:
+        """Rename and/or archive one conversation; the default session cannot be archived."""
+        get_session = _chat_session_db_method("get_chat_session")
+        get_summary = _chat_session_db_method("get_chat_session_summary")
+        normalized_id = session_id.strip()
+        if get_session(normalized_id) is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        if payload.title is not None:
+            title = payload.title.strip()
+            if not title:
+                raise HTTPException(status_code=422, detail="Session title cannot be empty.")
+            _chat_session_db_method("rename_chat_session")(normalized_id, title=title)
+        if payload.archived is not None:
+            try:
+                _chat_session_db_method("set_chat_session_archived")(
+                    normalized_id, archived=payload.archived
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        row = get_summary(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the check above
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        return _normalize_chat_session(row)
+
+    # --- Durable agent task center endpoints (「聊一聊」 M6) ---
+
+    @app.post("/api/chat/tasks", response_model=AgentTaskOut)
+    async def create_agent_task_endpoint(payload: AgentTaskCreateIn) -> AgentTaskOut:
+        """Start one durable background task (read-only loop + suggestion list).
+
+        The task runs an ``AgentLoop`` with a read-only tool subset in a
+        ``BackgroundTaskRegistry``-tracked asyncio task; every loop event is
+        appended to the durable step log. Write actions are only produced as
+        structured suggestions; on completion a summary message is written
+        back into the originating chat session for the user to confirm.
+        """
+        prompt = payload.prompt.strip()
+        if not prompt:
+            raise HTTPException(status_code=422, detail="Task prompt is required.")
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        if agent_config is not None and not bool(getattr(agent_config, "loop_enabled", True)):
+            raise HTTPException(status_code=503, detail="Agent loop chat is disabled.")
+        session_id = payload.session_id.strip()
+        if session_id:
+            get_session = _chat_db_method("get_chat_session")
+            if not callable(get_session) or get_session(session_id) is None:
+                raise HTTPException(status_code=404, detail="Chat session not found.")
+        skill_name = payload.skill.strip()
+        if skill_name:
+            skill_catalog = _resolve_skill_catalog()
+            if skill_catalog.get(skill_name) is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Unknown chat skill: {skill_name}. "
+                        f"Available: {', '.join(skill_catalog.names)}"
+                    ),
+                )
+        runner = _resolve_agent_task_runner()
+        row = runner.start(
+            session_id=session_id,
+            prompt=prompt,
+            title=payload.title.strip(),
+            skill=skill_name,
+        )
+        return _normalize_agent_task(row)
+
+    @app.get("/api/chat/tasks", response_model=AgentTaskListResponse)
+    async def list_agent_tasks_endpoint(
+        status: str = Query(default=""),
+        session_id: str = Query(default=""),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> AgentTaskListResponse:
+        """List durable agent tasks (newest first), without step logs."""
+        list_tasks = _agent_task_db_method("list_agent_tasks")
+        try:
+            rows, total = list_tasks(
+                status=status.strip(),
+                session_id=session_id.strip(),
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return AgentTaskListResponse(
+            items=[_normalize_agent_task(row, include_steps=False) for row in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/chat/tasks/{task_id}", response_model=AgentTaskOut)
+    async def get_agent_task_endpoint(task_id: str) -> AgentTaskOut:
+        """Return one agent task including its execution step log."""
+        get_task = _agent_task_db_method("get_agent_task")
+        row = get_task(task_id.strip())
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        return _normalize_agent_task(row)
+
+    @app.post("/api/chat/tasks/{task_id}/cancel", response_model=AgentTaskOut)
+    async def cancel_agent_task_endpoint(task_id: str) -> AgentTaskOut:
+        """Cancel one active task; terminal tasks report 409."""
+        get_task = _agent_task_db_method("get_agent_task")
+        normalized_id = task_id.strip()
+        row = get_task(normalized_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        if str(row.get("status", "")) in AGENT_TASK_TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="Agent task is already terminal.")
+        runner = _resolve_agent_task_runner()
+        await runner.cancel(normalized_id)
+        row = get_task(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the check above
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        return _normalize_agent_task(row)
 
     @app.post("/api/interest-probes/trigger")
     async def trigger_interest_probe() -> dict[str, Any]:
@@ -22142,6 +22918,7 @@ def create_app(
                 ("assets/css/app.css", _desktop_dir),
                 ("assets/css/classic.css", _desktop_dir),
                 ("assets/js/app.js", _desktop_dir),
+                ("assets/js/chat-agent-core.js", _desktop_dir),
                 ("dialogue-confirmation.js", _shared_web_dir),
                 ("source-status.js", _shared_web_dir),
             ):
@@ -22170,6 +22947,10 @@ def create_app(
             html = html.replace(
                 'src="/web/assets/js/app.js"',
                 f'src="/web/assets/js/app.js?v={version}"',
+            )
+            html = html.replace(
+                'src="/web/assets/js/chat-agent-core.js"',
+                f'src="/web/assets/js/chat-agent-core.js?v={version}"',
             )
             html = html.replace(
                 'src="/shared/dialogue-confirmation.js"',

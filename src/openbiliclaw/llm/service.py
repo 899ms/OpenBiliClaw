@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -11,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 from openbiliclaw.soul.profile import SoulProfile, preference_layer_from_dict
 from openbiliclaw.soul.tone import ToneProfile, build_tone_profile
 
-from .base import LLMProviderError, LLMRateLimitError
+from .base import LLMProviderError, LLMRateLimitError, LLMToolCallUnsupportedError
 from .concurrency import (
     DEFAULT_TOTAL_LLM_CONCURRENCY,
     LLMConcurrencyGate,
@@ -99,6 +101,41 @@ class SupportsComplete(Protocol):
     def is_chat_capable(self, name: str) -> bool: ...
 
     def provider_type(self, name: str | None = None) -> str: ...
+
+    def provider_supports_tool_calling(self, name: str | None = None) -> bool: ...
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse: ...
+
+    async def complete_with_tools_chain(
+        self,
+        instance_ids: list[str] | tuple[str, ...],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse: ...
+
+    async def complete_provider_with_tools(
+        self,
+        provider_name: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> LLMResponse: ...
 
 
 class LLMServiceError(Exception):
@@ -834,8 +871,6 @@ class LLMService:
         )
 
         # Try to parse tool calls from the response
-        import json
-
         content = (response.content or "").strip()
         if content.startswith("{"):
             try:
@@ -848,6 +883,204 @@ class LLMService:
             except (json.JSONDecodeError, TypeError):
                 pass  # Not valid JSON — treat as normal text reply
 
+        return response
+
+    async def complete_with_native_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        caller: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        bypass_semaphore: bool = False,
+    ) -> LLMResponse:
+        """Execute one agent-loop step with multi-hop tool calling.
+
+        Unlike :meth:`complete_with_tools` (single-turn, legacy flat tool
+        dicts), this takes the full canonical message list — system, history,
+        assistant messages with ``tool_calls`` and ``role="tool"`` results —
+        plus OpenAI-format tool schemas, and is safe to call once per hop.
+
+        When the routed provider implements native function calling
+        (``supports_tool_calling``), the request goes through the registry's
+        native FC chain with the usual fallback/cooldown semantics. Otherwise
+        the messages are flattened into the prompt-simulation path: tool
+        definitions (with JSON Schemas) are rendered into the system prompt
+        and ``{"tool_call": ...}`` / ``{"tool_calls": [...]}`` JSON replies
+        are parsed into normalized ``response.tool_calls``.
+
+        Neither path injects core memory — agent-loop callers own the system
+        prompt. A response with tool calls and empty content is valid; a
+        response with neither raises ``LLMResponseContentError``.
+        """
+        effective_reasoning_effort = self._reasoning_effort_for_call(
+            caller,
+            reasoning_effort,
+        )
+        native = self._route_supports_native_tools(caller)
+        if native:
+            try:
+                response = await self._complete_native_tool_call(
+                    messages=messages,
+                    tools=tools,
+                    caller=caller,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=effective_reasoning_effort,
+                    bypass_semaphore=bypass_semaphore,
+                )
+            except LLMToolCallUnsupportedError:
+                # The route claimed support (first instance) but the actual
+                # call resolved to an FC-less provider (e.g. responses-flavor
+                # instance). Degrade to simulation instead of failing the turn.
+                logger.info("Native tool calling unavailable at call time; simulating.")
+                response = await self._complete_simulated_tool_call(
+                    messages=messages,
+                    tools=tools,
+                    caller=caller,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=effective_reasoning_effort,
+                    bypass_semaphore=bypass_semaphore,
+                )
+        else:
+            response = await self._complete_simulated_tool_call(
+                messages=messages,
+                tools=tools,
+                caller=caller,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=effective_reasoning_effort,
+                bypass_semaphore=bypass_semaphore,
+            )
+        if not response.content.strip() and not response.tool_calls:
+            raise LLMResponseContentError("LLM returned an empty response.")
+        recorder = self.usage_recorder
+        if recorder is not None:
+            record_fn = getattr(recorder, "record", None)
+            if callable(record_fn):
+                with suppress(Exception):
+                    record_fn(response, caller=caller)
+        return response
+
+    def _route_supports_native_tools(self, caller: str) -> bool:
+        """Return whether the first provider of the resolved route has native FC."""
+        routed_chain = self._resolve_module_chain(caller)
+        if routed_chain is not None:
+            return bool(routed_chain) and self.registry.provider_supports_tool_calling(
+                routed_chain[0]
+            )
+        routed = self._resolve_module_override(caller)
+        provider_name = routed[0] if routed is not None else self.registry.default_provider
+        return self.registry.provider_supports_tool_calling(provider_name)
+
+    async def _complete_native_tool_call(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        caller: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        bypass_semaphore: bool,
+    ) -> LLMResponse:
+        """Run one native-FC call under the provider slot and module routing."""
+
+        async def _do_llm_call() -> LLMResponse:
+            routed_chain = self._resolve_module_chain(caller)
+            if routed_chain is not None:
+                return await self.registry.complete_with_tools_chain(
+                    routed_chain,
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            routed = self._resolve_module_override(caller)
+            if routed is None:
+                return await self.registry.complete_with_tools(
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            provider, model = routed
+            return await self.registry.complete_provider_with_tools(
+                provider,
+                messages,
+                tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            )
+
+        try:
+            async with self._provider_slot(
+                caller=caller,
+                bypass_background=(bypass_semaphore or _BACKGROUND_ADMISSION_BYPASS.get()),
+            ):
+                return await _do_llm_call()
+        except LLMToolCallUnsupportedError:
+            raise
+        except LLMProviderError as exc:
+            raise LLMProviderExecutionError(str(exc)) from exc
+
+    async def _complete_simulated_tool_call(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        caller: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        bypass_semaphore: bool,
+    ) -> LLMResponse:
+        """Prompt-simulation tool calling for providers without native FC."""
+        system_instruction, history, user_input = _flatten_agent_messages(messages)
+        tool_names = [_tool_schema_name(tool) for tool in tools]
+        tool_names = [name for name in tool_names if name]
+        if tools:
+            augmented_system = (
+                system_instruction + "\n\n"
+                "<available_tools>\n" + _render_simulated_tool_block(tools) + "\n"
+                "</available_tools>\n\n"
+                "<tool_call_format>\n"
+                "如果你需要调用工具，请返回如下 JSON（不要附带任何其他文字）：\n"
+                '{"tool_call": {"name": "工具名", "arguments": {参数}}}\n'
+                "需要连续调用多个工具时可以返回：\n"
+                '{"tool_calls": [{"name": "工具名", "arguments": {参数}}, ...]}\n'
+                "如果不需要调用工具，正常回复用户即可（不要输出 JSON）。\n"
+                "</tool_call_format>"
+            )
+        else:
+            augmented_system = system_instruction
+        response = await self.complete_with_core_memory(
+            system_instruction=augmented_system,
+            user_input=user_input,
+            history=history,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=False,
+            caller=caller,
+            reasoning_effort=reasoning_effort,
+            bypass_semaphore=bypass_semaphore,
+            # Agent-loop callers own the system prompt (including whatever
+            # profile context they want); injecting core memory here would
+            # diverge from the native-FC path, which takes messages verbatim.
+            inject_core_memory=False,
+        )
+        if tools:
+            calls = _parse_simulated_tool_calls(response.content, tool_names)
+            if calls:
+                response.tool_calls = calls
+                response.content = ""
         return response
 
     async def complete_socratic_dialogue(
@@ -890,3 +1123,127 @@ class LLMService:
             preference_summary=self.memory.get_core_memory().get("preference_summary", {}),
             recent_feedback=[],
         )
+
+
+def _tool_schema_name(tool: dict[str, Any]) -> str:
+    """Extract the function name from an OpenAI-format tool schema."""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "").strip()
+    return ""
+
+
+def _render_simulated_tool_block(tools: list[dict[str, Any]]) -> str:
+    """Render OpenAI-format tool schemas as a prompt-level tool list."""
+    lines: list[str] = []
+    for tool in tools:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(function.get("description") or "")
+        line = f"- {name}: {description}"
+        parameters = function.get("parameters")
+        if isinstance(parameters, dict) and parameters:
+            line += f"\n  parameters: {json.dumps(parameters, ensure_ascii=False)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _flatten_agent_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, str]], str]:
+    """Flatten canonical tool-calling messages for the simulation path.
+
+    Returns ``(system_instruction, history, user_input)``: system messages
+    join into the instruction; assistant turns with ``tool_calls`` become
+    text annotations; ``role="tool"`` results become user-role result notes.
+    The last flattened message becomes ``user_input`` when it is user-role
+    (always true for the loop: hop 1 ends with the user message, later hops
+    end with tool results); otherwise a continuation marker is appended.
+    """
+    system_parts: list[str] = []
+    flattened: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        text = content if isinstance(content, str) else str(content or "")
+        if role == "system":
+            if text.strip():
+                system_parts.append(text)
+            continue
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                descriptions = []
+                for call in calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(function, dict):
+                        continue
+                    call_name = str(function.get("name") or "")
+                    call_args = str(function.get("arguments") or "")
+                    descriptions.append(f"{call_name}({call_args})")
+                if descriptions:
+                    note = f"（调用了工具 {'；'.join(descriptions)}）"
+                    text = f"{text}\n{note}".strip()
+            flattened.append({"role": "assistant", "content": text})
+            continue
+        if role == "tool":
+            flattened.append({"role": "user", "content": f"[工具执行结果] {text}"})
+            continue
+        flattened.append({"role": "user", "content": text})
+
+    user_input = "（请根据以上工具结果继续回答用户）"
+    if flattened and flattened[-1]["role"] == "user":
+        user_input = flattened.pop()["content"]
+    return "\n\n".join(system_parts), flattened, user_input
+
+
+def _parse_simulated_tool_calls(
+    content: str,
+    tool_names: list[str],
+) -> list[dict[str, Any]] | None:
+    """Parse ``{"tool_call": ...}`` / ``{"tool_calls": [...]}`` JSON replies.
+
+    Returns normalized ``{"id", "name", "arguments", "arguments_raw"}``
+    entries, or ``None`` when the content is not a whole-message tool-call
+    JSON object. Calls naming unknown tools are dropped.
+    """
+    text = (content or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_calls: list[Any] = []
+    single = parsed.get("tool_call")
+    if isinstance(single, dict):
+        raw_calls.append(single)
+    multiple = parsed.get("tool_calls")
+    if isinstance(multiple, list):
+        raw_calls.extend(multiple)
+    if not raw_calls:
+        return None
+    known = {name for name in tool_names if name}
+    calls: list[dict[str, Any]] = []
+    for raw in raw_calls:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if name not in known:
+            continue
+        arguments = raw.get("arguments")
+        calls.append(
+            {
+                "id": f"sim-{uuid.uuid4().hex[:8]}",
+                "name": name,
+                "arguments": arguments if isinstance(arguments, dict) else {},
+                "arguments_raw": "",
+            }
+        )
+    return calls or None

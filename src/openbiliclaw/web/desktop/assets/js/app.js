@@ -27,6 +27,11 @@
       chatTurns: "/chat/turns",
       chat: "/chat",
       chatStream: "/chat/stream",
+      chatAgentStream: "/chat/agent/stream",
+      chatSessions: "/chat/sessions",
+      chatSkills: "/chat/skills",
+      chatTasks: "/chat/tasks",
+      chatApprovals: "/chat/approvals",
       dialogueContexts: "/chat/contexts",
       pendingConfirmations: "/chat/pending-confirmations",
       interestProbeRespond: "/interest-probes/respond",
@@ -79,6 +84,9 @@
       selectDialogueTurns,
       writeContextSelection,
     } = dialogueConfirmation;
+    // 「聊一聊」agent loop（M8）纯逻辑层：SSE 解析、过程模型与卡片 markup。
+    // 旧后端没有这个文件时保持 null，全部走 legacy 路径。
+    const chatAgentCore = globalThis.OpenBiliClawChatAgentCore || null;
     let dialogueContextSelection = readContextSelection(
       (() => {
         try { return window.localStorage; } catch { return null; }
@@ -147,7 +155,27 @@
       chat: [
         { role: "agent", text: "你可以直接告诉我最近想多看什么、少看什么，或者评价一条推荐为什么准/不准。" }
       ],
-      pendingConfirmations: { count: 0, items: [], expanded: false }
+      pendingConfirmations: { count: 0, items: [], expanded: false },
+      // 「聊一聊」agent loop（M8）。mode: "unknown"（未探测）→ "agent"（新链路）
+      // 或 "legacy"（旧后端 / 探测失败，保持原有行为）。
+      agentChat: {
+        mode: "unknown",
+        sessionId: "default",
+        sessions: [],
+        includeArchived: false,
+        skill: "",
+        skills: [],
+        skillPickerOpen: false,
+        sidebarOpen: true,
+        live: null,
+        tasksOpen: false,
+        tasks: [],
+        taskDetailId: "",
+        taskDetail: null,
+        approvalsOpen: false,
+        approvals: [],
+        handledSuggestions: new Set(),
+      }
     };
 
     const $ = (selector) => document.querySelector(selector);
@@ -3093,6 +3121,8 @@
       document.querySelectorAll(".drawer.is-open, .overlay.is-open").forEach((panel) => closePanel(panel.id));
       const forceBottom = !hasOpenedDialogueChatPage;
       showMainPage("chatPage");
+      // M8：探测 agent loop 链路是否可用（旧后端自动保持 legacy 布局与行为）。
+      void initDesktopAgentChat();
       renderChat({ forceBottom });
       hasOpenedDialogueChatPage = true;
       scheduleDialogueConfirmationRefresh();
@@ -7348,11 +7378,25 @@ ${cardFeedbackBarHtml()}`;
     }
 
     function chatHtml(messages) {
+      if (agentChatEnabled() && !messages.length && !state.agentChat.live) {
+        return '<p class="chat-session-empty">这个会话还没有消息，说点什么开始吧。</p>';
+      }
       return messages.map((msg) => {
         if (msg?.turn) {
+          // M8：后台任务汇总卡与带 agent_events 的 turn 走专属渲染。
+          if (chatAgentCore?.isAgentTaskSummaryTurn(msg.turn)) {
+            return chatAgentCore.taskSummaryCardMarkup(msg.turn, {
+              renderMarkdown,
+              handledSuggestions: state.agentChat.handledSuggestions,
+            });
+          }
           const waiting = desktopTurnIsWaitingForReply(msg.turn)
             ? desktopChatThinkingMarkup()
             : "";
+          const agentEvents = chatAgentCore ? chatAgentCore.turnAgentEvents(msg.turn) : [];
+          if (agentEvents.length) {
+            return `${replyQuoteMarkup(msg.turn, desktopDialogueTurns())}${desktopAgentTurnMarkup(msg.turn)}${waiting}`;
+          }
           return `${replyQuoteMarkup(msg.turn, desktopDialogueTurns())}${renderTurnMarkup(msg.turn, { surface: "desktop" })}${waiting}`;
         }
         if (msg?.thinking) return desktopChatThinkingMarkup(msg.text);
@@ -7376,18 +7420,37 @@ ${cardFeedbackBarHtml()}`;
       );
     }
 
+    function agentDetailKey(details) {
+      const turnId = details.closest("[data-dialogue-turn-id]")?.dataset.dialogueTurnId || "live";
+      const cls = details.classList.contains("agent-process")
+        ? "process"
+        : details.classList.contains("agent-tool")
+          ? "tool"
+          : "detail";
+      const label = (details.querySelector(":scope > summary")?.textContent || "").trim().slice(0, 60);
+      return `${turnId}|${cls}|${label}`;
+    }
+
     function renderChatLogElement(element, markup, { forceBottom = false } = {}) {
       if (!element) return;
       const hadContent = element.childElementCount > 0;
       const shouldStickToBottom = forceBottom || !hadContent || isNearScrollBottom(element);
       const previousScrollTop = element.scrollTop;
       const openEvidenceTurnIds = openDialogueEvidenceTurnIds(element);
+      // M8：轮询重渲染时保留过程折叠组件的展开状态。
+      const openAgentKeys = new Set(
+        Array.from(element.querySelectorAll(".agent-process[open], .agent-tool[open], .agent-tool-detail[open]"))
+          .map(agentDetailKey)
+      );
 
       element.innerHTML = markup;
 
       for (const details of element.querySelectorAll(".dialogue-evidence")) {
         const turnId = details.closest("[data-dialogue-turn-id]")?.dataset.dialogueTurnId || "";
         if (openEvidenceTurnIds.has(turnId)) details.open = true;
+      }
+      for (const details of element.querySelectorAll("details.agent-process, details.agent-tool, details.agent-tool-detail")) {
+        if (openAgentKeys.has(agentDetailKey(details))) details.open = true;
       }
       if (shouldStickToBottom) {
         element.scrollTop = element.scrollHeight;
@@ -7435,7 +7498,15 @@ ${cardFeedbackBarHtml()}`;
 
     function applyDialogueChatSnapshot(snapshot) {
       const items = selectDialogueTurns(Array.isArray(snapshot) ? snapshot : asArray(snapshot?.items));
-      if (!items.length) return;
+      if (!items.length) {
+        // agent 模式下空会话是合法状态（新会话），要清掉旧会话的残留渲染。
+        if (agentChatEnabled() && state.chat.length && lastDialogueChatSignature !== "[]") {
+          lastDialogueChatSignature = "[]";
+          state.chat = [];
+          renderChat();
+        }
+        return;
+      }
       const signature = JSON.stringify(items);
       if (signature === lastDialogueChatSignature) return;
       lastDialogueChatSignature = signature;
@@ -7444,6 +7515,16 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function refreshDialogueTurns() {
+      // M8：agent 模式按当前会话实体拉取（含 payload.agent_events 回放数据）；
+      // legacy 模式保持旧的共享 session 通道。
+      if (agentChatEnabled()) {
+        const detail = await requestJsonStrict(
+          `${ENDPOINTS.chatSessions}/${encodeURIComponent(state.agentChat.sessionId || "default")}?limit=100`,
+          { cache: "no-store" }
+        );
+        applyDialogueChatSnapshot(detail?.items || []);
+        return;
+      }
       const snapshot = await requestJsonStrict(
         `${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&limit=100`,
         { cache: "no-store" }
@@ -7575,6 +7656,8 @@ ${cardFeedbackBarHtml()}`;
       await Promise.allSettled([refreshDialogueTurns(), refreshDesktopPendingConfirmations()]);
       await validateDialogueContext({ announce: true });
       renderDialogueContextBar();
+      // M8：会话列表（标题异步生成、active_turns 指示）、待审批 badge、任务中心轮询。
+      await syncAgentChatSurface();
     }
 
     async function refreshSharedChatSurface() {
@@ -7600,6 +7683,786 @@ ${cardFeedbackBarHtml()}`;
       chatHistoryRefreshTimer = window.setInterval(() => {
         void refreshSharedChatSurface();
       }, CHAT_HISTORY_REFRESH_INTERVAL_MS);
+    }
+
+    // ── 「聊一聊」agent loop（M8）：会话侧栏 / 流式过程 / skill / 审批 / 任务中心 ──
+
+    const AGENT_CHAT_SESSION_KEY = "openbiliclaw.webui.chatSessionId";
+    const AGENT_CHAT_SKILL_KEY = "openbiliclaw.webui.chatSkillBySession";
+    let chatSessionsSignature = "";
+    let chatApprovalsSignature = "";
+    let chatTasksSignature = "";
+
+    function agentChatEnabled() {
+      return Boolean(chatAgentCore) && state.agentChat.mode === "agent";
+    }
+
+    function agentChatStorage() {
+      try { return window.localStorage; } catch { return null; }
+    }
+
+    function loadAgentChatPrefs() {
+      const storage = agentChatStorage();
+      if (!storage) return;
+      const savedSession = storage.getItem(AGENT_CHAT_SESSION_KEY) || "";
+      if (savedSession) state.agentChat.sessionId = savedSession;
+      try {
+        const map = JSON.parse(storage.getItem(AGENT_CHAT_SKILL_KEY) || "{}");
+        state.agentChat.skill = String(map?.[state.agentChat.sessionId] || "");
+      } catch {
+        state.agentChat.skill = "";
+      }
+    }
+
+    function persistAgentChatPrefs() {
+      const storage = agentChatStorage();
+      if (!storage) return;
+      storage.setItem(AGENT_CHAT_SESSION_KEY, state.agentChat.sessionId);
+      let map = {};
+      try { map = JSON.parse(storage.getItem(AGENT_CHAT_SKILL_KEY) || "{}"); } catch { map = {}; }
+      map[state.agentChat.sessionId] = state.agentChat.skill;
+      storage.setItem(AGENT_CHAT_SKILL_KEY, JSON.stringify(map));
+    }
+
+    function currentChatSession() {
+      return state.agentChat.sessions.find((item) => item?.session_id === state.agentChat.sessionId) || null;
+    }
+
+    function currentChatSkill() {
+      const name = state.agentChat.skill;
+      const found = state.agentChat.skills.find((item) => item?.name === name);
+      if (found) return found;
+      return state.agentChat.skills.find((item) => item?.default === true) || null;
+    }
+
+    function applyAgentChatChrome() {
+      const enabled = agentChatEnabled();
+      const chatPage = $("#chatPage");
+      chatPage?.classList.toggle("has-agent-side", enabled);
+      const side = $("#chatSide");
+      if (side) side.hidden = !enabled || !state.agentChat.sidebarOpen;
+      const bar = $("#chatSessionBar");
+      if (bar) bar.hidden = !enabled;
+      $("#chatSideToggle")?.setAttribute("aria-expanded", String(state.agentChat.sidebarOpen));
+      if (!enabled) return;
+      renderChatSidebar();
+      renderChatSessionBar();
+      renderChatBadges();
+    }
+
+    function renderChatSidebar() {
+      const list = $("#chatSessionList");
+      if (!list || !chatAgentCore) return;
+      list.innerHTML = chatAgentCore.sessionListMarkup(state.agentChat.sessions, state.agentChat.sessionId);
+      const archivedToggle = $("#chatArchivedToggle");
+      if (archivedToggle) {
+        archivedToggle.setAttribute("aria-pressed", String(state.agentChat.includeArchived));
+        archivedToggle.textContent = state.agentChat.includeArchived ? "隐藏已归档" : "显示已归档";
+      }
+    }
+
+    function renderChatSessionBar() {
+      if (!chatAgentCore) return;
+      const skill = currentChatSkill();
+      const icon = $("#chatSkillIcon");
+      const name = $("#chatSkillName");
+      if (icon) icon.textContent = chatAgentCore.skillIcon(skill?.name || "");
+      if (name) name.textContent = skill ? String(skill.title || skill.name) : "口味伙伴";
+      const sessionName = $("#chatSessionName");
+      if (sessionName) {
+        const session = currentChatSession();
+        sessionName.textContent = session
+          ? String(session.title || (session.session_id === "default" ? "默认会话" : "未命名会话"))
+          : "";
+      }
+    }
+
+    function renderChatBadges() {
+      const approvalsBadge = $("#chatApprovalsBadge");
+      const pendingApprovals = state.agentChat.approvals.length;
+      if (approvalsBadge) {
+        approvalsBadge.hidden = pendingApprovals === 0;
+        approvalsBadge.textContent = pendingApprovals > 99 ? "99+" : String(pendingApprovals);
+      }
+      const tasksBadge = $("#chatTasksBadge");
+      const activeTasks = state.agentChat.tasks.filter((task) => chatAgentCore?.taskIsActive(task)).length;
+      if (tasksBadge) {
+        tasksBadge.hidden = activeTasks === 0;
+        tasksBadge.textContent = String(activeTasks);
+      }
+    }
+
+    async function initDesktopAgentChat() {
+      // agent 模式下不重探；legacy 模式每次进聊天页重试一次（后端可能先以
+      // degraded 形态启动、之后才具备 agent 链路）。
+      if (!chatAgentCore || state.agentChat.mode === "agent") return;
+      try {
+        const payload = await requestJsonStrict(ENDPOINTS.chatSkills, { cache: "no-store", timeoutMs: 8000 });
+        if (!payload || !Array.isArray(payload.skills)) throw new Error("bad skills payload");
+        state.agentChat.mode = "agent";
+        state.agentChat.skills = payload.skills;
+      } catch {
+        // 旧后端没有 agent loop 端点：保持既有 legacy 聊天行为。
+        state.agentChat.mode = "legacy";
+        applyAgentChatChrome();
+        return;
+      }
+      loadAgentChatPrefs();
+      applyAgentChatChrome();
+      await Promise.allSettled([refreshChatSessions(), refreshChatApprovals(), refreshChatTasks()]);
+      await refreshDialogueTurns().catch(() => {});
+    }
+
+    async function refreshChatSessions() {
+      const query = state.agentChat.includeArchived ? "?include_archived=true" : "";
+      const payload = await requestJsonStrict(`${ENDPOINTS.chatSessions}${query}`, { cache: "no-store" });
+      const sessions = asArray(payload?.items);
+      const signature = JSON.stringify(sessions) + `|${state.agentChat.sessionId}|${state.agentChat.includeArchived}`;
+      state.agentChat.sessions = sessions;
+      // 会话不存在（例如被另一端归档清理后）时回落默认会话。
+      if (
+        state.agentChat.sessionId !== "default" &&
+        sessions.length &&
+        !sessions.some((item) => item?.session_id === state.agentChat.sessionId)
+      ) {
+        state.agentChat.sessionId = "default";
+        persistAgentChatPrefs();
+      }
+      if (signature !== chatSessionsSignature) {
+        chatSessionsSignature = signature;
+        renderChatSidebar();
+        renderChatSessionBar();
+      }
+    }
+
+    async function selectChatSession(sessionId) {
+      const id = String(sessionId || "default");
+      state.agentChat.sessionId = id;
+      const storage = agentChatStorage();
+      let map = {};
+      try { map = JSON.parse(storage?.getItem(AGENT_CHAT_SKILL_KEY) || "{}"); } catch { map = {}; }
+      state.agentChat.skill = String(map?.[id] || "");
+      persistAgentChatPrefs();
+      if (window.innerWidth <= 900) state.agentChat.sidebarOpen = false;
+      lastDialogueChatSignature = null;
+      chatSessionsSignature = "";
+      state.chat = [];
+      applyAgentChatChrome();
+      renderChat({ forceBottom: true });
+      await refreshDialogueTurns().catch(() => {});
+      $("#chatInput")?.focus();
+    }
+
+    async function createChatSession() {
+      try {
+        const session = await requestJsonStrict(ENDPOINTS.chatSessions, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        await refreshChatSessions().catch(() => {});
+        if (session?.session_id) await selectChatSession(session.session_id);
+        showToast("新会话已创建");
+      } catch (error) {
+        showToast(contextErrorMessage(error));
+      }
+    }
+
+    function startChatSessionRename(button) {
+      const item = button.closest("[data-session-id]");
+      const sessionId = item?.dataset.sessionId || "";
+      const session = state.agentChat.sessions.find((entry) => entry?.session_id === sessionId);
+      if (!item || !session) return;
+      const main = item.querySelector(".chat-session-main");
+      if (!main || item.querySelector(".chat-session-rename")) return;
+      const input = document.createElement("input");
+      input.className = "chat-session-rename";
+      input.value = String(session.title || "");
+      input.placeholder = sessionId === "default" ? "默认会话" : "会话名称";
+      input.setAttribute("aria-label", "会话名称");
+      main.replaceWith(input);
+      input.focus();
+      input.select();
+      let committed = false;
+      const commit = async () => {
+        if (committed) return;
+        committed = true;
+        const title = input.value.trim();
+        if (!title || title === String(session.title || "")) {
+          renderChatSidebar();
+          return;
+        }
+        try {
+          await requestJsonStrict(`${ENDPOINTS.chatSessions}/${encodeURIComponent(sessionId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title }),
+          });
+          chatSessionsSignature = "";
+          await refreshChatSessions().catch(() => {});
+          showToast("已改名");
+        } catch (error) {
+          showToast(contextErrorMessage(error));
+          renderChatSidebar();
+        }
+      };
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") { event.preventDefault(); void commit(); }
+        if (event.key === "Escape") { committed = true; renderChatSidebar(); }
+      });
+      input.addEventListener("blur", () => void commit());
+    }
+
+    async function archiveChatSession(sessionId) {
+      const session = state.agentChat.sessions.find((entry) => entry?.sessionId === sessionId || entry?.session_id === sessionId);
+      if (!session) return;
+      const next = session.archived !== true;
+      try {
+        await requestJsonStrict(`${ENDPOINTS.chatSessions}/${encodeURIComponent(sessionId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ archived: next }),
+        });
+        if (next && state.agentChat.sessionId === sessionId) await selectChatSession("default");
+        chatSessionsSignature = "";
+        await refreshChatSessions().catch(() => {});
+        showToast(next ? "已归档这个会话" : "已恢复这个会话");
+      } catch (error) {
+        showToast(contextErrorMessage(error));
+      }
+    }
+
+    function setChatSkill(name, { announce = true } = {}) {
+      state.agentChat.skill = String(name || "");
+      persistAgentChatPrefs();
+      renderChatSessionBar();
+      if (announce) {
+        const skill = currentChatSkill();
+        showToast(`已切换到「${skill ? String(skill.title || skill.name) : "默认角色"}」，下一回合生效`);
+      }
+    }
+
+    function renderChatSkillPicker() {
+      const picker = $("#chatSkillPicker");
+      if (!picker || !chatAgentCore) return;
+      picker.hidden = !state.agentChat.skillPickerOpen;
+      $("#chatSkillChip")?.setAttribute("aria-expanded", String(state.agentChat.skillPickerOpen));
+      if (state.agentChat.skillPickerOpen) {
+        picker.innerHTML = chatAgentCore.skillPickerMarkup(state.agentChat.skills, state.agentChat.skill || currentChatSkill()?.name || "");
+      }
+    }
+
+    function toggleChatSkillPicker(open) {
+      state.agentChat.skillPickerOpen = open ?? !state.agentChat.skillPickerOpen;
+      renderChatSkillPicker();
+    }
+
+    // ── 流式 agent 对话 ──
+
+    function liveAgentChatMarkup() {
+      const live = state.agentChat.live;
+      if (!live || !chatAgentCore) return "";
+      const parts = [];
+      const hasProcess = live.process.steps.length || live.process.stepLimitText || live.process.errorText;
+      if (hasProcess) {
+        parts.push(chatAgentCore.agentProcessMarkup(live.process, { live: !live.finished }));
+      }
+      if (live.replyText) {
+        parts.push(`<div class="chat-bubble agent"><div class="chat-markdown">${renderMarkdown(live.replyText)}</div></div>`);
+      }
+      if (!parts.length) parts.push(desktopChatThinkingMarkup());
+      return parts.join("");
+    }
+
+    function desktopAgentTurnMarkup(turn) {
+      const turnId = escapeHtml(turn.turn_id || "");
+      const userText = String(turn.message || "").trim();
+      const userBubble = userText
+        ? `<div class="chat-bubble user" data-dialogue-turn-id="${turnId}" data-part="user">${escapeHtml(userText)}</div>`
+        : "";
+      const process = chatAgentCore.agentProcessMarkup(
+        chatAgentCore.buildAgentProcess(chatAgentCore.turnAgentEvents(turn)),
+      );
+      const failed = ["error", "failed"].includes(String(turn.status || "").toLowerCase());
+      const reply = failed
+        ? String(turn.error || "这句还没发出去，稍后再试。")
+        : String(turn.reply || turn.assistant_message || "");
+      const replyBubble = reply
+        ? `<div class="chat-bubble agent" data-dialogue-turn-id="${turnId}" data-part="assistant"><div class="chat-markdown">${renderMarkdown(reply)}</div></div>`
+        : "";
+      return `${userBubble}${process}${replyBubble}`;
+    }
+
+    function handleAgentStreamEvent(name, data, live) {
+      if (!chatAgentCore) return;
+      if (name === "done") {
+        live.replyText = String(data?.reply || live.process.finalText || live.replyText || "");
+        if (data?.skill && String(data.skill) !== state.agentChat.skill) {
+          state.agentChat.skill = String(data.skill);
+          persistAgentChatPrefs();
+        }
+        live.finished = true;
+        renderChat({ forceBottom: true });
+        return;
+      }
+      const event =
+        data && typeof data === "object" && !Array.isArray(data)
+          ? { ...data, type: data.type || name }
+          : { type: name };
+      chatAgentCore.applyAgentEvent(live.process, event);
+      if (event.type === "final") live.replyText = String(event.text || "");
+      if (event.type === "error") live.finished = true;
+      renderChat({ forceBottom: true });
+    }
+
+    async function streamAgentChatTurn({ turnId, message, sessionId, skill, live }) {
+      const base = getApiBase() || DEFAULT_API_BASE;
+      const body = {
+        turn_id: turnId,
+        message,
+        session: SHARED_CHAT_SESSION,
+        scope: "chat",
+      };
+      if (sessionId && sessionId !== "default") body.session_id = sessionId;
+      if (skill) body.skill = skill;
+      const response = await fetch(`${base}${ENDPOINTS.chatAgentStream}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const error = new Error(`agent stream failed: ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const parser = chatAgentCore.createSseParser((name, data) => {
+        handleAgentStreamEvent(name, data, live);
+      });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parser.feed(decoder.decode(value, { stream: true }));
+      }
+      parser.end();
+    }
+
+    // 旧假流式端点回退（agent loop 被 `[agent] loop_enabled=false` 关掉时）。
+    async function legacyStreamForTurn(turn, payloadMessage) {
+      state.chat.push({ role: "agent", text: "阿B 正在思考，等待模型回复…", thinking: true });
+      renderChat({ forceBottom: true });
+      const thinkingIndex = state.chat.length - 1;
+      let accumulated = "";
+      const finish = async (text) => {
+        state.chat[thinkingIndex] = { role: "agent", text };
+        renderChat({ forceBottom: true });
+        await refreshDialogueConfirmationSurface();
+        await refreshUntilDialogueCardsSettle();
+      };
+      await streamChatTurn({
+        turnId: turn.turn_id,
+        message: payloadMessage,
+        session: SHARED_CHAT_SESSION,
+        scope: "chat",
+        onContent: (delta) => {
+          accumulated += delta;
+          state.chat[thinkingIndex] = { role: "agent", text: accumulated };
+          renderChat({ forceBottom: true });
+        },
+        onToolCall: (data) => {
+          accumulated += `\n\n🔧 调用工具：${String(data.name || "工具")}\n`;
+          state.chat[thinkingIndex] = { role: "agent", text: accumulated };
+          renderChat({ forceBottom: true });
+        },
+        onDone: (data) => {
+          accumulated = String(data.reply || accumulated);
+          void finish(accumulated);
+        },
+      });
+      if (state.chat[thinkingIndex]?.thinking) {
+        await finish(accumulated || "后端已完成这轮聊天。");
+      }
+    }
+
+    async function sendAgentChat(message) {
+      const replyToTurnId = dialogueContextSelection?.["reply_to_turn_id"] || "";
+      state.chat.push({ role: "user", text: message });
+      renderChat({ forceBottom: true });
+      const agentState = state.agentChat;
+      const sessionId = agentState.sessionId || "default";
+      const skill = agentState.skill || "";
+      const turnId = createClientTurnId("chat");
+      const payload = {
+        turn_id: turnId,
+        session: SHARED_CHAT_SESSION,
+        scope: "chat",
+        subject_id: "",
+        subject_title: "",
+        reply_to_turn_id: replyToTurnId,
+        message,
+        streaming: true,
+      };
+      if (sessionId !== "default") payload.session_id = sessionId;
+      if (skill) payload.skill = skill;
+      let turn;
+      try {
+        turn = await requestJsonStrict(ENDPOINTS.chatTurns, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } catch (error) {
+        retainedChatDraft = message;
+        const input = $("#chatInput");
+        if (input) input.value = message;
+        state.chat.push({ role: "agent", text: contextErrorMessage(error) });
+        renderChat();
+        showToast(contextErrorMessage(error));
+        return;
+      }
+      if (!turn?.turn_id) {
+        state.chat.push({ role: "agent", text: "当前没有连上后端，聊天没有提交成功。请检查 FastAPI 地址后重试。" });
+        renderChat();
+        showToast("聊天提交失败：后端不可用");
+        return;
+      }
+      const live = {
+        process: chatAgentCore.createAgentProcess(),
+        replyText: "",
+        finished: false,
+        turnId: turn.turn_id,
+      };
+      agentState.live = live;
+      renderChat({ forceBottom: true });
+      const finalize = async () => {
+        agentState.live = null;
+        lastDialogueChatSignature = null;
+        await refreshDialogueTurns().catch(() => {});
+        await refreshDesktopPendingConfirmations().catch(() => {});
+        await refreshChatSessions().catch(() => {});
+        await refreshChatApprovals().catch(() => {});
+        await refreshUntilDialogueCardsSettle();
+      };
+      try {
+        await streamAgentChatTurn({ turnId: turn.turn_id, message, sessionId, skill, live });
+        if (live.process.errorText) showToast(live.process.errorText);
+        await finalize();
+      } catch (error) {
+        if (Number(error?.status) === 503) {
+          // loop_enabled=false：这一轮回退到旧假流式端点，会话/历史功能不变。
+          agentState.live = null;
+          showToast("Agent 对话未在后端启用，本轮已回退到普通对话模式");
+          try {
+            await legacyStreamForTurn(turn, message);
+          } catch {
+            state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
+            renderChat();
+          }
+          await finalize();
+          return;
+        }
+        agentState.live = null;
+        state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
+        renderChat();
+        await finalize();
+      }
+    }
+
+    // ── 审批卡 ──
+
+    async function refreshChatApprovals() {
+      const payload = await requestJsonStrict(`${ENDPOINTS.chatApprovals}?status=pending`, { cache: "no-store" });
+      const items = asArray(payload?.items);
+      const signature = JSON.stringify(items);
+      state.agentChat.approvals = items;
+      renderChatBadges();
+      if (state.agentChat.approvalsOpen && signature !== chatApprovalsSignature) {
+        chatApprovalsSignature = signature;
+        renderChatApprovalsPanel();
+      }
+    }
+
+    function renderChatApprovalsPanel() {
+      const body = $("#chatApprovalsBody");
+      if (!body || !chatAgentCore) return;
+      body.innerHTML = chatAgentCore.approvalsPanelMarkup(state.agentChat.approvals);
+    }
+
+    function renderChatApprovalsPanelVisibility() {
+      const drawer = $("#chatApprovalsPanel");
+      if (drawer) drawer.hidden = !state.agentChat.approvalsOpen;
+      $("#chatApprovalsToggle")?.setAttribute("aria-expanded", String(state.agentChat.approvalsOpen));
+      if (state.agentChat.approvalsOpen) renderChatApprovalsPanel();
+    }
+
+    function markApprovalCardDecided(card, label, toneClass) {
+      if (!card) return;
+      card.dataset.decided = "true";
+      card.querySelector(".agent-approval-reject")?.remove();
+      const actions = card.querySelector(".agent-approval-actions");
+      const status = document.createElement("p");
+      status.className = `agent-approval-status ${toneClass}`;
+      status.setAttribute("role", "status");
+      status.textContent = label;
+      if (actions) actions.replaceWith(status);
+      else card.appendChild(status);
+    }
+
+    async function handleAgentApprovalAction(button) {
+      const card = button.closest("[data-agent-approval-id]");
+      const approvalId = card?.dataset.agentApprovalId || "";
+      const action = button.dataset.approvalAction || "";
+      if (!approvalId || !action) return;
+      if (action === "reject") {
+        // 展开内联原因输入，再点一次「确认拒绝」才真正提交。
+        if (card.querySelector(".agent-approval-reject")) {
+          card.querySelector(".agent-approval-reason")?.focus();
+          return;
+        }
+        const row = document.createElement("div");
+        row.className = "agent-approval-reject";
+        row.innerHTML = `<input type="text" class="agent-approval-reason" placeholder="拒绝原因（可选）" aria-label="拒绝原因"><button type="button" class="pill-btn" data-approval-action="confirm-reject">确认拒绝</button>`;
+        card.querySelector(".agent-approval-actions")?.after(row);
+        row.querySelector(".agent-approval-reason")?.focus();
+        return;
+      }
+      button.disabled = true;
+      try {
+        if (action === "approve") {
+          const result = await requestJsonStrict(
+            `${ENDPOINTS.chatApprovals}/${encodeURIComponent(approvalId)}/approve`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+          );
+          const ok = result?.ok !== false;
+          const detail = String(result?.result || result?.approval?.error || "").trim();
+          markApprovalCardDecided(
+            card,
+            ok ? "已批准并执行" : `已批准，但执行失败${detail ? `：${detail}` : ""}`,
+            ok ? "is-ok" : "is-failed",
+          );
+          showToast(ok ? "已批准并执行" : "已批准，但执行失败");
+        } else if (action === "confirm-reject") {
+          const reason = card.querySelector(".agent-approval-reason")?.value?.trim() || "";
+          await requestJsonStrict(
+            `${ENDPOINTS.chatApprovals}/${encodeURIComponent(approvalId)}/reject`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) },
+          );
+          markApprovalCardDecided(card, "已拒绝", "is-rejected");
+          showToast("已拒绝这项改动");
+        }
+      } catch (error) {
+        button.disabled = false;
+        showToast(
+          Number(error?.status)
+            ? contextErrorMessage(error)
+            : "审批操作没完成（可能是后端正在热重载），请稍后重试",
+        );
+        return;
+      }
+      void refreshChatApprovals().catch(() => {});
+      void refreshDialogueTurns().catch(() => {});
+    }
+
+    // ── skill 建议 / 后台任务确认卡 ──
+
+    function replaceAgentCardWithNote(card, note) {
+      if (!card) return;
+      const actions = card.querySelector(".agent-card-actions");
+      const p = document.createElement("p");
+      p.className = "agent-card-note";
+      p.setAttribute("role", "status");
+      p.textContent = note;
+      if (actions) actions.replaceWith(p);
+      else card.appendChild(p);
+    }
+
+    function handleSkillSuggestAction(button) {
+      const card = button.closest("[data-suggest-skill]");
+      const skill = card?.dataset.suggestSkill || "";
+      const action = button.dataset.skillAction || "";
+      if (!card || !action) return;
+      if (action === "accept" && skill) {
+        setChatSkill(skill);
+        replaceAgentCardWithNote(card, "已切换，从下一回合开始生效。");
+      } else if (action === "dismiss") {
+        replaceAgentCardWithNote(card, "已忽略这个建议。");
+      }
+    }
+
+    async function handleBackgroundTaskAction(button) {
+      const card = button.closest("[data-bg-task]");
+      const action = button.dataset.bgTaskAction || "";
+      if (!card || !action) return;
+      if (action === "dismiss") {
+        replaceAgentCardWithNote(card, "已忽略，任务不会启动。");
+        return;
+      }
+      let spec = {};
+      try {
+        spec = JSON.parse(card.dataset.bgTask || "{}");
+      } catch {
+        spec = {};
+      }
+      const prompt = String(spec.prompt || "").trim();
+      if (!prompt) {
+        replaceAgentCardWithNote(card, "这条任务提议缺少内容，无法发起。");
+        return;
+      }
+      button.disabled = true;
+      const body = { prompt };
+      if (spec.title) body.title = String(spec.title);
+      if (spec.skill) body.skill = String(spec.skill);
+      if (state.agentChat.sessionId && state.agentChat.sessionId !== "default") {
+        body.session_id = state.agentChat.sessionId;
+      }
+      try {
+        await requestJsonStrict(ENDPOINTS.chatTasks, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        replaceAgentCardWithNote(card, "已发起，可在任务中心查看进度。");
+        showToast("后台任务已开始");
+        state.agentChat.tasksOpen = true;
+        renderChatTaskCenter();
+        void refreshChatTasks().catch(() => {});
+      } catch (error) {
+        button.disabled = false;
+        if (Number(error?.status) === 503) showToast("后端未启用 Agent 任务，暂时无法发起后台任务");
+        else showToast(contextErrorMessage(error));
+      }
+    }
+
+    // ── 任务中心 ──
+
+    async function refreshChatTasks() {
+      const payload = await requestJsonStrict(`${ENDPOINTS.chatTasks}?limit=50`, { cache: "no-store" });
+      const items = asArray(payload?.items);
+      const signature = JSON.stringify(items) + `|${state.agentChat.taskDetailId}`;
+      state.agentChat.tasks = items;
+      renderChatBadges();
+      if (state.agentChat.tasksOpen && !state.agentChat.taskDetailId && signature !== chatTasksSignature) {
+        chatTasksSignature = signature;
+        renderChatTaskCenter();
+      }
+    }
+
+    function renderChatTaskCenter() {
+      const drawer = $("#chatTaskCenter");
+      const body = $("#chatTaskCenterBody");
+      if (!drawer || !body || !chatAgentCore) return;
+      drawer.hidden = !state.agentChat.tasksOpen;
+      $("#chatTasksToggle")?.setAttribute("aria-expanded", String(state.agentChat.tasksOpen));
+      if (!state.agentChat.tasksOpen) return;
+      if (state.agentChat.taskDetailId && state.agentChat.taskDetail) {
+        body.innerHTML = chatAgentCore.taskDetailMarkup(state.agentChat.taskDetail, {
+          renderMarkdown,
+          handledSuggestions: state.agentChat.handledSuggestions,
+        });
+      } else {
+        body.innerHTML = chatAgentCore.taskListMarkup(state.agentChat.tasks);
+      }
+    }
+
+    async function openChatTaskDetail(taskId) {
+      try {
+        const task = await requestJsonStrict(`${ENDPOINTS.chatTasks}/${encodeURIComponent(taskId)}`, { cache: "no-store" });
+        state.agentChat.taskDetailId = taskId;
+        state.agentChat.taskDetail = task;
+        renderChatTaskCenter();
+      } catch (error) {
+        showToast(contextErrorMessage(error));
+      }
+    }
+
+    async function refreshChatTaskDetail() {
+      const taskId = state.agentChat.taskDetailId;
+      if (!taskId) return;
+      try {
+        const task = await requestJsonStrict(`${ENDPOINTS.chatTasks}/${encodeURIComponent(taskId)}`, { cache: "no-store" });
+        const changed = JSON.stringify(task) !== JSON.stringify(state.agentChat.taskDetail);
+        state.agentChat.taskDetail = task;
+        if (changed && state.agentChat.tasksOpen) renderChatTaskCenter();
+      } catch {
+        // 详情刷新失败保持现状，下一次轮询再试。
+      }
+    }
+
+    async function cancelChatTask(taskId, button) {
+      if (button) button.disabled = true;
+      try {
+        await requestJsonStrict(`${ENDPOINTS.chatTasks}/${encodeURIComponent(taskId)}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        showToast("已取消这个任务");
+      } catch (error) {
+        if (Number(error?.status) === 409) showToast("任务已经结束，无需取消");
+        else showToast(contextErrorMessage(error));
+      }
+      chatTasksSignature = "";
+      await refreshChatTasks().catch(() => {});
+      if (state.agentChat.taskDetailId === taskId) await refreshChatTaskDetail();
+    }
+
+    function findSuggestion(source, index) {
+      const detail = state.agentChat.taskDetail;
+      if (detail && String(detail.task_id || "") === source && Array.isArray(detail.suggestions)) {
+        return { suggestion: detail.suggestions[index], sessionId: String(detail.session_id || "") };
+      }
+      const turn = state.chat.find((entry) => {
+        const payload = entry?.turn?.payload;
+        return payload?.type === "agent_task_summary" && String(payload.task_id || "") === source;
+      })?.turn;
+      if (turn && Array.isArray(turn.payload?.suggestions)) {
+        return { suggestion: turn.payload.suggestions[index], sessionId: String(turn.session_id || "") };
+      }
+      const listed = state.agentChat.tasks.find((task) => String(task?.task_id || "") === source);
+      if (listed && Array.isArray(listed.suggestions)) {
+        return { suggestion: listed.suggestions[index], sessionId: String(listed.session_id || "") };
+      }
+      return { suggestion: null, sessionId: "" };
+    }
+
+    // v1 建议执行统一走对话：soft_write 由 agent 立即执行（一键），hard_write
+    // 在对话中触发审批卡。确认动作 = 往来源会话发一条结构化执行指令。
+    async function handleSuggestionConfirm(button) {
+      const item = button.closest("[data-suggestion-index]");
+      const index = Number(item?.dataset.suggestionIndex);
+      const source = item?.dataset.suggestionSource || "";
+      if (!Number.isInteger(index) || index < 0) return;
+      const { suggestion, sessionId } = findSuggestion(source, index);
+      if (!suggestion || typeof suggestion !== "object") {
+        showToast("这条建议的内容还没加载，请打开任务详情再试");
+        return;
+      }
+      const action = String(suggestion.action || "");
+      const summary = String(suggestion.summary || "");
+      const payloadText = chatAgentCore.prettyJson(suggestion.payload);
+      const message = `请执行这条后台任务建议（${action}）：${summary}\n参数：${payloadText}`;
+      const key = `${source}:${index}`;
+      state.agentChat.handledSuggestions.add(key);
+      button.disabled = true;
+      if (sessionId && sessionId !== state.agentChat.sessionId) {
+        await selectChatSession(sessionId);
+      }
+      state.agentChat.tasksOpen = false;
+      renderChatTaskCenter();
+      await sendChat(message);
+      renderChatTaskCenter();
+      renderChat({ forceBottom: true });
+    }
+
+    // 轮询时保持进行中的任务详情实时更新。
+    async function syncAgentChatSurface() {
+      if (!agentChatEnabled()) return;
+      await Promise.allSettled([refreshChatSessions(), refreshChatApprovals(), refreshChatTasks()]);
+      if (state.agentChat.taskDetailId) {
+        const detail = state.agentChat.taskDetail;
+        if (!detail || chatAgentCore.taskIsActive(detail)) await refreshChatTaskDetail();
+      }
     }
 
     function updateDesktopDialogueTurn(turn) {
@@ -7704,7 +8567,8 @@ ${cardFeedbackBarHtml()}`;
       renderDialogueContextBar();
       renderDesktopPendingConfirmations();
       const chatLog = $("#chatLog");
-      renderChatLogElement(chatLog, chatHtml(state.chat), { forceBottom });
+      // M8：流式中的过程视图与部分答复追加在主聊天尾部（不进 state.chat）。
+      renderChatLogElement(chatLog, chatHtml(state.chat) + liveAgentChatMarkup(), { forceBottom });
       const messageChatLog = $("#messageChatLog");
       if (messageChatLog) {
         const baseMessages = state.messageChatPrompt
@@ -7746,6 +8610,16 @@ ${cardFeedbackBarHtml()}`;
     }
 
     async function sendChat(message, options = {}) {
+      // M8：主对话（scope=chat）在 agent 模式下走 /api/chat/agent/stream 多跳
+      // 流；delight/probe 等其它 scope 与 legacy 模式保持原路径不变。
+      if (
+        agentChatEnabled() &&
+        String(options.scope || "chat") === "chat" &&
+        !options.contextPrefix
+      ) {
+        await sendAgentChat(message);
+        return;
+      }
       const payloadMessage = options.contextPrefix ? `${options.contextPrefix}\n\n${message}` : message;
       const replyToTurnId = dialogueContextSelection?.["reply_to_turn_id"] || "";
       state.chat.push({ role: "user", text: message });
@@ -12059,12 +12933,130 @@ ${cardFeedbackBarHtml()}`;
         : null;
       if (button instanceof HTMLButtonElement) void handleDesktopPendingOpen(button);
     });
+    // M8：chatLog 内的 agent 卡片（审批 / skill 建议 / 后台任务 / 建议清单）
+    // 与既有的假设卡动作共用同一个委托入口。
+    function handleAgentSurfaceClick(event) {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      const approvalButton = target.closest("[data-approval-action]");
+      if (approvalButton instanceof HTMLButtonElement) {
+        void handleAgentApprovalAction(approvalButton);
+        return;
+      }
+      const skillButton = target.closest("[data-skill-action]");
+      if (skillButton instanceof HTMLButtonElement) {
+        handleSkillSuggestAction(skillButton);
+        return;
+      }
+      const bgTaskButton = target.closest("[data-bg-task-action]");
+      if (bgTaskButton instanceof HTMLButtonElement) {
+        void handleBackgroundTaskAction(bgTaskButton);
+        return;
+      }
+      const suggestionButton = target.closest("[data-suggestion-action]");
+      if (suggestionButton instanceof HTMLButtonElement) {
+        void handleSuggestionConfirm(suggestionButton);
+        return;
+      }
+      const taskOpen = target.closest("[data-task-open]");
+      if (taskOpen instanceof HTMLElement && taskOpen.dataset.taskOpen) {
+        state.agentChat.tasksOpen = true;
+        renderChatTaskCenter();
+        void openChatTaskDetail(taskOpen.dataset.taskOpen);
+      }
+    }
+
     $("#chatLog")?.addEventListener("click", (event) => {
       activateReplyQuote(event, $("#chatLog"));
       const button = event.target instanceof Element
         ? event.target.closest("[data-card-action]")
         : null;
       if (button instanceof HTMLButtonElement) void handleDesktopCardAction(button);
+      handleAgentSurfaceClick(event);
+    });
+    $("#chatApprovalsBody")?.addEventListener("click", handleAgentSurfaceClick);
+    $("#chatTaskCenterBody")?.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      const cancelButton = target.closest("[data-task-cancel]");
+      if (cancelButton instanceof HTMLButtonElement) {
+        void cancelChatTask(cancelButton.dataset.taskCancel, cancelButton);
+        return;
+      }
+      if (target.closest("[data-task-back]")) {
+        state.agentChat.taskDetailId = "";
+        state.agentChat.taskDetail = null;
+        chatTasksSignature = "";
+        renderChatTaskCenter();
+        return;
+      }
+      handleAgentSurfaceClick(event);
+    });
+    $("#chatSessionList")?.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const actionEl = target?.closest("[data-session-action]");
+      if (!actionEl) return;
+      const sessionId = actionEl.closest("[data-session-id]")?.dataset.sessionId || "";
+      const action = actionEl.dataset.sessionAction;
+      if (action === "switch") void selectChatSession(sessionId);
+      else if (action === "rename") startChatSessionRename(actionEl);
+      else if (action === "archive") void archiveChatSession(sessionId);
+    });
+    safeBind("#chatNewSessionBtn", "click", () => void createChatSession());
+    safeBind("#chatArchivedToggle", "click", () => {
+      state.agentChat.includeArchived = !state.agentChat.includeArchived;
+      chatSessionsSignature = "";
+      void refreshChatSessions().catch(() => {});
+      renderChatSidebar();
+    });
+    safeBind("#chatSideToggle", "click", () => {
+      state.agentChat.sidebarOpen = !state.agentChat.sidebarOpen;
+      applyAgentChatChrome();
+    });
+    safeBind("#chatSkillChip", "click", () => toggleChatSkillPicker());
+    $("#chatSkillPicker")?.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const option = target?.closest("[data-skill-pick]");
+      if (!(option instanceof HTMLElement)) return;
+      setChatSkill(option.dataset.skillPick || "");
+      toggleChatSkillPicker(false);
+    });
+    // Escape 关闭 skill 选择弹层；点击弹层外也收起。
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && state.agentChat.skillPickerOpen) toggleChatSkillPicker(false);
+    });
+    document.addEventListener("click", (event) => {
+      if (!state.agentChat.skillPickerOpen) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("#chatSkillPicker") || target?.closest("#chatSkillChip")) return;
+      toggleChatSkillPicker(false);
+    });
+    safeBind("#chatTasksToggle", "click", () => {
+      state.agentChat.tasksOpen = !state.agentChat.tasksOpen;
+      if (!state.agentChat.tasksOpen) {
+        state.agentChat.taskDetailId = "";
+        state.agentChat.taskDetail = null;
+      }
+      renderChatTaskCenter();
+      if (state.agentChat.tasksOpen) void refreshChatTasks().catch(() => {});
+    });
+    safeBind("#chatTaskCenterClose", "click", () => {
+      state.agentChat.tasksOpen = false;
+      state.agentChat.taskDetailId = "";
+      state.agentChat.taskDetail = null;
+      renderChatTaskCenter();
+    });
+    safeBind("#chatApprovalsToggle", "click", () => {
+      state.agentChat.approvalsOpen = !state.agentChat.approvalsOpen;
+      renderChatApprovalsPanelVisibility();
+      if (state.agentChat.approvalsOpen) {
+        chatApprovalsSignature = "";
+        void refreshChatApprovals().catch(() => {});
+      }
+    });
+    safeBind("#chatApprovalsClose", "click", () => {
+      state.agentChat.approvalsOpen = false;
+      renderChatApprovalsPanelVisibility();
     });
     safeBind("#chatForm", "submit", (event) => { event.preventDefault(); const input = $("#chatInput"); const text = input?.value?.trim() || ""; if (!text) return; input.value = ""; sendChat(text); });
     safeBind("#messageChatBackBtn", "click", returnToMessages);

@@ -1219,6 +1219,18 @@ Awareness seam 固定为 `legacy`。未发布的聚合字段
 |----|------|--------|------|
 | `satisfaction_filter_enabled` | bool | `true` | v0.3.x 事件满意度信号：默认开启。偏好分析会在构 prompt 前忽略 `quick_exit` 等被动 negative 事件，保留 positive / neutral / unknown 上下文；`feedback_type=dislike` 或 `reaction=thumbs_down` 的显式负反馈会继续进入分析器，只能作为 `disliked_topics` / 避让证据，不能提取为正向 `interests` |
 
+### `[agent]`（聊一聊 agent loop 预算）
+
+「聊一聊」多跳 agent loop 的步数与回填预算（`src/openbiliclaw/agent/loop.py`，M1 起生效）。
+
+| 键 | 类型 | 默认值 | 说明 |
+|----|------|--------|------|
+| `loop_max_steps` | int | `64` | 每轮对话「思考 → 调工具 → 再思考」的最大跳数（范围 `1..256`，越界回退默认值）。超限后 loop 发出 `step_limit_reached` 事件，并以无工具的收尾调用让模型汇报进展与建议 |
+| `tool_result_max_chars` | int | `4000` | 单次工具结果回填进 prompt 的字符上限（范围 `200..100000`），超出部分截断并标注；截断后的文本同时出现在 `tool_result` 事件（`truncated=true`）与回填消息里 |
+| `loop_enabled` | bool | `true` | 流式 agent 聊天端点 `POST /api/chat/agent/stream` 的开关（M2 起生效）；`false` 时该端点返回 503，旧单跳端点 `/api/chat` 与 `/api/chat/stream` 不受影响 |
+| `session_title_enabled` | bool | `true` | 多会话标题自动生成（M5 起生效）：新会话首条 chat 消息落库后异步调用 LLM 生成简短标题（caller `chat.session_title`，走全局并发闸），失败/超时回退为消息截断前缀；`false` 时直接用截断前缀、不发起 LLM 调用。已有标题（含手动改名）不被覆盖 |
+| `task_max_steps` | int | `32` | 后台任务（任务中心，M6 起生效）单次执行的最大跳数（范围 `1..256`，越界回退默认值）。后台任务无人值守、只挂只读工具（`filter_by_permission("read")` + `propose_suggestion` 元工具），预算比交互对话小；超限后与交互 loop 一样发出 `step_limit_reached` 并以无工具收尾调用让模型汇报进展 |
+
 ### `[logging]`
 
 | 键 | 类型 | 默认值 | 说明 |

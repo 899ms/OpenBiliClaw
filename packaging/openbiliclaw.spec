@@ -128,6 +128,12 @@ a = Analysis(
         # packaged app. Dest mirrors the import path so __file__-relative
         # resolution (web_dir = .../openbiliclaw/web) works when frozen.
         (str(project_root / "src" / "openbiliclaw" / "web"), "openbiliclaw/web"),
+        # Builtin chat skills (M4): SKILL.md files loaded via
+        # agent/skill.py's __file__-relative builtin_skills_dir().
+        (
+            str(project_root / "src" / "openbiliclaw" / "agent" / "skills_builtin"),
+            "openbiliclaw/agent/skills_builtin",
+        ),
     ]
     + _x_datas
     + _reddit_datas,

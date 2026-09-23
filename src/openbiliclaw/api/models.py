@@ -2002,6 +2002,11 @@ class ChatTurnIn(BaseModel):
     scope: str = "chat"
     subject_id: str = ""
     subject_title: str = ""
+    # Owning multi-session conversation (M5).  Empty resolves to the default
+    # chat session server-side at POST time.
+    session_id: str = ""
+    # Chat skill binding (M4): empty means the default skill (口味伙伴).
+    skill: str = ""
     # The only client-declared relation.  Canonical kind/ref/generation/title
     # are resolved from this durable target by the server at POST time.
     reply_to_turn_id: str = ""
@@ -2012,7 +2017,7 @@ class ChatTurnIn(BaseModel):
 
     @model_validator(mode="after")
     def reject_reserved_binding_payload(self) -> Self:
-        """Do not accept client-supplied canonical binding facts."""
+        """Do not accept client-supplied canonical binding facts or replay data."""
         reserved = {
             "dialogue_binding",
             "source_type",
@@ -2027,6 +2032,14 @@ class ChatTurnIn(BaseModel):
             "context",
             "mode",
             "inventory_settles_allowed",
+            # Server-owned agent-loop replay log (written on stream completion).
+            "agent_events",
+            # Server-owned background-task summary card (M6): written only by
+            # AgentTaskManager when a task terminates; clients must not forge
+            # a summary card for an arbitrary task.
+            "agent_task_summary",
+            "task_id",
+            "task_status",
         }
         # Card creation legitimately accepts ``evidence_refs`` as input. Once
         # a request declares a reply relation, however, even evidence is
@@ -2036,6 +2049,10 @@ class ChatTurnIn(BaseModel):
         forbidden = sorted(set(self.payload).intersection(reserved))
         if forbidden:
             raise ValueError(f"reserved_payload_key: {', '.join(forbidden)} is server-owned")
+        # The summary card is keyed on the payload ``type`` value, so blocking
+        # the keys alone is not enough — reject the value directly.
+        if str(self.payload.get("type") or "").strip() == "agent_task_summary":
+            raise ValueError("reserved_payload_key: agent_task_summary is server-owned")
         return self
 
 
@@ -2053,6 +2070,8 @@ class ChatTurnOut(BaseModel):
     status: str = "pending"
     error: str = ""
     payload: dict[str, object] = Field(default_factory=dict)
+    # Owning multi-session conversation (M5); '' marks pre-M5 legacy rows.
+    session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -2074,6 +2093,112 @@ class ChatTurnListResponse(BaseModel):
     """Durable popup chat history."""
 
     items: list[ChatTurnOut]
+
+
+# --- Multi-session chat models (「聊一聊」 M5) ---
+
+
+class ChatSessionCreateIn(BaseModel):
+    """Create one chat conversation. Empty ``session_id`` auto-generates one."""
+
+    session_id: str = ""
+    title: str = ""
+    # Additive metadata bag; reserved for the skill binding (M4).
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class ChatSessionPatchIn(BaseModel):
+    """Rename and/or archive one chat conversation."""
+
+    title: str | None = None
+    archived: bool | None = None
+
+
+class ChatSessionOut(BaseModel):
+    """One chat conversation with list-preview fields."""
+
+    session_id: str
+    title: str = ""
+    archived: bool = False
+    metadata: dict[str, object] = Field(default_factory=dict)
+    turn_count: int = 0
+    # Pending (in-flight) replies — the "active" indicator for the list UI.
+    active_turns: int = 0
+    last_message_preview: str = ""
+    last_activity: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    last_message_at: str = ""
+
+
+class ChatSessionListResponse(BaseModel):
+    """Chat conversation list ordered by latest activity."""
+
+    items: list[ChatSessionOut]
+
+
+class ChatSessionDetailResponse(BaseModel):
+    """One chat conversation plus a page of its turns."""
+
+    session: ChatSessionOut
+    items: list[ChatTurnOut]
+    total: int
+    limit: int
+    offset: int
+
+
+# --- Durable agent task center models (「聊一聊」 M6) ---
+
+
+class AgentTaskCreateIn(BaseModel):
+    """Start one durable background task.
+
+    ``prompt`` is the complete instruction the unattended background agent
+    sees. ``session_id`` (default session when empty) is the originating
+    conversation that receives the completion summary message; ``skill``
+    optionally binds a chat skill's persona and tool whitelist (intersected
+    with the read-only permission ceiling).
+    """
+
+    prompt: str
+    session_id: str = ""
+    title: str = ""
+    skill: str = ""
+
+
+class AgentTaskOut(BaseModel):
+    """One durable background task.
+
+    ``suggestions`` is the structured write-proposal list
+    (``{action, summary, payload}``) the user confirms back in the
+    conversation. ``steps`` (the execution log) is only populated by the
+    detail endpoint; list responses leave it empty.
+    """
+
+    task_id: str
+    session_id: str = ""
+    title: str = ""
+    prompt: str = ""
+    status: str = "pending"
+    skill: str = ""
+    progress: str = ""
+    report: str = ""
+    suggestions: list[dict[str, object]] = Field(default_factory=list)
+    steps: list[dict[str, object]] = Field(default_factory=list)
+    error: str = ""
+    created_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    updated_at: str = ""
+
+
+class AgentTaskListResponse(BaseModel):
+    """Agent task list page (newest first), without step logs."""
+
+    items: list[AgentTaskOut]
+    total: int
+    limit: int
+    offset: int
 
 
 # --- Configuration API models ---

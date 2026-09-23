@@ -65,6 +65,8 @@
 | 知乎接入 | [modules/zhihu.md](modules/zhihu.md) | `src/openbiliclaw/sources/zhihu_tasks.py` + `runtime/zhihu_producer.py` + `extension/src/**/zhihu*` | ✅ 登录态任务桥、五路 discovery、账号信号与原生保存确认 |
 | 记忆系统 | [modules/memory.md](modules/memory.md) | `src/openbiliclaw/memory/` | ✅ 完成 |
 | 灵魂引擎 | [modules/soul.md](modules/soul.md) | `src/openbiliclaw/soul/` | ✅ 完成 |
+| 聊天 Agent Loop | [modules/agent.md](modules/agent.md) | `src/openbiliclaw/agent/` | 🧪 M1–M7 后端完成（工具注册表 / 原生 FC / 多跳 loop / SSE 真流式 / v1 工具集 / skill / 会话 / 任务中心 / 审批门）；M8/M9 三端前端已交付 |
+| 桌面 Web | [modules/desktop-web.md](modules/desktop-web.md) | `src/openbiliclaw/web/desktop/` | 🧪 M8 聊一聊 agent loop 前端：流式过程折叠展示、会话侧栏、skill 切换、审批卡、任务中心 |
 | 内容发现引擎 | [modules/discovery.md](modules/discovery.md) | `src/openbiliclaw/discovery/` | ✅ v0.3.x 多源 + 统一待评估池 + 跨源跨轮 topic 配额 |
 | 推荐引擎 | [modules/recommendation.md](modules/recommendation.md) | `src/openbiliclaw/recommendation/` | ✅ v0.3.x 双轴 fatigue + per-group 候选窗口 + reshuffle 0.6s |
 | 存储层 | [modules/storage.md](modules/storage.md) | `src/openbiliclaw/storage/` | ✅ SQLite schema + discovery candidates / pool readiness + 去除 API auth 的 `.obcbackup` 快照、暂存 / 取消、重启应用与回滚 |

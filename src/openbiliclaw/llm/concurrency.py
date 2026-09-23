@@ -353,6 +353,13 @@ _INTERACTIVE_CALLERS = {
     "soul.dialogue.tools",
     "soul.dialogue.tool_followup",
     "api.sentiment",
+    # 「聊一聊」 agent loop lanes are user-initiated: the interactive chat
+    # loop ("agent.chat") answers live in the conversation, and durable
+    # background tasks ("agent.task") are launched by an explicit user
+    # request from the chat. Neither is daemon maintenance, so neither may
+    # be parked behind the empty-pool refill reservation.
+    "agent.chat",
+    "agent.task",
 }
 _EXPRESSION_CALLERS = {
     "recommendation.expression",
