@@ -2,6 +2,13 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M9：移动 Web 与插件 popup 前端（2026-09-23，feat/chat-agent-loop）
+
+- **共享前端模块 `web/shared/agent-chat.js`（新）**：安装 `globalThis.OpenBiliClawAgentChat`，移动 Web 经 `/shared/` 挂载加载、popup 由 `scripts/build.mjs` 复制进 `popup/shared/`（桌面 Web 复用同一文件）。提供三件核心能力：`createAgentSseParser()` 增量 SSE 帧解析（event 名 = AgentEvent type，容忍分片/多行 data/注释行，坏帧丢弃不断流）；`createAgentRun()` + `applyAgentEvent()` 把事件流（或历史 turn 的 `payload.agent_events`）归约成过程流 run 模型（steps / thinking / tool_call 生命周期 / approval_request → approval_result 审批结局 / suggest_skill 与 start_background_task 元调用 / step_limit / final / done / error）；以及一组 markup 渲染器（过程流折叠卡、审批卡、skill 切换建议卡、后台任务确认卡、任务行/详情、`agent_task_summary` 汇总卡），全部经 `data-agent-*` 钩子由两端各自做事件委托接线。
+- **移动 Web（`web/js/views/chat.js` + `web/js/api.js`）**：主聊天切到 `POST /api/chat/agent/stream` 真流式——思考过程与工具调用逐跳铺在对话里（工具一行折叠摘要、可展开看参数/结果），`final` 落成答复气泡，`error` 事件给中文友好提示；`loop_enabled=false`（503）时本次页面会话永久回退旧 `/api/chat/stream` 假流式，历史里 pending 的流式 turn 由 agent 流重新驱动而不是空轮询。历史回放读取 `payload.agent_events`，完成后过程整体折叠为「执行过程（N 步）」。新增会话抽屉（新建/切换/改名/归档，活跃会话圆点指示，标题生成后约 4 秒自动刷新）、会话顶部 skill 指示 chip + 角色选择浮层（按会话持久化选择）、`suggest_skill` 建议卡一键切换（下一回合生效）、L2 审批卡（批准/拒绝，拒绝可填理由；「待审批操作」面板复用待聊确认的折叠列表习惯并随历史刷新轮询）、任务中心浮层（列表 + 详情复用过程流组件 + 取消 + report + 建议清单「带入对话」）、`start_background_task` 确认卡与 `agent_task_summary` 汇总卡渲染。delight/探针内嵌聊天、假设卡片与待聊确认行为不变。
+- **插件 popup（`extension/popup/popup.js` / `popup-api.js` / `popup.html`）**：对话 tab 内新增「对话 / 会话 / 任务」子 tab 适配小窗；过程流为紧凑单行摘要（11px）；skill 用紧凑下拉选择器；审批卡内嵌消息流 + 「待审批」折叠列表（轮询）；会话子 tab 支持新建/切换/归档；任务子 tab 为精简任务中心（列表 + 进行中徽标 + 取消 + 简化内联详情，详情里 report/建议/步骤可展开）。发送与历史恢复都先走 agent loop 流式（`pollChatTurnUntilSettled` 内优先 `streamAgentChatTurn`，503 回退旧 `streamChatTurn`）；scope=delight/probe/avoidance_probe 的内嵌聊天明确保持旧单跳路径。
+- **回归**：`extension/tests/agent-chat.test.ts` 16 条行为测试（SSE 分片/多行/坏帧解析、run 归约全事件类型、审批状态机、回放、各卡片 markup 钩子）；`extension/tests/popup-agent-chat.test.ts` 7 条 popup 接线静态回归；`tests/test_mobile_web_agent_chat.py` 5 条移动端接线静态回归；`extension` 全量 1482 通过（1 条 pre-existing 失败与本次无关），`pytest -k mobile` 131 通过。
+
 ## 聊一聊 Agent Loop M7：L2 审批门（hard_write 逐项审批 + 审计）（2026-09-23，feat/chat-agent-loop）
 
 - **审批存储 `agent/approvals.py`（新模块，免迁移）**：`ApprovalRecord` + `ApprovalStore`，单 JSON 文件持久化（`{data_dir}/chat_approvals.json`，tmp + os.replace 原子写，threading.Lock 串行），刻意不动 `storage/database.py`。状态机 `pending → approved → executed`、`pending → rejected`、`pending → expired`（默认 24h TTL 惰性过期）；幂等语义：重复 approve/reject 已决记录返回现状，`mark_executed` 仅接受 approved 态，从机制上禁止二次执行。

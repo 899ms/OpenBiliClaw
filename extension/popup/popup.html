@@ -5898,6 +5898,341 @@
       .saved-load-retry { min-width: 44px; min-height: 44px; }
     }
 
+    /* ── 聊一聊 agent loop（M9，popup 紧凑形态）───────────────── */
+    .chat-subtabs {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 4px;
+      margin-bottom: 8px;
+    }
+
+    .chat-subtab {
+      flex: 1;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .chat-subtab.is-active {
+      background: var(--brand-soft);
+      border-color: var(--line-strong);
+      color: var(--text-main);
+    }
+
+    .chat-subtab:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+    .chat-subpanel {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .chat-subpanel[hidden] { display: none; }
+
+    .chat-agent-bar {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .chat-skill-select {
+      flex: 1;
+      min-width: 0;
+      min-height: 28px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      background: var(--brand-soft);
+      color: var(--text-main);
+      font-size: 11px;
+      padding: 2px 8px;
+    }
+
+    .chat-approvals-toggle {
+      flex: 0 0 auto;
+      width: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+    }
+
+    .chat-approvals-list {
+      flex: 0 0 auto;
+      max-height: min(32vh, 220px);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      display: grid;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .chat-sessions-list,
+    .chat-tasks-list {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      display: grid;
+      gap: 6px;
+      align-content: start;
+      padding-bottom: 8px;
+    }
+
+    #chatSessionNew { flex: 0 0 auto; margin-bottom: 8px; }
+
+    .chat-task-detail {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding-bottom: 8px;
+    }
+
+    .agent-session-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 6px 8px;
+      background: var(--surface);
+    }
+
+    .agent-session-row.is-active { border-color: var(--line-strong); background: var(--brand-soft); }
+
+    .agent-session-main {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      text-align: left;
+      display: grid;
+      gap: 2px;
+      padding: 2px;
+    }
+
+    .agent-session-title { font-size: 12px; color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-session-preview { font-size: 10px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-session-active { color: var(--brand); font-size: 9px; }
+
+    .agent-run {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface-soft);
+      padding: 4px 8px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin: 4px 0;
+    }
+
+    .agent-run.is-collapsed { padding: 0; }
+    .agent-run.is-collapsed > .agent-run-toggle {
+      padding: 6px 8px;
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .agent-run.is-collapsed > .agent-step,
+    .agent-run.is-collapsed > .agent-step-limit,
+    .agent-run.is-collapsed > .agent-skill-card,
+    .agent-run.is-collapsed > .agent-task-proposal { margin: 0 8px 6px; }
+
+    .agent-step { margin: 2px 0; }
+
+    .agent-thinking {
+      margin: 2px 0;
+      font-size: 11px;
+      color: var(--text-secondary);
+      white-space: pre-wrap;
+    }
+
+    .agent-tool {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      margin: 2px 0;
+    }
+
+    .agent-tool > summary {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 4px 6px;
+      cursor: pointer;
+      font-size: 11px;
+      list-style: none;
+    }
+    .agent-tool > summary::-webkit-details-marker { display: none; }
+    .agent-tool[data-status="failed"] > summary .agent-tool-state { color: var(--danger); }
+    .agent-tool[data-status="ok"] > summary .agent-tool-state { color: #22a06b; }
+    .agent-tool[data-status="running"] > summary .agent-tool-state { color: var(--brand); }
+
+    .agent-tool-detail { padding: 0 6px 6px; }
+
+    .agent-detail-pre {
+      margin: 2px 0;
+      padding: 4px 6px;
+      border-radius: 6px;
+      background: rgba(32, 48, 74, 0.05);
+      font-size: 10px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 140px;
+      overflow-y: auto;
+    }
+
+    .agent-tool-result.is-error { color: var(--danger); }
+    .agent-step-limit { margin: 4px 0; font-size: 11px; color: var(--text-secondary); }
+    .agent-run-error { margin: 4px 0; font-size: 11px; color: var(--danger); }
+
+    .agent-btn {
+      min-height: 26px;
+      padding: 2px 10px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 11px;
+    }
+    .agent-btn-primary { background: var(--brand); color: #fff; }
+    .agent-btn-secondary { background: var(--surface-strong); border-color: var(--line); color: var(--text-main); }
+    .agent-btn-ghost { background: transparent; color: var(--text-secondary); }
+    .agent-btn:disabled { opacity: 0.6; }
+
+    .agent-approval-card {
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: var(--surface-strong);
+      padding: 8px;
+      margin: 4px 0;
+    }
+
+    .agent-approval-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .agent-approval-status { font-size: 10px; color: var(--text-secondary); font-weight: 400; }
+    .agent-approval-status[data-tone="pending"] { color: var(--brand); }
+    .agent-approval-status[data-tone="executed"] { color: #22a06b; }
+    .agent-approval-status[data-tone="rejected"],
+    .agent-approval-status[data-tone="failed"] { color: var(--danger); }
+
+    .agent-approval-summary,
+    .agent-approval-reason,
+    .agent-approval-impact,
+    .agent-approval-result { margin: 2px 0; font-size: 11px; color: var(--text-main); }
+    .agent-approval-impact,
+    .agent-approval-reason { color: var(--text-secondary); }
+
+    .agent-approval-args summary { font-size: 11px; color: var(--text-secondary); cursor: pointer; }
+    .agent-approval-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .agent-approval-reject { margin-top: 6px; }
+    .agent-approval-reason {
+      width: 100%;
+      min-height: 28px;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 12px;
+      box-sizing: border-box;
+    }
+
+    .agent-skill-card,
+    .agent-task-proposal,
+    .agent-task-summary {
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: var(--brand-soft);
+      padding: 8px;
+      margin: 4px 0;
+      font-size: 12px;
+      color: var(--text-main);
+    }
+
+    .agent-skill-card-text,
+    .agent-task-proposal-text { margin: 0 0 4px; }
+    .agent-task-proposal-prompt { margin: 0 0 4px; font-size: 11px; color: var(--text-secondary); }
+
+    .agent-task-summary-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+
+    .agent-task-suggestions {
+      margin: 6px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 4px;
+    }
+    .agent-task-suggestions li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .agent-task-suggestion-text { flex: 1; min-width: 0; }
+
+    .agent-task-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 6px 8px;
+      background: var(--surface);
+    }
+
+    .agent-task-row-main {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      text-align: left;
+      display: grid;
+      gap: 2px;
+      padding: 2px;
+    }
+
+    .agent-task-row-title { font-size: 12px; color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-task-row-progress { font-size: 10px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-task-row-status { font-size: 10px; color: var(--text-secondary); }
+    .agent-task-row-status[data-tone="running"],
+    .agent-task-row-status[data-tone="pending"] { color: var(--brand); }
+    .agent-task-row-status[data-tone="completed"] { color: #22a06b; }
+    .agent-task-row-status[data-tone="failed"],
+    .agent-task-row-status[data-tone="interrupted"] { color: var(--danger); }
+
+    .agent-task-detail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-main);
+      margin-bottom: 4px;
+    }
+    .agent-task-detail-prompt { font-size: 11px; color: var(--text-secondary); margin: 0 0 6px; }
+    .agent-task-detail-report { margin-top: 6px; font-size: 12px; }
+    .agent-tasks-empty { font-size: 12px; color: var(--text-secondary); text-align: center; margin: 18px 0; }
   </style>
 </head>
 <body>
@@ -6218,28 +6553,50 @@
 
       <section id="viewChat" class="view" role="tabpanel" aria-labelledby="tabChat" hidden>
         <div class="chat-shell">
-          <div class="chat-pending">
-            <div class="chat-pending-head">
-              <button id="chatPendingToggle" class="chat-pending-toggle" type="button" aria-expanded="false" aria-controls="chatPendingList">
-                <span>待聊确认 <span id="chatPendingCount" class="chat-pending-count">0</span></span>
-              </button>
-              <label class="chat-badge-pref" title="开启后「对话」标签上显示待聊数量红点；关闭则始终隐藏。默认关闭。">
-                <input id="chatPendingBadgeToggle" type="checkbox">
-                <span class="chat-badge-pref-switch" aria-hidden="true"></span>
-                <span id="chatPendingBadgeToggleText" class="chat-badge-pref-text">标签红点</span>
-              </label>
-            </div>
-            <div id="chatPendingList" class="chat-pending-list" aria-label="待聊确认列表" hidden></div>
+          <div class="chat-subtabs" role="tablist" aria-label="对话视图切换">
+            <button id="chatSubtabChat" class="chat-subtab is-active" type="button" role="tab" aria-selected="true" data-chat-subtab="chat">对话</button>
+            <button id="chatSubtabSessions" class="chat-subtab" type="button" role="tab" aria-selected="false" data-chat-subtab="sessions">会话</button>
+            <button id="chatSubtabTasks" class="chat-subtab" type="button" role="tab" aria-selected="false" data-chat-subtab="tasks">任务 <span id="chatTasksBadge" class="tab-count-badge" hidden>0</span></button>
           </div>
-          <div id="chatMessages" class="chat-messages" role="region" aria-label="口味对话记录" tabindex="0"></div>
-          <form id="chatForm" class="chat-form">
-            <label class="chat-input-shell">
-              <span class="chat-input-label">写点你的想法和口味</span>
-              <textarea id="chatInput" class="chat-input" rows="2" placeholder="说说你最近怎么想——你是什么样的人、怎么想、喜欢什么、讨厌什么，为什么会停下来，都可以直接说。"></textarea>
-            </label>
-            <button id="chatSendButton" class="action-button action-primary" type="submit">发出去</button>
-            <p id="chatStatus" class="chat-status" aria-live="polite"></p>
-          </form>
+          <div id="chatSubpanelChat" class="chat-subpanel">
+            <div class="chat-agent-bar">
+              <select id="chatSkillSelect" class="chat-skill-select" aria-label="对话角色" title="对话角色（skill）"></select>
+              <button id="chatApprovalsToggle" class="chat-pending-toggle chat-approvals-toggle" type="button" aria-expanded="false" aria-controls="chatApprovalsList" hidden>
+                <span>待审批 <span id="chatApprovalsCount" class="chat-pending-count">0</span></span>
+              </button>
+            </div>
+            <div id="chatApprovalsList" class="chat-pending-list chat-approvals-list" aria-label="待审批操作列表" hidden></div>
+            <div class="chat-pending">
+              <div class="chat-pending-head">
+                <button id="chatPendingToggle" class="chat-pending-toggle" type="button" aria-expanded="false" aria-controls="chatPendingList">
+                  <span>待聊确认 <span id="chatPendingCount" class="chat-pending-count">0</span></span>
+                </button>
+                <label class="chat-badge-pref" title="开启后「对话」标签上显示待聊数量红点；关闭则始终隐藏。默认关闭。">
+                  <input id="chatPendingBadgeToggle" type="checkbox">
+                  <span class="chat-badge-pref-switch" aria-hidden="true"></span>
+                  <span id="chatPendingBadgeToggleText" class="chat-badge-pref-text">标签红点</span>
+                </label>
+              </div>
+              <div id="chatPendingList" class="chat-pending-list" aria-label="待聊确认列表" hidden></div>
+            </div>
+            <div id="chatMessages" class="chat-messages" role="region" aria-label="口味对话记录" tabindex="0"></div>
+            <form id="chatForm" class="chat-form">
+              <label class="chat-input-shell">
+                <span class="chat-input-label">写点你的想法和口味</span>
+                <textarea id="chatInput" class="chat-input" rows="2" placeholder="说说你最近怎么想——你是什么样的人、怎么想、喜欢什么、讨厌什么，为什么会停下来，都可以直接说。"></textarea>
+              </label>
+              <button id="chatSendButton" class="action-button action-primary" type="submit">发出去</button>
+              <p id="chatStatus" class="chat-status" aria-live="polite"></p>
+            </form>
+          </div>
+          <div id="chatSubpanelSessions" class="chat-subpanel" hidden>
+            <button id="chatSessionNew" class="action-button action-secondary" type="button">新建会话</button>
+            <div id="chatSessionsList" class="chat-sessions-list" aria-label="会话列表"></div>
+          </div>
+          <div id="chatSubpanelTasks" class="chat-subpanel" hidden>
+            <div id="chatTasksList" class="chat-tasks-list" aria-label="任务列表"></div>
+            <div id="chatTaskDetail" class="chat-task-detail" hidden></div>
+          </div>
         </div>
       </section>
     </main>
@@ -7982,6 +8339,7 @@
        read their globals. -->
   <script src="shared/dialogue-confirmation.js"></script>
   <script src="shared/source-status.js"></script>
+  <script src="shared/agent-chat.js"></script>
   <script type="module" src="popup.js"></script>
 </body>
 </html>
