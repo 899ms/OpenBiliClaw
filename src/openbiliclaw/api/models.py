@@ -2137,6 +2137,60 @@ class ChatSessionDetailResponse(BaseModel):
     offset: int
 
 
+# --- Durable agent task center models (「聊一聊」 M6) ---
+
+
+class AgentTaskCreateIn(BaseModel):
+    """Start one durable background task.
+
+    ``prompt`` is the complete instruction the unattended background agent
+    sees. ``session_id`` (default session when empty) is the originating
+    conversation that receives the completion summary message; ``skill``
+    optionally binds a chat skill's persona and tool whitelist (intersected
+    with the read-only permission ceiling).
+    """
+
+    prompt: str
+    session_id: str = ""
+    title: str = ""
+    skill: str = ""
+
+
+class AgentTaskOut(BaseModel):
+    """One durable background task.
+
+    ``suggestions`` is the structured write-proposal list
+    (``{action, summary, payload}``) the user confirms back in the
+    conversation. ``steps`` (the execution log) is only populated by the
+    detail endpoint; list responses leave it empty.
+    """
+
+    task_id: str
+    session_id: str = ""
+    title: str = ""
+    prompt: str = ""
+    status: str = "pending"
+    skill: str = ""
+    progress: str = ""
+    report: str = ""
+    suggestions: list[dict[str, object]] = Field(default_factory=list)
+    steps: list[dict[str, object]] = Field(default_factory=list)
+    error: str = ""
+    created_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    updated_at: str = ""
+
+
+class AgentTaskListResponse(BaseModel):
+    """Agent task list page (newest first), without step logs."""
+
+    items: list[AgentTaskOut]
+    total: int
+    limit: int
+    offset: int
+
+
 # --- Configuration API models ---
 
 

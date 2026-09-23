@@ -1699,13 +1699,16 @@ class AgentConfig:
     ``session_title_enabled`` (M5) lets the backend auto-title new chat
     sessions from their first message via the LLM (falling back to a
     truncated message prefix); when false the truncated prefix is used
-    directly.
+    directly.  ``task_max_steps`` (M6) caps the hops of one durable
+    background task run — background tasks get a smaller budget than
+    interactive turns since they run unattended.
     """
 
     loop_enabled: bool = True
     loop_max_steps: int = 64
     tool_result_max_chars: int = 4000
     session_title_enabled: bool = True
+    task_max_steps: int = 32
 
 
 @dataclass
@@ -2681,6 +2684,12 @@ def _build_config(
             max_value=100000,
         ),
         session_title_enabled=bool(agent_raw.get("session_title_enabled", True)),
+        task_max_steps=_normalize_scheduler_int(
+            agent_raw.get("task_max_steps"),
+            default=32,
+            min_value=1,
+            max_value=256,
+        ),
     )
 
     api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
@@ -6252,6 +6261,10 @@ def _render_config_toml(
             "# (falling back to a truncated message prefix); when false the",
             "# truncated prefix is used directly without an LLM call.",
             f"session_title_enabled = {_toml_bool(config.agent.session_title_enabled)}",
+            "# 「聊一聊」 background task budget (M6). One durable background",
+            "# task run gets a smaller hop budget than interactive turns",
+            "# since it runs unattended with read-only tools.",
+            f"task_max_steps = {max(1, int(config.agent.task_max_steps))}",
             "",
         ]
     )

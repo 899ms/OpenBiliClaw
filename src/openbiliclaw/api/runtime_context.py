@@ -471,6 +471,10 @@ class RuntimeContext:
     # chat skill catalog (M4: builtin skills + data/skills/ overrides).
     agent_tool_registry: Any = None
     skill_catalog: Any = None
+    # Durable background task runner (「聊一聊」 M6); lazily built by the API
+    # layer and resolves loop/registry/catalog from this context at run start,
+    # so one instance survives the hot-reload atomic swap.
+    agent_task_runner: Any = None
     # Wave 1: the one self-owned typed dialogue settlement queue. It is not in
     # cancel_all and uses pause/drain + exact permit handoff on hot reload.
     dialogue_settlement_queue: Any = None

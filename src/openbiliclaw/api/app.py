@@ -50,6 +50,9 @@ from starlette.background import BackgroundTask
 from openbiliclaw.api.models import (
     ActivityFeedItemOut,
     ActivityFeedResponse,
+    AgentTaskCreateIn,
+    AgentTaskListResponse,
+    AgentTaskOut,
     AutostartApplyIn,
     AutostartConfigOut,
     AutostartStatusOut,
@@ -261,7 +264,11 @@ from openbiliclaw.sources.platforms import (
 from openbiliclaw.sources.platforms import (
     infer_source_platform_from_url as _registry_infer_source_platform_from_url,
 )
-from openbiliclaw.storage.database import CONTENT_HISTORY_RETENTION_DAYS, DEFAULT_CHAT_SESSION_ID
+from openbiliclaw.storage.database import (
+    AGENT_TASK_TERMINAL_STATUSES,
+    CONTENT_HISTORY_RETENTION_DAYS,
+    DEFAULT_CHAT_SESSION_ID,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -2368,6 +2375,15 @@ def create_app(
     if initial_available is not None and callable(update_inventory):
         update_inventory(available=initial_available, target=_inventory_target())
     app.state.runtime_context = ctx
+    # 「聊一聊」 M6: agent tasks still pending/running belong to a dead
+    # process (in-flight asyncio tasks never survive a restart) — mark them
+    # interrupted once at boot; they are never auto-resumed.
+    with suppress(Exception):
+        interrupt_stale = getattr(
+            getattr(ctx, "database", None), "interrupt_stale_agent_tasks", None
+        )
+        if callable(interrupt_stale):
+            interrupt_stale()
     auto_replenishment_task: asyncio.Task[None] | None = None
     auto_replenishment_started_at = 0.0
     first_page_topup_attempted_at = 0.0
@@ -4954,6 +4970,58 @@ def create_app(
         if row is None:
             raise HTTPException(status_code=404, detail="Chat session not found.")
         return requested
+
+    # --- Durable agent task center helpers (「聊一聊」 M6) ---
+
+    def _agent_task_db_method(name: str) -> Any:
+        method = _chat_db_method(name)
+        if method is None:
+            raise HTTPException(status_code=503, detail="Agent task storage not available.")
+        return method
+
+    def _resolve_agent_task_runner() -> Any:
+        """Return the runtime task runner, building it lazily if unwired.
+
+        The runner resolves loop/registry/catalog from ``ctx`` at run start,
+        so one instance survives the hot-reload atomic swap — same lazy
+        pattern as ``_resolve_skill_catalog``.
+        """
+        runner = getattr(ctx, "agent_task_runner", None)
+        if runner is not None:
+            return runner
+        from openbiliclaw.agent.tasks import AgentTaskRunner
+
+        database = getattr(ctx, "database", None)
+        if not callable(getattr(database, "create_agent_task", None)):
+            raise HTTPException(status_code=503, detail="Agent task storage not available.")
+        runner = AgentTaskRunner(
+            database,
+            runtime=ctx,
+            task_registry=getattr(ctx, "task_registry", None),
+        )
+        ctx.agent_task_runner = runner
+        return runner
+
+    def _normalize_agent_task(
+        row: Mapping[str, Any], *, include_steps: bool = True
+    ) -> AgentTaskOut:
+        return AgentTaskOut(
+            task_id=str(row.get("task_id", "")),
+            session_id=str(row.get("session_id", "") or ""),
+            title=str(row.get("title", "") or ""),
+            prompt=str(row.get("prompt", "") or ""),
+            status=str(row.get("status", "") or ""),
+            skill=str(row.get("skill", "") or ""),
+            progress=str(row.get("progress", "") or ""),
+            report=str(row.get("report", "") or ""),
+            suggestions=[dict(item) for item in row.get("suggestions", []) or []],
+            steps=[dict(step) for step in row.get("steps", []) or []] if include_steps else [],
+            error=str(row.get("error", "") or ""),
+            created_at=str(row.get("created_at", "") or ""),
+            started_at=str(row.get("started_at", "") or ""),
+            finished_at=str(row.get("finished_at", "") or ""),
+            updated_at=str(row.get("updated_at", "") or ""),
+        )
 
     def _resolve_chat_title_llm_service() -> Any | None:
         """Find an LLMService capable of the structured title task."""
@@ -11458,21 +11526,26 @@ def create_app(
         return catalog
 
     def _skill_tool_subset(skill_definition: Any, skill_catalog: Any) -> Any:
-        """Skill whitelist subset of the full registry + ``suggest_skill``.
+        """Skill whitelist subset of the full registry + meta tools.
 
         Returns ``None`` when no full registry is wired (legacy tests that
         inject only ``ctx.agent_loop``) so the loop falls back to its own
-        registry, preserving pre-M4 behavior.
+        registry, preserving pre-M4 behavior. Meta tools: ``suggest_skill``
+        (M4) proposes a skill switch; ``start_background_task`` (M6) proposes
+        a durable background task — both are read-level and side-effect free,
+        the user confirms via the frontend.
         """
         if skill_definition is None:
             return None
         base_registry = getattr(ctx, "agent_tool_registry", None)
         if base_registry is None:
             return None
+        from openbiliclaw.agent.tasks import build_start_background_task_tool
         from openbiliclaw.agent.tools import build_suggest_skill_tool
 
         subset = base_registry.subset(skill_definition.tools)
         subset.register(build_suggest_skill_tool(skill_catalog.names))
+        subset.register(build_start_background_task_tool(skill_catalog.names))
         return subset
 
     @app.get("/api/chat/skills")
@@ -13248,6 +13321,100 @@ def create_app(
         if row is None:  # pragma: no cover - guarded by the check above
             raise HTTPException(status_code=404, detail="Chat session not found.")
         return _normalize_chat_session(row)
+
+    # --- Durable agent task center endpoints (「聊一聊」 M6) ---
+
+    @app.post("/api/chat/tasks", response_model=AgentTaskOut)
+    async def create_agent_task_endpoint(payload: AgentTaskCreateIn) -> AgentTaskOut:
+        """Start one durable background task (read-only loop + suggestion list).
+
+        The task runs an ``AgentLoop`` with a read-only tool subset in a
+        ``BackgroundTaskRegistry``-tracked asyncio task; every loop event is
+        appended to the durable step log. Write actions are only produced as
+        structured suggestions; on completion a summary message is written
+        back into the originating chat session for the user to confirm.
+        """
+        prompt = payload.prompt.strip()
+        if not prompt:
+            raise HTTPException(status_code=422, detail="Task prompt is required.")
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        if agent_config is not None and not bool(getattr(agent_config, "loop_enabled", True)):
+            raise HTTPException(status_code=503, detail="Agent loop chat is disabled.")
+        session_id = payload.session_id.strip()
+        if session_id:
+            get_session = _chat_db_method("get_chat_session")
+            if not callable(get_session) or get_session(session_id) is None:
+                raise HTTPException(status_code=404, detail="Chat session not found.")
+        skill_name = payload.skill.strip()
+        if skill_name:
+            skill_catalog = _resolve_skill_catalog()
+            if skill_catalog.get(skill_name) is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Unknown chat skill: {skill_name}. "
+                        f"Available: {', '.join(skill_catalog.names)}"
+                    ),
+                )
+        runner = _resolve_agent_task_runner()
+        row = runner.start(
+            session_id=session_id,
+            prompt=prompt,
+            title=payload.title.strip(),
+            skill=skill_name,
+        )
+        return _normalize_agent_task(row)
+
+    @app.get("/api/chat/tasks", response_model=AgentTaskListResponse)
+    async def list_agent_tasks_endpoint(
+        status: str = Query(default=""),
+        session_id: str = Query(default=""),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> AgentTaskListResponse:
+        """List durable agent tasks (newest first), without step logs."""
+        list_tasks = _agent_task_db_method("list_agent_tasks")
+        try:
+            rows, total = list_tasks(
+                status=status.strip(),
+                session_id=session_id.strip(),
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return AgentTaskListResponse(
+            items=[_normalize_agent_task(row, include_steps=False) for row in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/api/chat/tasks/{task_id}", response_model=AgentTaskOut)
+    async def get_agent_task_endpoint(task_id: str) -> AgentTaskOut:
+        """Return one agent task including its execution step log."""
+        get_task = _agent_task_db_method("get_agent_task")
+        row = get_task(task_id.strip())
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        return _normalize_agent_task(row)
+
+    @app.post("/api/chat/tasks/{task_id}/cancel", response_model=AgentTaskOut)
+    async def cancel_agent_task_endpoint(task_id: str) -> AgentTaskOut:
+        """Cancel one active task; terminal tasks report 409."""
+        get_task = _agent_task_db_method("get_agent_task")
+        normalized_id = task_id.strip()
+        row = get_task(normalized_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        if str(row.get("status", "")) in AGENT_TASK_TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="Agent task is already terminal.")
+        runner = _resolve_agent_task_runner()
+        await runner.cancel(normalized_id)
+        row = get_task(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the check above
+            raise HTTPException(status_code=404, detail="Agent task not found.")
+        return _normalize_agent_task(row)
 
     @app.post("/api/interest-probes/trigger")
     async def trigger_interest_probe() -> dict[str, Any]:

@@ -6,7 +6,8 @@
 `docs/plans/2026-09-23-chat-agent-loop-design.md`）。M1 交付后端核心三件：
 JSON Schema 工具注册表、provider 原生 function calling、多跳 `AgentLoop`；
 M2 把 loop 接上了聊天 SSE 端点（真流式）；M3 交付 14 个 v1 标准工具；
-M4 交付 skill 体系（SKILL.md 加载、4 个内置 skill、会话绑定与切换）。
+M4 交付 skill 体系（SKILL.md 加载、4 个内置 skill、会话绑定与切换）；
+M6 交付任务中心（durable 后台任务 + 建议清单回报）；
 L2 审批门（M7）在后续里程碑落地。
 
 ## 已实现功能
@@ -20,6 +21,7 @@ L2 审批门（M7）在后续里程碑落地。
 | M2 SSE 流式接线 | ✅ | 新端点 `POST /api/chat/agent/stream` 真流式转发 `AgentEvent`；`SocraticDialogue.stream_agent_reply()` 复用 persona prompt / 历史 / 学习队列；loop 事件随 turn 落 `payload.agent_events`；旧 `/api/chat` 与 `/api/chat/stream`（假流式）保持共存 |
 | M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
 | M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
+| M6 任务中心（durable 后台任务） | ✅ | `agent/tasks.py`：`AgentTaskRunner` 在 `BackgroundTaskRegistry` 登记的 asyncio task 里跑**只读** AgentLoop（`filter_by_permission("read")` ∩ skill 白名单），事件逐步落 `agent_tasks.steps`；写动作只经 `propose_suggestion` 元工具产出结构化建议清单，完成后往来源会话写汇总消息；交互侧另有 `start_background_task` 元工具（同 suggest_skill 确认卡模式）。见下文「任务中心（M6）」 |
 | M7 L2 审批门 | ⬜ | hard_write 工具的对话内审批卡 |
 
 ## 模块结构
@@ -30,6 +32,7 @@ agent/
 ├── orchestrator.py      # 既有空壳编排器（未接 loop）
 ├── skill.py             # SkillDefinition / SkillCatalog / SKILL.md 加载（M4）
 │                        # + 既有 Skill ABC / SkillRegistry 代码技能骨架（未使用）
+├── tasks.py             # AgentTaskRunner + propose_suggestion / start_background_task 元工具（M6）
 ├── skills_builtin/      # 4 个内置 skill 的 SKILL.md（随包分发）
 │   ├── taste-companion/   # 口味伙伴（默认）
 │   ├── taste-explorer/    # 口味探寻师
@@ -230,6 +233,42 @@ tool_result / step_limit_reached / final）以相同 dict 结构写入
 `chat_turns.payload.agent_events`（JSON 数组，免迁移），历史回放直接读
 `GET /api/chat/turns/{turn_id}` 的 `payload.agent_events`。
 
+### 任务中心（M6，durable 后台任务）
+
+任务是一等公民持久对象（`agent_tasks` 表，见
+[storage 模块](storage.md)）：独立于来源会话存在，带完整执行记录，可审计；
+终态包括 `completed` / `failed` / `cancelled` / `interrupted`。
+
+**只读 + 建议清单**：`AgentTaskRunner`（`agent/tasks.py`）为每个任务构造一个
+独立 `AgentLoop`（共享当前 `llm_service`，caller=`agent.task`，**不**绕过全局
+并发闸），工具集 = `agent_tool_registry.filter_by_permission("read")`
+∩ skill 白名单（任务带 `skill` 时），另加 `propose_suggestion` 元工具。后台
+loop 物理上没有写工具；所有写意图只能通过 `propose_suggestion(action, summary,
+payload)` 落成结构化建议（action ∈ write_memory / submit_feedback / save_item /
+create_source / toggle_source / update_config，上限 20 条，summary ≤500 字符、
+payload ≤4000 字符）。
+
+**生命周期**：`POST /api/chat/tasks` 落 `pending` 行并立即在
+`BackgroundTaskRegistry.track("agent_task.<task_id>")` 登记的后台 asyncio task
+里开跑；每个 loop 事件实时 `append_agent_task_step` 落库（上限 200 条 /
+200_000 字符，单条 text ≤2000 字符，超限以 `steps_truncated` 标记收尾）；
+完成时 `set_agent_task_report` CAS 落 `completed` + report + suggestions，
+并往来源会话写一条 `payload.type="agent_task_summary"` 的 durable chat turn
+（`message` 为 `[后台任务完成] <标题>`，`reply` 为报告 + 建议清单导读），
+前端据此渲染汇总卡。LLM 异常落 `failed`（同样写回失败说明）；用户取消落
+`cancelled`（不写回消息）；**服务重启/热重载**把仍在 pending/running 的行标为
+`interrupted`（终态，重启恢复在 `create_app` 启动时执行一次；热重载经 registry
+cancel_all 取消在途任务，与显式取消区分靠 runner 的 `_cancel_requested` 集合）——
+任务**不自动恢复**，由用户从任务中心重新发起。
+
+**交互侧发起**：对话内 loop 可调用 `start_background_task(prompt, title?,
+skill?)` 元工具（read 级、无副作用，注册进每个 skill 子集，同 `suggest_skill`
+模式）：模型产出 `tool_call` 事件 → 前端渲染确认卡 → 用户确认后前端调
+`POST /api/chat/tasks` 真正发起。v1 不做 agent 自动派发。
+
+**预算**：后台任务用独立的更小跳数预算 `[agent] task_max_steps`（默认 32，
+交互对话是 `loop_max_steps` 64），超限同样走 step_limit_reached → 收尾汇报。
+
 ### 接线与并发
 
 - `RuntimeContext._rebuild_components()` 在构造 `SocraticDialogue` 后同步构造
@@ -248,4 +287,6 @@ tool_result / step_limit_reached / final）以相同 dict 结构写入
 ## 配置
 
 见 [配置参考](config.md) 的 `[agent]` 段：`loop_enabled`（默认 true）、
-`loop_max_steps`（默认 64）、`tool_result_max_chars`（默认 4000）。
+`loop_max_steps`（默认 64）、`tool_result_max_chars`（默认 4000）、
+`session_title_enabled`（默认 true）、`task_max_steps`（M6 后台任务跳数预算，
+默认 32）。

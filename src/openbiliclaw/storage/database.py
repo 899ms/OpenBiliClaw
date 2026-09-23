@@ -1016,13 +1016,42 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Schema version for migrations.  V4 adds the atomic temporal-evidence and
 # review lifecycle fields to both discovery candidates and cached content; V6
 # records the event source-attribution schema marker; V7 adds the chat
-# multi-session model (chat_sessions + chat_turns.session_id).
-_SCHEMA_VERSION = 7
+# multi-session model (chat_sessions + chat_turns.session_id); V8 adds the
+# durable background task center (agent_tasks).
+_SCHEMA_VERSION = 8
 
 # Well-known chat session that owns every legacy chat turn whose session_id
 # stayed ''.  It can be renamed but never archived.
 DEFAULT_CHAT_SESSION_ID = "default"
 DEFAULT_CHAT_SESSION_TITLE = "默认会话"
+
+# Durable agent task center (「聊一聊」 M6).  ``interrupted`` marks tasks a
+# previous process (or a config hot reload) left in pending/running; it is a
+# terminal state — tasks are never auto-resumed, the user re-issues them.
+AGENT_TASK_STATUSES: tuple[str, ...] = (
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+AGENT_TASK_TERMINAL_STATUSES: tuple[str, ...] = (
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+AGENT_TASK_ACTIVE_STATUSES: tuple[str, ...] = ("pending", "running")
+# Bounds on the JSON step log kept inline in agent_tasks.steps: at most 200
+# entries, each entry's text truncated to 2000 chars, and the serialized
+# array capped at 200_000 chars (a truncation marker replaces further
+# appends).  Reports and suggestions have their own caps.
+MAX_AGENT_TASK_STEPS = 200
+MAX_AGENT_TASK_STEP_CHARS = 2000
+MAX_AGENT_TASK_STEPS_CHARS = 200_000
+MAX_AGENT_TASK_SUGGESTIONS = 20
+MAX_AGENT_TASK_REPORT_CHARS = 8000
 
 # SQL fragment matching the turns owned by one chat session (sessions aliased
 # ``s``, turns aliased ``t``).  The default session also owns legacy turns
@@ -1312,6 +1341,34 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_archived_activity
     ON chat_sessions(archived, last_message_at);
+
+-- Durable background task center (「聊一聊」 M6).  Tasks are first-class
+-- persistent objects independent of their originating chat session: each
+-- row carries its read-only execution log (``steps``, a capped JSON array
+-- of AgentEvent-shaped entries), the final ``report`` and the structured
+-- ``suggestions`` list handed back to the conversation for user-confirmed
+-- writes.  ``started_at``/``finished_at`` bracket the actual execution.
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    task_id     TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    prompt      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    skill       TEXT NOT NULL DEFAULT '',
+    progress    TEXT NOT NULL DEFAULT '',
+    report      TEXT NOT NULL DEFAULT '',
+    suggestions TEXT NOT NULL DEFAULT '[]',
+    steps       TEXT NOT NULL DEFAULT '[]',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at  TIMESTAMP,
+    finished_at TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created
+    ON agent_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_created
+    ON agent_tasks(session_id, created_at);
 
 -- Atomic winner receipt for durable dialogue-confirmation cards. Dialogue
 -- effects are serialized by the single in-process settlement worker.
@@ -2290,6 +2347,7 @@ class Database:
         self._ensure_llm_usage_cache_columns()
         self._ensure_chat_turns_table()
         self._ensure_chat_sessions_table()
+        self._ensure_agent_tasks_table()
         self._ensure_profile_update_ledger_table()
         self._ensure_confusions_table()
         self._ensure_watch_later_table()
@@ -4074,6 +4132,288 @@ class Database:
             (serialized, turn_id),
         )
         return int(cursor.rowcount or 0) == 1
+
+    # --- Durable agent task center (「聊一聊」 M6) ---
+
+    @staticmethod
+    def _normalize_agent_task_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Decode the JSON columns while tolerating corrupt rows."""
+        normalized = dict(row)
+        json_list_fields: tuple[tuple[str, list[Any]], ...] = (
+            ("suggestions", []),
+            ("steps", []),
+        )
+        for field_name, fallback in json_list_fields:
+            raw_value = normalized.get(field_name, fallback)
+            try:
+                parsed = json.loads(str(raw_value)) if isinstance(raw_value, str) else raw_value
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = fallback
+            normalized[field_name] = parsed if isinstance(parsed, list) else []
+        for field_name in (
+            "session_id",
+            "title",
+            "prompt",
+            "status",
+            "skill",
+            "progress",
+            "report",
+            "error",
+        ):
+            normalized[field_name] = str(normalized.get(field_name, "") or "")
+        for field_name in ("created_at", "started_at", "finished_at", "updated_at"):
+            normalized[field_name] = str(normalized.get(field_name, "") or "")
+        return normalized
+
+    def create_agent_task(
+        self,
+        *,
+        task_id: str,
+        session_id: str = "",
+        title: str = "",
+        prompt: str,
+        skill: str = "",
+    ) -> dict[str, Any]:
+        """Create one durable background task in ``pending`` state (idempotent)."""
+        normalized_id = task_id.strip()
+        if not normalized_id:
+            raise ValueError("Agent task id is required")
+        if not prompt.strip():
+            raise ValueError("Agent task prompt is required")
+        self._execute_write(
+            """
+            INSERT OR IGNORE INTO agent_tasks (task_id, session_id, title, prompt, skill)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_id,
+                session_id.strip(),
+                title.strip(),
+                prompt.strip(),
+                skill.strip(),
+            ),
+        )
+        row = self.get_agent_task(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError(f"Failed to create agent task {normalized_id!r}")
+        return row
+
+    def get_agent_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return one agent task by id, with ``suggestions``/``steps`` decoded."""
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT task_id, session_id, title, prompt, status, skill, progress,
+                   report, suggestions, steps, error,
+                   created_at, started_at, finished_at, updated_at
+            FROM agent_tasks
+            WHERE task_id = ?
+            """,
+            (task_id.strip(),),
+        ).fetchone()
+        return self._normalize_agent_task_row(row) if row is not None else None
+
+    def list_agent_tasks(
+        self,
+        *,
+        status: str = "",
+        session_id: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page agent tasks (newest first) plus the total count.
+
+        ``status`` filters one exact status; ``session_id`` filters the
+        originating conversation.  Step logs are included per row — the API
+        layer strips them from list responses.
+        """
+        self._ensure_fresh_read()
+        clauses: list[str] = []
+        params: list[Any] = []
+        normalized_status = status.strip()
+        if normalized_status:
+            if normalized_status not in AGENT_TASK_STATUSES:
+                raise ValueError(f"Unknown agent task status: {normalized_status}")
+            clauses.append("status = ?")
+            params.append(normalized_status)
+        if session_id.strip():
+            clauses.append("session_id = ?")
+            params.append(session_id.strip())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM agent_tasks {where}",
+            params,
+        ).fetchone()
+        total = int(total_row["count"] if total_row is not None else 0)
+        cursor = self.conn.execute(
+            f"""
+            SELECT task_id, session_id, title, prompt, status, skill, progress,
+                   report, suggestions, steps, error,
+                   created_at, started_at, finished_at, updated_at
+            FROM agent_tasks
+            {where}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, max(1, int(limit)), max(0, int(offset))],
+        )
+        rows = [self._normalize_agent_task_row(row) for row in cursor.fetchall()]
+        return rows, total
+
+    def update_agent_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        progress: str = "",
+        error: str = "",
+        expected: tuple[str, ...] | None = None,
+    ) -> bool:
+        """CAS one task into ``status``; returns False when the transition lost.
+
+        ``expected`` defaults to the active states (pending/running) so
+        terminal rows are never overwritten.  Entering ``running`` stamps
+        ``started_at``; entering any terminal status stamps ``finished_at``.
+        """
+        if status not in AGENT_TASK_STATUSES:
+            raise ValueError(f"Unknown agent task status: {status}")
+        allowed = expected if expected is not None else AGENT_TASK_ACTIVE_STATUSES
+        if not allowed:
+            return False
+        placeholders = ", ".join("?" for _ in allowed)
+        assignments = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+        params: list[Any] = [status]
+        if progress:
+            assignments.append("progress = ?")
+            params.append(progress)
+        if error or status in AGENT_TASK_TERMINAL_STATUSES:
+            assignments.append("error = ?")
+            params.append(error)
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)")
+        if status in AGENT_TASK_TERMINAL_STATUSES:
+            assignments.append("finished_at = CURRENT_TIMESTAMP")
+        cursor = self._execute_write(
+            f"""
+            UPDATE agent_tasks
+            SET {", ".join(assignments)}
+            WHERE task_id = ?
+              AND status IN ({placeholders})
+            """,
+            (*params, task_id.strip(), *allowed),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def append_agent_task_step(self, task_id: str, *, step: Mapping[str, object]) -> bool:
+        """Append one execution-log entry to a non-terminal task's step log.
+
+        Entries are ``AgentEvent.to_dict()``-shaped dicts with text truncated
+        to ``MAX_AGENT_TASK_STEP_CHARS``.  The log is bounded: once it reaches
+        ``MAX_AGENT_TASK_STEPS`` entries or ``MAX_AGENT_TASK_STEPS_CHARS``
+        serialized, further appends collapse into a single trailing
+        ``steps_truncated`` marker.  The task's ``progress`` summary follows
+        the latest step.
+        """
+        row = self.conn.execute(
+            "SELECT status, steps FROM agent_tasks WHERE task_id = ?",
+            (task_id.strip(),),
+        ).fetchone()
+        if row is None or str(row["status"] or "") in AGENT_TASK_TERMINAL_STATUSES:
+            return False
+        try:
+            steps = json.loads(str(row["steps"] or "[]"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            steps = []
+        if not isinstance(steps, list):
+            steps = []
+        entry = dict(step)
+        text = str(entry.get("text", "") or "")
+        if len(text) > MAX_AGENT_TASK_STEP_CHARS:
+            entry["text"] = text[:MAX_AGENT_TASK_STEP_CHARS] + "…（已截断）"
+            entry["truncated"] = True
+        steps.append(entry)
+        serialized = json.dumps(steps, ensure_ascii=False)
+        if len(steps) > MAX_AGENT_TASK_STEPS or len(serialized) > MAX_AGENT_TASK_STEPS_CHARS:
+            marker = {
+                "type": "steps_truncated",
+                "text": (
+                    f"执行记录已达上限（{MAX_AGENT_TASK_STEPS} 条 / "
+                    f"{MAX_AGENT_TASK_STEPS_CHARS} 字符），后续步骤省略。"
+                ),
+            }
+            steps = steps[: MAX_AGENT_TASK_STEPS - 1] + [marker]
+            serialized = json.dumps(steps, ensure_ascii=False)
+        progress = str(entry.get("summary", "") or "") or text[:120]
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET steps = ?,
+                progress = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+            """,
+            (serialized, progress, task_id.strip()),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def set_agent_task_report(
+        self,
+        task_id: str,
+        *,
+        report: str,
+        suggestions: list[Mapping[str, object]] | None = None,
+    ) -> bool:
+        """Publish the final report + suggestion list and complete the task.
+
+        CAS from the active states only, so a cancel or failure that landed
+        first is never overwritten by a late report.
+        """
+        trimmed_report = report.strip()
+        if len(trimmed_report) > MAX_AGENT_TASK_REPORT_CHARS:
+            trimmed_report = trimmed_report[:MAX_AGENT_TASK_REPORT_CHARS] + "…（报告已截断）"
+        normalized_suggestions = [
+            dict(item) for item in (suggestions or [])[:MAX_AGENT_TASK_SUGGESTIONS]
+        ]
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET status = 'completed',
+                report = ?,
+                suggestions = ?,
+                error = '',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+              AND status IN ('pending', 'running')
+            """,
+            (
+                trimmed_report,
+                json.dumps(normalized_suggestions, ensure_ascii=False),
+                task_id.strip(),
+            ),
+        )
+        return int(cursor.rowcount or 0) == 1
+
+    def interrupt_stale_agent_tasks(self) -> int:
+        """Mark tasks a previous process left active as ``interrupted``.
+
+        Called once at app startup: in-flight asyncio tasks never survive a
+        restart, so any row still pending/running belongs to a dead process.
+        Tasks are never auto-resumed — the user re-issues them from the task
+        center.  Returns the number of rows marked.
+        """
+        cursor = self._execute_write(
+            """
+            UPDATE agent_tasks
+            SET status = 'interrupted',
+                error = '服务重启或热重载中断了该任务，可从任务中心重新发起。',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('pending', 'running')
+            """,
+        )
+        return int(cursor.rowcount or 0)
 
     def try_create_card_settlement(
         self,
@@ -14492,6 +14832,32 @@ class Database:
                 ON chat_sessions(archived, last_message_at);
         """)
         self.ensure_default_chat_session()
+
+    def _ensure_agent_tasks_table(self) -> None:
+        """Create the durable agent task center for existing databases (M6)."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                task_id     TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL DEFAULT '',
+                title       TEXT NOT NULL DEFAULT '',
+                prompt      TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'pending',
+                skill       TEXT NOT NULL DEFAULT '',
+                progress    TEXT NOT NULL DEFAULT '',
+                report      TEXT NOT NULL DEFAULT '',
+                suggestions TEXT NOT NULL DEFAULT '[]',
+                steps       TEXT NOT NULL DEFAULT '[]',
+                error       TEXT NOT NULL DEFAULT '',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at  TIMESTAMP,
+                finished_at TIMESTAMP,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created
+                ON agent_tasks(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_created
+                ON agent_tasks(session_id, created_at);
+        """)
 
     def _migrate_card_settlements_to_wave_2(self) -> None:
         """Rebuild legacy claim/segment receipts into the Wave 2 winner schema."""

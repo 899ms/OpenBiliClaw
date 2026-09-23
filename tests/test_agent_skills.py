@@ -23,6 +23,7 @@ from openbiliclaw.agent.skill import (
     load_skill_catalog,
     parse_skill_md,
 )
+from openbiliclaw.agent.tasks import START_BACKGROUND_TASK_TOOL_NAME
 from openbiliclaw.agent.tools import (
     SUGGEST_SKILL_TOOL_NAME,
     AgentToolContext,
@@ -410,7 +411,8 @@ def test_stream_endpoint_defaults_to_taste_companion(tmp_path: Path) -> None:
     tools = call["tools"]
     assert tools is not None
     assert set(tools.names) == BUILTIN_TOOL_WHITELISTS["taste-companion"] | {
-        SUGGEST_SKILL_TOOL_NAME
+        SUGGEST_SKILL_TOOL_NAME,
+        START_BACKGROUND_TASK_TOOL_NAME,
     }
     # Hard-write tools are excluded from the default skill.
     assert "update_config" not in tools.names
@@ -433,7 +435,8 @@ def test_stream_endpoint_with_explicit_skill(tmp_path: Path) -> None:
     call = dialogue.agent_calls[0]
     assert call["skill"].name == "system-steward"
     assert set(call["tools"].names) == BUILTIN_TOOL_WHITELISTS["system-steward"] | {
-        SUGGEST_SKILL_TOOL_NAME
+        SUGGEST_SKILL_TOOL_NAME,
+        START_BACKGROUND_TASK_TOOL_NAME,
     }
 
 
