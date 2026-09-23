@@ -2,6 +2,14 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M10：收尾集成与全量质量门（2026-09-23，feat/chat-agent-loop）
+
+- **桌面静态资源指纹补齐**：`_desktop_asset_version()` 指纹列表与 `?v=` 注入覆盖 M8 新增的 `web/desktop/assets/js/chat-agent-core.js`（此前只有 app.js / app.css / classic.css 与两个 shared 模块参与指纹，chat-agent-core.js 升级后可能被浏览器缓存旧版）；`test_desktop_web_index_cache_busts_static_assets` 补断言。
+- **`ChatTurnIn` 保留键补齐（汇总卡防伪造）**：server-owned 保留键新增 `agent_task_summary` / `task_id` / `task_status`，并按值拒绝 `payload.type="agent_task_summary"`——M6 的后台任务汇总卡此前可被客户端经 `POST /api/chat/turns` 伪造；回归 `test_chat_turn_rejects_client_forged_agent_task_summary`。
+- **`agent.chat` / `agent.task` 归入交互流量**：M6 后台任务 loop 的 caller=`agent.task` 此前落入 maintenance，推荐池为空时会被 `RefillAdmissionSemaphore` park 最长 300s；用户显式发起的任务（与交互对话 `agent.chat` 一样）不是 daemon maintenance，现归入 interactive 类（仅过 total gate、不参与空库存 park），并消除未知 caller 告警。回归 `test_agent_loop_callers_are_not_parked_by_empty_inventory` + `test_confirmed_interactive_callers`。
+- **全量质量门**：`ruff format --check`（本分支触碰文件）/ `ruff check src/ tests/` / `mypy src/` / `pytest` 全量 / `extension` npm test · typecheck · build / `node --test tests/js/` / `openbiliclaw config-show` 冒烟通过；既有失败（`tests/test_desktop_web_list_stability_e2e.py`、`extension/tests/popup-api.test.ts` 的 `startChatTurn posts durable chat turn metadata`）与 main 表现一致，不在本分支处理。
+- **文档同步**：`docs/architecture.md` / `docs/spec.md` / `docs/architecture-overview.md` 补 chat agent loop 车道与 `agent/` 模块职责；`docs/modules/llm.md`（交互 caller 清单）/ `docs/modules/agent.md`（任务流量分级 + 汇总卡 server-owned）/ `docs/modules/api.md`（`POST /api/chat/turns` 保留键清单）同步；设计文档状态更新为「已实现」。
+
 ## 聊一聊 Agent Loop M8：桌面 Web 前端（2026-09-23，feat/chat-agent-loop）
 
 - **桌面纯逻辑层 `web/desktop/assets/js/chat-agent-core.js`（新）**：暴露 `globalThis.OpenBiliClawChatAgentCore`（兼 `module.exports` 供 node:test），无 DOM 依赖。三件能力：`createSseParser()` 增量 SSE 帧解析（event 名 = AgentEvent type，容忍分片/CRLF/多行 data/注释行）；`createAgentProcess()` + `applyAgentEvent()` / `buildAgentProcess()` 把事件流或历史 turn 的 `payload.agent_events` 归约为过程视图模型（steps 配对 thinking/tool_call/tool_result、approval_request → approval_result 审批结局、step_limit_reached、final、error）；以及全量 markup 渲染器（过程折叠组件、审批卡、skill 建议卡、后台任务确认卡、会话列表、任务列表/详情、建议清单、skill 选择浮层），全部 `data-*` 钩子由 `app.js` 事件委托接线。

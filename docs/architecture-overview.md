@@ -10,7 +10,7 @@ Android / iOS 原生 App（内嵌 tsnet）→ 用户 tailnet → 电脑端 Go ts
 电脑无需系统 Tailscale；首版无 Funnel/Serve，Tailnet ACL 外建议再开应用密码
 Web / Linux / macOS / Windows Flutter 客户端不在此应用内 tsnet 支持范围
 
-interactive（对话 / 配置探测）───────────────────────┐
+interactive（对话 / 配置探测 / agent.chat / agent.task）───────┐
                                                     ├─ runtime total gate (default 4) ─ 有序实例链 ─ Provider 适配
 background ─ background admission (default 3) ──────┘
              ├─ refill: expression > evaluation > supply
@@ -70,6 +70,8 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 ┌──────────────────────▼─────────────────────────┐
 │                  Agent 编排层                    │
 │ Skill · 对话 · Runtime · 反馈 10s 可撤销提交屏障    │
+│ 聊一聊 agent loop：多跳工具循环 · skill 人设/白名单 · │
+│ L2 审批门 · durable 任务中心（只读 + 建议清单）      │
 ├─────────┬──────────┬───────────┬───────────────┤
 │  Soul   │  Memory  │ Discovery │ Recommendation │
 │ 灵魂画像 │ 五层记忆  │多源发现+准入│   推荐与表达     │
@@ -138,6 +140,8 @@ Agent 宿主（OpenClaw / Hermes / WorkBuddy）
 
 Web/API durable → rowid 顺序回复 worker → app-stable 对话 lease(max active 1) → SocraticDialogue(queued) → 可见 CAS
 惊喜/legacy/兴趣探针/避雷探针 chat ────────────────────────────────┘（回复与必要副作用同 lease）
+聊一聊 agent loop → 同一对话 lease → AgentLoop 多跳（agent.chat，交互车道）→ SSE 过程事件 + agent_events 回放
+                 hard_write → 审批卡 → approve 端点执行 + 台账；后台任务（agent.task，交互车道）只读 loop → 建议清单回写
 回复完成后的 11-kind learning/settlement → 独立 typed 结算单 worker（不属于 reply backlog）
 CLI/OpenClaw → SocraticDialogue(legacy_direct) → user+agent 历史 → 队列/guard 外 direct learning
 学习 → 绕过后台门禁、保留总并发 ── 新避雷：共享清池 → content_cache

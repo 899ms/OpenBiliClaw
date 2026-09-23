@@ -2,7 +2,7 @@
 
 - 日期：2026-09-23
 - 分支：`feat/chat-agent-loop`
-- 状态：设计已与需求方逐轮确认（grilling 三轮），本文档是最终共识 + 实施拆分。
+- 状态：**已实现**（M1–M10 全部完成于本分支，2026-09-23）。本文档是最终共识 + 实施拆分；文末「实现偏差校正」记录与最终实现的出入。
 
 ## 1. 定位与交互形态
 
@@ -102,3 +102,13 @@ v1 标准集约 10–12 个工具，从 OpenClaw 能力清单（`integrations/op
 - L1 写（记忆/反馈）对话内生效；L2 动作弹审批卡，批准后执行并记 ledger；
 - 后台任务从对话发起，任务中心可见，完成后回报建议清单；
 - 三端 UI 可用；`pytest`、`mypy src/`、`ruff check src/ tests/` 通过。
+
+## 11. 实现偏差校正（M10 收尾时核对）
+
+- **工具数量**：§3 估「10–12 个」；实际 v1 标准集 15 个（read 8 / soft_write 3 / hard_write 3 + list_sources），另加 3 个元工具（`suggest_skill` / `start_background_task` / `propose_suggestion`）。
+- **L2 审批骨架**：§4 计划「复用假设卡片/pending-confirmation 骨架」；最终实现为独立的 `ApprovalStore`（`{data_dir}/chat_approvals.json` 单文件状态机 + `profile_update_ledger` 审计），未改动 pending-confirmation 链路。
+- **后台任务预算**：§1 写「后台任务另有 token 预算」；实际落地为独立跳数预算 `[agent] task_max_steps`（默认 32），未实现 token 预算。
+- **skill 目录**：§9 M4 关键文件写 `skills/builtin/`；实际内置 skill 位于 `src/openbiliclaw/agent/skills_builtin/`（随 wheel / PyInstaller datas 分发），用户目录仍是 `{data_dir}/skills/`。
+- **Claude/Gemini 原生 FC**：§2 列为「次之」；M1 只交付 `openai_compatible` 原生 FC，Claude/Gemini 及其余 provider 仍走 prompt 级 JSON 模拟兜底（符合「保留兜底」的底线要求）。
+- **口味探寻师**：§5 计划「现有 SocraticDialogue 逻辑改造而来」；实现为 skill 人设叠加在共享 socratic system prompt 上（`_layer_skill_system_prompt()`），假设卡片与结算队列保留在既有链路，未做逻辑搬迁。
+- **流量分级（M10 修补）**：后台任务 caller=`agent.task` 最初落入 maintenance 类，空库存时会被 park；M10 将 `agent.chat` / `agent.task` 归入交互流量（见 `llm/concurrency.py` `_INTERACTIVE_CALLERS`）。

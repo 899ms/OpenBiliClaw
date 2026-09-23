@@ -20,7 +20,7 @@ native Android/iOS App（内嵌 tsnet）→ tailnet → app-owned Go tsnet helpe
 local Desktop Web / extension Settings → PUT /api/config(write-only Auth/OAuth + tag)
                                       → private one-shot stage → helper stdin ────────┘
 
-interactive (dialogue / config probe) ──────────────┐
+interactive (dialogue / config probe / agent.chat / agent.task) ┐
                                                     ├─ runtime total gate (default 4) ─ ordered instance chain ─ adapter
 background ─ background admission (default 3) ──────┘
              ├─ refill: expression > evaluation > supply
@@ -102,6 +102,13 @@ dialogue entries → app-stable execution lease(max active 1; reload pause/drain
                    → visible completion CAS; transient/cancel → pending + bounded in-place retry
                    explicit invalid → failed CAS
   direct chat/probes → same lease through response + ctx-dependent side effects
+  chat agent loop (「聊一聊」) → POST /api/chat/agent/stream → same dialogue lease
+                 → AgentLoop(caller=agent.chat, interactive lane) multi-hop tool calling
+                 → SSE thinking/tool_call/tool_result/approval_request/final → payload.agent_events replay
+                 → hard_write call → ApprovalStore pending card → approve endpoint re-dispatch + ledger audit
+                 → start_background_task confirm → POST /api/chat/tasks
+                 → read-only AgentLoop(caller=agent.task, interactive lane) → steps → agent_tasks
+                 → terminal report → agent_task_summary durable turn in source session
   post-reply learning/object settlement (independent of reply backlog)
                  → typed settlement queue[all 11 declared kinds] → one actual worker + guard
                  → pending≤3 → user open(no cooldown) | system 12h+object 72h
@@ -225,6 +232,7 @@ tag-owned 节点；`GET /api/config` 只投影 staged 布尔值和安全运行�
 - 任务调度和策略决策
 - 多步推理和自省优化
 - Skill 注册、发现和调度
+- 「聊一聊」chat agent loop（2026-09-23）：`loop.py` 多跳工具调用循环（`[agent] loop_max_steps` 默认 64 跳，事件流 thinking/tool_call/tool_result/approval_request/final）；`tools/` JSON Schema 工具注册表 + read / soft_write / hard_write 三级权限与 v1 标准工具集；`skill.py` SKILL.md 目录加载（`skills_builtin/` 内置 4 个 + `{data_dir}/skills/` 用户覆盖）；`tasks.py` durable 后台任务中心（只读 loop + `propose_suggestion` 建议清单 + 完成后 `agent_task_summary` 汇总 turn 回写来源会话）；`approvals.py` L2 hard_write 审批门（`chat_approvals.json` 单文件状态机 pending → approved → executed / rejected / expired，决策写 `profile_update_ledger` 审计）
 
 ### Integrations (`integrations/`)
 - 对外系统接入边界

@@ -293,7 +293,7 @@ main API ← validated response inventory / 2s active-client inventory watcher
          → runtime-stream pool_updated → client total + source badges
 legacy outbox → immutable claimed batches → DB commit → acknowledge only that batch
 
-interactive (dialogue / config probe) ──────────────┐
+interactive (dialogue / config probe / agent.chat / agent.task) ┐
                                                     ├─ runtime total gate (default 4) ─ ordered instance chain ─ adapter
 background ─ background admission (default 3) ──────┘
              ├─ refill: expression > evaluation > supply
@@ -358,6 +358,13 @@ dialogue entries → app-stable execution lease(max active 1; reload pause/drain
                  → visible completion CAS
                    transient/cancel → pending + bounded in-place retry; explicit invalid → failed CAS
   direct chat/probes → same lease through response + ctx-dependent side effects
+  chat agent loop (「聊一聊」) → POST /api/chat/agent/stream → same dialogue lease
+                 → AgentLoop(caller=agent.chat, interactive lane) multi-hop tool calling
+                 → SSE thinking/tool_call/tool_result/approval_request/final → payload.agent_events replay
+                 → hard_write call → ApprovalStore pending card → approve endpoint re-dispatch + ledger audit
+                 → start_background_task confirm → POST /api/chat/tasks
+                 → read-only AgentLoop(caller=agent.task, interactive lane) → steps → agent_tasks
+                 → terminal report → agent_task_summary durable turn in source session
 post-reply learning/object settlement (independent of durable reply backlog)
                  → typed settlement queue[all 11 declared kinds] → one actual worker + guard
                  → pending≤3 → user open(no cooldown) | system 12h+object 72h

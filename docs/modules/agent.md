@@ -301,7 +301,9 @@ token / secret / password / credential / sessdata / access_key）或路径/存�
 
 **只读 + 建议清单**：`AgentTaskRunner`（`agent/tasks.py`）为每个任务构造一个
 独立 `AgentLoop`（共享当前 `llm_service`，caller=`agent.task`，**不**绕过全局
-并发闸），工具集 = `agent_tool_registry.filter_by_permission("read")`
+并发闸；M10 起 `agent.chat` / `agent.task` 归入交互流量类，用户显式发起的
+任务不会被空库存的 refill 保留位 park，见
+[llm 模块](llm.md#runtime-全局补货优先-admission)），工具集 = `agent_tool_registry.filter_by_permission("read")`
 ∩ skill 白名单（任务带 `skill` 时），另加 `propose_suggestion` 元工具。后台
 loop 物理上没有写工具；所有写意图只能通过 `propose_suggestion(action, summary,
 payload)` 落成结构化建议（action ∈ write_memory / submit_feedback / save_item /
@@ -315,7 +317,9 @@ payload ≤4000 字符）。
 完成时 `set_agent_task_report` CAS 落 `completed` + report + suggestions，
 并往来源会话写一条 `payload.type="agent_task_summary"` 的 durable chat turn
 （`message` 为 `[后台任务完成] <标题>`，`reply` 为报告 + 建议清单导读），
-前端据此渲染汇总卡。LLM 异常落 `failed`（同样写回失败说明）；用户取消落
+前端据此渲染汇总卡。汇总卡 payload 是 server-owned：`ChatTurnIn` 保留键拒绝
+客户端提交 `agent_task_summary` / `task_id` / `task_status` 或
+`payload.type="agent_task_summary"`（M10），防止伪造任务汇总卡。LLM 异常落 `failed`（同样写回失败说明）；用户取消落
 `cancelled`（不写回消息）；**服务重启/热重载**把仍在 pending/running 的行标为
 `interrupted`（终态，重启恢复在 `create_app` 启动时执行一次；热重载经 registry
 cancel_all 取消在途任务，与显式取消区分靠 runner 的 `_cancel_requested` 集合）——
