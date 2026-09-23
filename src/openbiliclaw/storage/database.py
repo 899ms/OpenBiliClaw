@@ -1015,8 +1015,24 @@ _EXPLORE_HIGH_RISK_CLUSTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # Schema version for migrations.  V4 adds the atomic temporal-evidence and
 # review lifecycle fields to both discovery candidates and cached content; V6
-# records the event source-attribution schema marker.
-_SCHEMA_VERSION = 6
+# records the event source-attribution schema marker; V7 adds the chat
+# multi-session model (chat_sessions + chat_turns.session_id).
+_SCHEMA_VERSION = 7
+
+# Well-known chat session that owns every legacy chat turn whose session_id
+# stayed ''.  It can be renamed but never archived.
+DEFAULT_CHAT_SESSION_ID = "default"
+DEFAULT_CHAT_SESSION_TITLE = "默认会话"
+
+# SQL fragment matching the turns owned by one chat session (sessions aliased
+# ``s``, turns aliased ``t``).  The default session also owns legacy turns
+# whose session_id stayed ''.
+_CHAT_SESSION_TURN_MEMBERSHIP_SQL = (
+    f"(s.session_id = '{DEFAULT_CHAT_SESSION_ID}' "
+    f"AND t.session_id IN ('', '{DEFAULT_CHAT_SESSION_ID}')) "
+    f"OR (s.session_id <> '{DEFAULT_CHAT_SESSION_ID}' "
+    "AND t.session_id = s.session_id)"
+)
 
 _SCHEMA_SQL = """
 -- Event log (behavioral data from browser extension)
@@ -1272,6 +1288,7 @@ CREATE TABLE IF NOT EXISTS chat_turns (
     reply         TEXT NOT NULL DEFAULT '',
     error         TEXT NOT NULL DEFAULT '',
     payload       TEXT NOT NULL DEFAULT '{}',
+    session_id    TEXT NOT NULL DEFAULT '',
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -1279,6 +1296,22 @@ CREATE INDEX IF NOT EXISTS idx_chat_turns_session_created
     ON chat_turns(session, created_at, turn_id);
 CREATE INDEX IF NOT EXISTS idx_chat_turns_scope_subject
     ON chat_turns(scope, subject_id, created_at);
+
+-- Multi-session chat model (「聊一聊」 M5).  One row per user-facing
+-- conversation; chat_turns.session_id links turns to it.  ``metadata`` is
+-- an additive JSON bag reserved for skill bindings (M4).  The well-known
+-- row ``default`` owns every legacy turn whose session_id stayed ''.
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    session_id      TEXT PRIMARY KEY,
+    title           TEXT NOT NULL DEFAULT '',
+    archived        INTEGER NOT NULL DEFAULT 0,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_message_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_archived_activity
+    ON chat_sessions(archived, last_message_at);
 
 -- Atomic winner receipt for durable dialogue-confirmation cards. Dialogue
 -- effects are serialized by the single in-process settlement worker.
@@ -2256,6 +2289,7 @@ class Database:
         self._normalize_legacy_style_keys()
         self._ensure_llm_usage_cache_columns()
         self._ensure_chat_turns_table()
+        self._ensure_chat_sessions_table()
         self._ensure_profile_update_ledger_table()
         self._ensure_confusions_table()
         self._ensure_watch_later_table()
@@ -3291,6 +3325,229 @@ class Database:
     # Durable popup chat turns
     # ------------------------------------------------------------------
 
+    # --- Multi-session chat model (「聊一聊」 M5) ---
+
+    @staticmethod
+    def _normalize_chat_session_row(row: sqlite3.Row) -> dict[str, Any]:
+        """Decode the additive session metadata while tolerating corrupt rows."""
+        normalized = dict(row)
+        raw_metadata = normalized.get("metadata", "{}")
+        try:
+            parsed = json.loads(str(raw_metadata or "{}"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = {}
+        normalized["metadata"] = parsed if isinstance(parsed, dict) else {}
+        normalized["archived"] = bool(normalized.get("archived", 0))
+        normalized["title"] = str(normalized.get("title", "") or "")
+        normalized["last_message_at"] = str(normalized.get("last_message_at", "") or "")
+        return normalized
+
+    def ensure_default_chat_session(self) -> dict[str, Any]:
+        """Create the well-known default chat session if missing and return it."""
+        self._execute_write(
+            "INSERT OR IGNORE INTO chat_sessions (session_id, title) VALUES (?, ?)",
+            (DEFAULT_CHAT_SESSION_ID, DEFAULT_CHAT_SESSION_TITLE),
+        )
+        row = self.get_chat_session(DEFAULT_CHAT_SESSION_ID)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError("Failed to create the default chat session")
+        return row
+
+    def create_chat_session(
+        self,
+        *,
+        session_id: str,
+        title: str = "",
+        metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Create one chat session; idempotent on the session id."""
+        normalized_id = session_id.strip()
+        if not normalized_id:
+            raise ValueError("Chat session id is required")
+        serialized_metadata = json.dumps(dict(metadata or {}), ensure_ascii=False, sort_keys=True)
+        self._execute_write(
+            """
+            INSERT OR IGNORE INTO chat_sessions (session_id, title, metadata)
+            VALUES (?, ?, ?)
+            """,
+            (normalized_id, title.strip(), serialized_metadata),
+        )
+        row = self.get_chat_session(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the INSERT above
+            raise RuntimeError(f"Failed to create chat session {normalized_id!r}")
+        return row
+
+    def get_chat_session(self, session_id: str) -> dict[str, Any] | None:
+        """Return one chat session by id."""
+        self._ensure_fresh_read()
+        row = self.conn.execute(
+            """
+            SELECT session_id, title, archived, metadata,
+                   created_at, updated_at, last_message_at
+            FROM chat_sessions
+            WHERE session_id = ?
+            """,
+            (session_id.strip(),),
+        ).fetchone()
+        return self._normalize_chat_session_row(row) if row is not None else None
+
+    def list_chat_sessions(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return chat sessions ordered by latest activity, most recent first.
+
+        Each row carries a ``last_message_preview`` (truncated latest user
+        message), ``turn_count``, ``active_turns`` (pending replies) and the
+        computed ``last_activity`` used for ordering.  The default session
+        also owns legacy turns whose ``session_id`` stayed ''.
+        """
+        self._ensure_fresh_read()
+        membership = _CHAT_SESSION_TURN_MEMBERSHIP_SQL
+        cursor = self.conn.execute(
+            f"""
+            SELECT s.session_id, s.title, s.archived, s.metadata,
+                   s.created_at, s.updated_at, s.last_message_at,
+                   (SELECT COUNT(*) FROM chat_turns t WHERE {membership}) AS turn_count,
+                   (SELECT COUNT(*) FROM chat_turns t
+                    WHERE ({membership}) AND t.status = 'pending') AS active_turns,
+                   (SELECT substr(t.message, 1, 120) FROM chat_turns t
+                    WHERE {membership}
+                    ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1) AS last_message_preview,
+                   COALESCE(
+                       s.last_message_at,
+                       (SELECT MAX(t.created_at) FROM chat_turns t WHERE {membership}),
+                       s.updated_at
+                   ) AS last_activity
+            FROM chat_sessions s
+            WHERE (? OR s.archived = 0)
+            ORDER BY last_activity DESC, turn_count DESC, s.session_id ASC
+            LIMIT ?
+            """,
+            (1 if include_archived else 0, max(1, int(limit))),
+        )
+        return [self._normalize_chat_session_row(row) for row in cursor.fetchall()]
+
+    def get_chat_session_summary(self, session_id: str) -> dict[str, Any] | None:
+        """Return one session with the same aggregate preview fields as the list."""
+        self._ensure_fresh_read()
+        membership = _CHAT_SESSION_TURN_MEMBERSHIP_SQL
+        row = self.conn.execute(
+            f"""
+            SELECT s.session_id, s.title, s.archived, s.metadata,
+                   s.created_at, s.updated_at, s.last_message_at,
+                   (SELECT COUNT(*) FROM chat_turns t WHERE {membership}) AS turn_count,
+                   (SELECT COUNT(*) FROM chat_turns t
+                    WHERE ({membership}) AND t.status = 'pending') AS active_turns,
+                   (SELECT substr(t.message, 1, 120) FROM chat_turns t
+                    WHERE {membership}
+                    ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1) AS last_message_preview,
+                   COALESCE(
+                       s.last_message_at,
+                       (SELECT MAX(t.created_at) FROM chat_turns t WHERE {membership}),
+                       s.updated_at
+                   ) AS last_activity
+            FROM chat_sessions s
+            WHERE s.session_id = ?
+            """,
+            (session_id.strip(),),
+        ).fetchone()
+        return self._normalize_chat_session_row(row) if row is not None else None
+
+    def rename_chat_session(self, session_id: str, *, title: str) -> bool:
+        """Rename one chat session; returns False when the session is missing."""
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET title = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (title.strip(), session_id.strip()),
+        )
+        return cursor.rowcount == 1
+
+    def set_chat_session_archived(self, session_id: str, *, archived: bool) -> bool:
+        """Archive/unarchive one session. The default session cannot be archived."""
+        normalized_id = session_id.strip()
+        if normalized_id == DEFAULT_CHAT_SESSION_ID and archived:
+            raise ValueError("The default chat session cannot be archived")
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET archived = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (1 if archived else 0, normalized_id),
+        )
+        return cursor.rowcount == 1
+
+    def touch_chat_session(self, session_id: str) -> bool:
+        """Bump one session's last-message activity timestamp."""
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET last_message_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (session_id.strip(),),
+        )
+        return cursor.rowcount == 1
+
+    def list_chat_turns_by_session(
+        self,
+        *,
+        session_id: str,
+        scope: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page one session's turns (newest page first) plus the total count.
+
+        Rows come back in ascending display order within the requested page,
+        matching ``list_chat_turns``.  The default session includes legacy
+        turns whose ``session_id`` stayed ''.
+        """
+        self._ensure_fresh_read()
+        normalized_id = session_id.strip()
+        if normalized_id == DEFAULT_CHAT_SESSION_ID:
+            clauses = ["session_id IN ('', ?)"]
+            params: list[Any] = [DEFAULT_CHAT_SESSION_ID]
+        else:
+            clauses = ["session_id = ?"]
+            params = [normalized_id]
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        where = " AND ".join(clauses)
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM chat_turns WHERE {where}",
+            params,
+        ).fetchone()
+        total = int(total_row["count"] if total_row is not None else 0)
+        cursor = self.conn.execute(
+            f"""
+            SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
+                   status, reply, error, payload, session_id, created_at, updated_at
+            FROM (
+                SELECT rowid AS insertion_rowid,
+                       turn_id, session, scope, subject_id, subject_title,
+                       reply_to_turn_id, message,
+                       status, reply, error, payload, session_id, created_at, updated_at
+                FROM chat_turns
+                WHERE {where}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ? OFFSET ?
+            )
+            ORDER BY created_at ASC, insertion_rowid ASC
+            """,
+            [*params, max(1, int(limit)), max(0, int(offset))],
+        )
+        rows = [self._normalize_chat_turn_row(row) for row in cursor.fetchall()]
+        return rows, total
+
     def create_chat_turn(
         self,
         *,
@@ -3302,16 +3559,18 @@ class Database:
         subject_title: str = "",
         reply_to_turn_id: str = "",
         payload: Mapping[str, object] | None = None,
+        session_id: str = "",
     ) -> dict[str, Any]:
         """Create a pending popup chat turn if it does not already exist."""
         serialized_payload = json.dumps(dict(payload or {}), ensure_ascii=False, sort_keys=True)
+        normalized_session_id = session_id.strip()
         self._execute_write(
             """
             INSERT OR IGNORE INTO chat_turns (
                 turn_id, session, scope, subject_id, subject_title, reply_to_turn_id,
-                message, status, payload
+                message, status, payload, session_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 turn_id,
@@ -3322,8 +3581,11 @@ class Database:
                 reply_to_turn_id or "",
                 message,
                 serialized_payload,
+                normalized_session_id,
             ),
         )
+        if normalized_session_id:
+            self.touch_chat_session(normalized_session_id)
         row = self.get_chat_turn(turn_id)
         if row is None:
             raise RuntimeError(f"Failed to create chat turn {turn_id!r}")
@@ -3531,6 +3793,8 @@ class Database:
             """,
             (reply, turn_id),
         )
+        if cursor.rowcount == 1:
+            self._touch_chat_session_for_turn(turn_id)
         return cursor.rowcount == 1
 
     def fail_chat_turn(self, turn_id: str, *, error: str, reply: str = "") -> bool:
@@ -3547,7 +3811,23 @@ class Database:
             """,
             (reply, error, turn_id),
         )
+        if cursor.rowcount == 1:
+            self._touch_chat_session_for_turn(turn_id)
         return cursor.rowcount == 1
+
+    def _touch_chat_session_for_turn(self, turn_id: str) -> None:
+        """Reflect a turn outcome in its owning session's activity timestamp."""
+        self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET last_message_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = (
+                SELECT session_id FROM chat_turns WHERE turn_id = ?
+            )
+            """,
+            (turn_id,),
+        )
 
     def get_chat_turn(self, turn_id: str) -> dict[str, Any] | None:
         """Return one durable popup chat turn by id."""
@@ -3556,7 +3836,7 @@ class Database:
             """
             SELECT turn_id, session, scope, subject_id, subject_title,
                    reply_to_turn_id, message,
-                   status, reply, error, payload, created_at, updated_at
+                   status, reply, error, payload, session_id, created_at, updated_at
             FROM chat_turns
             WHERE turn_id = ?
             """,
@@ -3583,12 +3863,12 @@ class Database:
         cursor = self.conn.execute(
             f"""
             SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
-                   status, reply, error, payload, created_at, updated_at
+                   status, reply, error, payload, session_id, created_at, updated_at
             FROM (
                    SELECT rowid AS insertion_rowid,
                        turn_id, session, scope, subject_id, subject_title,
                        reply_to_turn_id, message,
-                       status, reply, error, payload, created_at, updated_at
+                       status, reply, error, payload, session_id, created_at, updated_at
                 FROM chat_turns
                 WHERE {" AND ".join(clauses)}
                 ORDER BY created_at DESC, rowid DESC
@@ -3635,7 +3915,7 @@ class Database:
         cursor = self.conn.execute(
             f"""
             SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
-                   status, reply, error, payload, created_at, updated_at
+                   status, reply, error, payload, session_id, created_at, updated_at
             FROM chat_turns
             {where}
             ORDER BY created_at DESC, rowid DESC
@@ -3706,6 +3986,9 @@ class Database:
         # Additive relation migration: legacy rows have no relation and must
         # hydrate as explicitly unbound rather than crashing or guessing.
         normalized.setdefault("reply_to_turn_id", "")
+        # Additive multi-session migration (M5): legacy rows have no owning
+        # session entity and are read through the default session.
+        normalized.setdefault("session_id", "")
         return normalized
 
     def update_chat_turn_payload_state(
@@ -14180,10 +14463,35 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE chat_turns ADD COLUMN reply_to_turn_id TEXT NOT NULL DEFAULT ''"
             )
+        if "session_id" not in columns:
+            self.conn.execute(
+                "ALTER TABLE chat_turns ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+            )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_turns_reply_to ON chat_turns(reply_to_turn_id)"
         )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_turns_session_id_created "
+            "ON chat_turns(session_id, created_at, turn_id)"
+        )
         self._migrate_card_settlements_to_wave_2()
+
+    def _ensure_chat_sessions_table(self) -> None:
+        """Create the multi-session chat model for existing databases (M5)."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id      TEXT PRIMARY KEY,
+                title           TEXT NOT NULL DEFAULT '',
+                archived        INTEGER NOT NULL DEFAULT 0,
+                metadata        TEXT NOT NULL DEFAULT '{}',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_message_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_archived_activity
+                ON chat_sessions(archived, last_message_at);
+        """)
+        self.ensure_default_chat_session()
 
     def _migrate_card_settlements_to_wave_2(self) -> None:
         """Rebuild legacy claim/segment receipts into the Wave 2 winner schema."""

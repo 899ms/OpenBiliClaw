@@ -812,6 +812,9 @@ satisfaction_filter_enabled = true
 # loop_max_steps = 64
 # 单次工具结果回填进 prompt 的字符上限，超出部分截断。
 # tool_result_max_chars = 4000
+# 多会话标题自动生成（M5）：开启后新会话首条消息会用 LLM 生成简短标题
+# （失败时回退为消息截断前缀）；关闭则直接使用截断前缀、不发起 LLM 调用。
+# session_title_enabled = true
 
 
 # ──────────────────────────────────────────────────────────────

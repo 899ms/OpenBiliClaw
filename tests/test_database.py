@@ -37,7 +37,7 @@ def test_event_source_schema_is_present_in_fresh_database(tmp_path: Path) -> Non
     assert columns["source_platform"] == "''"
     assert columns["content_id"] == "''"
     assert columns["source_confidence"] == "'legacy_unknown'"
-    assert db.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 6
+    assert db.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 7
     indexes = {
         str(row["name"])
         for row in db.conn.execute("PRAGMA index_list(events)").fetchall()

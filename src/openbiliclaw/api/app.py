@@ -61,6 +61,11 @@ from openbiliclaw.api.models import (
     BilibiliCookieResponse,
     BilibiliSourceConfigOut,
     ChatIn,
+    ChatSessionCreateIn,
+    ChatSessionDetailResponse,
+    ChatSessionListResponse,
+    ChatSessionOut,
+    ChatSessionPatchIn,
     ChatTurnIn,
     ChatTurnListResponse,
     ChatTurnOut,
@@ -256,7 +261,7 @@ from openbiliclaw.sources.platforms import (
 from openbiliclaw.sources.platforms import (
     infer_source_platform_from_url as _registry_infer_source_platform_from_url,
 )
-from openbiliclaw.storage.database import CONTENT_HISTORY_RETENTION_DAYS
+from openbiliclaw.storage.database import CONTENT_HISTORY_RETENTION_DAYS, DEFAULT_CHAT_SESSION_ID
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -1903,6 +1908,59 @@ def _is_masked_proxy_echo(value: str) -> bool:
 # page snappy instead of blocking on every tap.
 _BILIBILI_RELATED_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _BILIBILI_RELATED_CACHE_TTL_SECONDS = 300.0
+
+# --- Chat session auto-titling (「聊一聊」 M5) ---
+
+SESSION_TITLE_MAX_CHARS = 30
+_SESSION_TITLE_TIMEOUT_SECONDS = 30.0
+_SESSION_TITLE_SYSTEM_PROMPT = (
+    "你是会话标题生成器。根据用户的首条消息，生成一个简短的中文会话标题。"
+    "要求：不超过 20 个字符，概括话题，不带标点后缀，不带引号。"
+    '输出 JSON：{"title": "..."}'
+)
+# Strong references for fire-and-forget title tasks so the event loop cannot
+# garbage-collect them mid-flight.
+_SESSION_TITLE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def fallback_session_title(message: str) -> str:
+    """Truncated first-message prefix used when LLM titling is unavailable."""
+    return " ".join(message.split())[:SESSION_TITLE_MAX_CHARS]
+
+
+async def generate_session_title(
+    llm_service: Any,
+    message: str,
+    *,
+    timeout: float = _SESSION_TITLE_TIMEOUT_SECONDS,
+) -> str:
+    """Generate a short session title via the LLM, falling back to a prefix.
+
+    The call goes through ``LLMService.complete_structured_task`` so it
+    shares the app-wide LLM concurrency gate; any failure (timeout, provider
+    error, malformed JSON, empty title) falls back to the truncated first
+    message instead of propagating.
+    """
+    try:
+        response = await asyncio.wait_for(
+            llm_service.complete_structured_task(
+                system_instruction=_SESSION_TITLE_SYSTEM_PROMPT,
+                user_input=message[:2000],
+                temperature=0.3,
+                max_tokens=256,
+                caller="chat.session_title",
+                reasoning_effort="",
+                inject_core_memory=False,
+            ),
+            timeout=timeout,
+        )
+        parsed = json.loads(str(response.content))
+        title = str(parsed.get("title", "")).strip().strip("\"' ").strip()
+        if title:
+            return title[:SESSION_TITLE_MAX_CHARS]
+    except Exception:
+        logger.debug("Chat session title generation failed; using fallback", exc_info=True)
+    return fallback_session_title(message)
 
 
 def create_app(
@@ -4048,6 +4106,7 @@ def create_app(
             status=str(row.get("status", "pending") or "pending"),
             error=str(row.get("error", "") or ""),
             payload=payload,
+            session_id=str(row.get("session_id", "") or ""),
             created_at=str(row.get("created_at", "") or ""),
             updated_at=str(row.get("updated_at", "") or ""),
         )
@@ -4283,6 +4342,11 @@ def create_app(
             return False
         if str(row.get("session", "popup") or "popup") != (payload.session.strip() or "popup"):
             return False
+        # Explicit multi-session ownership (M5) is part of request identity;
+        # omitted session_id stays compatible with pre-M5 rows.
+        requested_session_id = payload.session_id.strip()
+        if requested_session_id and str(row.get("session_id", "") or "") != requested_session_id:
+            return False
         if str(row.get("reply_to_turn_id", "") or "") != payload.reply_to_turn_id.strip():
             return False
         if stored_binding is None or stored_binding.mode.value != "bound":
@@ -4506,6 +4570,7 @@ def create_app(
         *,
         turn_id: str,
         structured_payload: dict[str, object] | None = None,
+        session_id: str = "",
     ) -> dict[str, Any]:
         create_chat_turn = _chat_db_method("create_chat_turn")
         if create_chat_turn is not None:
@@ -4520,6 +4585,7 @@ def create_app(
                     message=payload.message.strip(),
                     reply_to_turn_id=payload.reply_to_turn_id.strip(),
                     payload=structured_payload or {},
+                    session_id=session_id,
                 ),
             )
 
@@ -4540,6 +4606,7 @@ def create_app(
                 "reply": "",
                 "error": "",
                 "payload": dict(structured_payload or {}),
+                "session_id": session_id,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -4853,6 +4920,84 @@ def create_app(
             row["payload"] = stored_payload
         stored_payload["agent_events"] = [dict(event) for event in events]
         return True
+
+    # --- Multi-session chat helpers (「聊一聊」 M5) ---
+
+    def _chat_session_db_method(name: str) -> Any:
+        method = _chat_db_method(name)
+        if method is None:
+            raise HTTPException(status_code=503, detail="Chat session storage not available.")
+        return method
+
+    def _normalize_chat_session(row: Mapping[str, Any]) -> ChatSessionOut:
+        return ChatSessionOut(
+            session_id=str(row.get("session_id", "")),
+            title=str(row.get("title", "") or ""),
+            archived=bool(row.get("archived", False)),
+            metadata=dict(row.get("metadata", {}) or {}),
+            turn_count=int(row.get("turn_count", 0) or 0),
+            active_turns=int(row.get("active_turns", 0) or 0),
+            last_message_preview=str(row.get("last_message_preview", "") or ""),
+            last_activity=str(row.get("last_activity", "") or ""),
+            created_at=str(row.get("created_at", "") or ""),
+            updated_at=str(row.get("updated_at", "") or ""),
+            last_message_at=str(row.get("last_message_at", "") or ""),
+        )
+
+    def _resolve_chat_session_id(payload: ChatTurnIn) -> str:
+        """Resolve the owning session for a new turn, validating explicit ids."""
+        requested = payload.session_id.strip()
+        if not requested:
+            return DEFAULT_CHAT_SESSION_ID
+        getter = _chat_db_method("get_chat_session")
+        row = getter(requested) if callable(getter) else None
+        if row is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        return requested
+
+    def _resolve_chat_title_llm_service() -> Any | None:
+        """Find an LLMService capable of the structured title task."""
+        for owner in (
+            getattr(ctx, "agent_loop", None),
+            getattr(ctx, "dialogue", None),
+            getattr(ctx, "soul_engine", None),
+        ):
+            service = getattr(owner, "_llm", None) or getattr(owner, "_llm_service", None)
+            if service is not None and callable(getattr(service, "complete_structured_task", None)):
+                return service
+        return None
+
+    def _schedule_session_title(session_id: str, message: str) -> None:
+        """Best-effort async auto-title for a session's first chat message."""
+        get_session = _chat_db_method("get_chat_session")
+        rename_session = _chat_db_method("rename_chat_session")
+        if not callable(get_session) or not callable(rename_session):
+            return
+        row = get_session(session_id)
+        if row is None or str(row.get("title", "")).strip():
+            return
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        enabled = bool(getattr(agent_config, "session_title_enabled", True))
+        llm_service = _resolve_chat_title_llm_service() if enabled else None
+
+        async def _run() -> None:
+            try:
+                if llm_service is not None:
+                    title = await generate_session_title(llm_service, message)
+                else:
+                    title = fallback_session_title(message)
+            except Exception:
+                logger.debug("Chat session title task failed", exc_info=True)
+                title = fallback_session_title(message)
+            current = get_session(session_id)
+            if current is None or str(current.get("title", "")).strip():
+                # A manual rename or another writer already set the title.
+                return
+            rename_session(session_id, title=title)
+
+        task = asyncio.create_task(_run())
+        _SESSION_TITLE_TASKS.add(task)
+        task.add_done_callback(_SESSION_TITLE_TASKS.discard)
 
     def _health_profile_ready() -> bool | None:
         soul_engine = getattr(ctx, "soul_engine", None)
@@ -11189,6 +11334,12 @@ def create_app(
         Switching skills mid-session is just sending the next turn with a
         different ``skill`` value; the agent itself can only *propose* a
         switch via the ``suggest_skill`` tool call.
+
+        M5 multi-session: the optional ``session_id`` selects the owning
+        conversation (default session when empty, 404 when unknown). With a
+        durable ``turn_id`` the turn's own ``session_id`` (assigned at
+        ``POST /api/chat/turns``) wins; the terminal ``done`` event always
+        carries the effective ``session_id``.
         """
         message = payload.message.strip()
         if not message:
@@ -11213,6 +11364,16 @@ def create_app(
         turn_id = payload.turn_id.strip()
         row = _get_chat_turn_row(turn_id) if turn_id else None
         turn = _normalize_chat_turn(row) if row else None
+        requested_session_id = payload.session_id.strip()
+        if turn is not None:
+            effective_session_id = turn.session_id or DEFAULT_CHAT_SESSION_ID
+        elif requested_session_id:
+            get_session = _chat_db_method("get_chat_session")
+            if callable(get_session) and get_session(requested_session_id) is None:
+                raise HTTPException(status_code=404, detail="Chat session not found.")
+            effective_session_id = requested_session_id
+        else:
+            effective_session_id = DEFAULT_CHAT_SESSION_ID
 
         async def _event_stream() -> AsyncIterator[str]:
             import json as _json
@@ -11266,6 +11427,7 @@ def create_app(
                     "reply": final_reply,
                     "turn_id": turn_id,
                     "skill": skill_definition.name if skill_definition is not None else "",
+                    "session_id": effective_session_id,
                 },
             )
 
@@ -12755,6 +12917,8 @@ def create_app(
                 chat_reply_scheduler.schedule(turn.turn_id)
             return turn
 
+        resolved_session_id = _resolve_chat_session_id(payload)
+
         if normalized_scope == "hypothesis":
             if payload.reply_to_turn_id.strip():
                 _dialogue_context_error(
@@ -12766,6 +12930,7 @@ def create_app(
                 payload,
                 turn_id=turn_id,
                 structured_payload=_hypothesis_card_payload(payload),
+                session_id=resolved_session_id,
             )
             _complete_chat_turn_row(turn_id, reply="")
             completed = _get_chat_turn_row(turn_id)
@@ -12840,9 +13005,12 @@ def create_app(
             canonical_request,
             turn_id=turn_id,
             structured_payload=structured_payload,
+            session_id=resolved_session_id,
         )
         if not payload.streaming:
             chat_reply_scheduler.schedule(turn_id)
+        if canonical_scope == "chat" and not payload.reply_to_turn_id.strip():
+            _schedule_session_title(resolved_session_id, message)
         return _normalize_chat_turn(row)
 
     @app.get("/api/chat/pending-confirmations", response_model=None)
@@ -13003,6 +13171,83 @@ def create_app(
         if turn.status == "pending":
             chat_reply_scheduler.schedule(turn.turn_id)
         return turn
+
+    # --- Multi-session chat endpoints (「聊一聊」 M5) ---
+
+    @app.post("/api/chat/sessions", response_model=ChatSessionOut)
+    async def create_chat_session(payload: ChatSessionCreateIn) -> ChatSessionOut:
+        """Create one chat conversation; title auto-generates on first message."""
+        create_session = _chat_session_db_method("create_chat_session")
+        session_id = payload.session_id.strip() or f"chat-{uuid.uuid4().hex}"
+        row = create_session(
+            session_id=session_id,
+            title=payload.title.strip(),
+            metadata=payload.metadata,
+        )
+        return _normalize_chat_session(row)
+
+    @app.get("/api/chat/sessions", response_model=ChatSessionListResponse)
+    async def list_chat_sessions(
+        include_archived: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> ChatSessionListResponse:
+        """List conversations by latest activity with previews and active counts."""
+        list_sessions = _chat_session_db_method("list_chat_sessions")
+        rows = list_sessions(include_archived=include_archived, limit=limit)
+        return ChatSessionListResponse(items=[_normalize_chat_session(row) for row in rows])
+
+    @app.get("/api/chat/sessions/{session_id}", response_model=ChatSessionDetailResponse)
+    async def get_chat_session_detail(
+        session_id: str,
+        scope: str = Query(default=""),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> ChatSessionDetailResponse:
+        """Return one conversation plus a page of its turns (display order)."""
+        get_summary = _chat_session_db_method("get_chat_session_summary")
+        list_by_session = _chat_session_db_method("list_chat_turns_by_session")
+        row = get_summary(session_id.strip())
+        if row is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        normalized_scope = _normalize_chat_scope(scope) if scope else ""
+        turns, total = list_by_session(
+            session_id=session_id.strip(),
+            scope=normalized_scope,
+            limit=limit,
+            offset=offset,
+        )
+        return ChatSessionDetailResponse(
+            session=_normalize_chat_session(row),
+            items=[_normalize_chat_turn(turn) for turn in turns],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.patch("/api/chat/sessions/{session_id}", response_model=ChatSessionOut)
+    async def update_chat_session(session_id: str, payload: ChatSessionPatchIn) -> ChatSessionOut:
+        """Rename and/or archive one conversation; the default session cannot be archived."""
+        get_session = _chat_session_db_method("get_chat_session")
+        get_summary = _chat_session_db_method("get_chat_session_summary")
+        normalized_id = session_id.strip()
+        if get_session(normalized_id) is None:
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        if payload.title is not None:
+            title = payload.title.strip()
+            if not title:
+                raise HTTPException(status_code=422, detail="Session title cannot be empty.")
+            _chat_session_db_method("rename_chat_session")(normalized_id, title=title)
+        if payload.archived is not None:
+            try:
+                _chat_session_db_method("set_chat_session_archived")(
+                    normalized_id, archived=payload.archived
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        row = get_summary(normalized_id)
+        if row is None:  # pragma: no cover - guarded by the check above
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        return _normalize_chat_session(row)
 
     @app.post("/api/interest-probes/trigger")
     async def trigger_interest_probe() -> dict[str, Any]:

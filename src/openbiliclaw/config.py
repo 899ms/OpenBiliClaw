@@ -1696,11 +1696,16 @@ class AgentConfig:
     hops per user turn; when exhausted the model is asked to wrap up and
     report progress. ``tool_result_max_chars`` bounds each tool result fed
     back into the prompt (longer results are truncated with a marker).
+    ``session_title_enabled`` (M5) lets the backend auto-title new chat
+    sessions from their first message via the LLM (falling back to a
+    truncated message prefix); when false the truncated prefix is used
+    directly.
     """
 
     loop_enabled: bool = True
     loop_max_steps: int = 64
     tool_result_max_chars: int = 4000
+    session_title_enabled: bool = True
 
 
 @dataclass
@@ -2675,6 +2680,7 @@ def _build_config(
             min_value=200,
             max_value=100000,
         ),
+        session_title_enabled=bool(agent_raw.get("session_title_enabled", True)),
     )
 
     api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
@@ -6241,6 +6247,11 @@ def _render_config_toml(
             "# Per-tool-result character budget fed back into the prompt;",
             "# longer results are truncated with a marker.",
             f"tool_result_max_chars = {max(200, int(config.agent.tool_result_max_chars))}",
+            "# 「聊一聊」 multi-session auto-titling (M5). When true, a new",
+            "# session's first message gets an LLM-generated short title",
+            "# (falling back to a truncated message prefix); when false the",
+            "# truncated prefix is used directly without an LLM call.",
+            f"session_title_enabled = {_toml_bool(config.agent.session_title_enabled)}",
             "",
         ]
     )

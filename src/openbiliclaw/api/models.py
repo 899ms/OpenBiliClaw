@@ -2002,6 +2002,9 @@ class ChatTurnIn(BaseModel):
     scope: str = "chat"
     subject_id: str = ""
     subject_title: str = ""
+    # Owning multi-session conversation (M5).  Empty resolves to the default
+    # chat session server-side at POST time.
+    session_id: str = ""
     # Chat skill binding (M4): empty means the default skill (口味伙伴).
     skill: str = ""
     # The only client-declared relation.  Canonical kind/ref/generation/title
@@ -2057,6 +2060,8 @@ class ChatTurnOut(BaseModel):
     status: str = "pending"
     error: str = ""
     payload: dict[str, object] = Field(default_factory=dict)
+    # Owning multi-session conversation (M5); '' marks pre-M5 legacy rows.
+    session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -2078,6 +2083,58 @@ class ChatTurnListResponse(BaseModel):
     """Durable popup chat history."""
 
     items: list[ChatTurnOut]
+
+
+# --- Multi-session chat models (「聊一聊」 M5) ---
+
+
+class ChatSessionCreateIn(BaseModel):
+    """Create one chat conversation. Empty ``session_id`` auto-generates one."""
+
+    session_id: str = ""
+    title: str = ""
+    # Additive metadata bag; reserved for the skill binding (M4).
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class ChatSessionPatchIn(BaseModel):
+    """Rename and/or archive one chat conversation."""
+
+    title: str | None = None
+    archived: bool | None = None
+
+
+class ChatSessionOut(BaseModel):
+    """One chat conversation with list-preview fields."""
+
+    session_id: str
+    title: str = ""
+    archived: bool = False
+    metadata: dict[str, object] = Field(default_factory=dict)
+    turn_count: int = 0
+    # Pending (in-flight) replies — the "active" indicator for the list UI.
+    active_turns: int = 0
+    last_message_preview: str = ""
+    last_activity: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    last_message_at: str = ""
+
+
+class ChatSessionListResponse(BaseModel):
+    """Chat conversation list ordered by latest activity."""
+
+    items: list[ChatSessionOut]
+
+
+class ChatSessionDetailResponse(BaseModel):
+    """One chat conversation plus a page of its turns."""
+
+    session: ChatSessionOut
+    items: list[ChatTurnOut]
+    total: int
+    limit: int
+    offset: int
 
 
 # --- Configuration API models ---
