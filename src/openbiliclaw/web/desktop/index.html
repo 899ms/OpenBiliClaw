@@ -291,17 +291,62 @@
             <span id="chatPendingBadgeToggleText">标签红点</span>
           </label>
         </div>
-        <div class="dialogue-pending">
-          <button id="desktopPendingToggle" type="button" aria-expanded="false" aria-controls="desktopPendingConfirmations">
-            <span class="dialogue-pending-toggle-title">待聊确认 <span class="dialogue-pending-toggle-count" id="desktopPendingCount">0</span></span>
-            <span class="dialogue-pending-toggle-chevron" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7 10 5 5 5-5"/></svg>
-            </span>
-          </button>
-          <div class="profile-card-list" id="desktopPendingConfirmations" aria-label="待聊确认列表" hidden></div>
+        <div class="chat-main">
+          <aside class="chat-side" id="chatSide" aria-label="会话与任务" hidden>
+            <div class="chat-side-head">
+              <button class="pill-btn primary" id="chatNewSessionBtn" type="button">＋ 新会话</button>
+            </div>
+            <div class="chat-session-list" id="chatSessionList" role="list" aria-label="会话列表"></div>
+            <div class="chat-side-foot">
+              <button class="chat-side-entry" id="chatTasksToggle" type="button" aria-expanded="false" aria-controls="chatTaskCenter">
+                <span>任务中心</span><span class="chat-side-badge" id="chatTasksBadge" hidden></span>
+              </button>
+              <button class="chat-side-entry" id="chatApprovalsToggle" type="button" aria-expanded="false" aria-controls="chatApprovalsPanel">
+                <span>待审批</span><span class="chat-side-badge" id="chatApprovalsBadge" hidden></span>
+              </button>
+              <button class="chat-side-archived" id="chatArchivedToggle" type="button" aria-pressed="false">显示已归档</button>
+            </div>
+          </aside>
+          <div class="chat-conversation">
+            <div class="chat-session-bar" id="chatSessionBar" hidden>
+              <button class="chat-side-toggle" id="chatSideToggle" type="button" aria-label="会话列表" aria-expanded="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+              </button>
+              <button class="chat-skill-chip" id="chatSkillChip" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="chatSkillPicker" title="点击切换对话角色">
+                <span class="chat-skill-icon" id="chatSkillIcon" aria-hidden="true">🧭</span>
+                <span id="chatSkillName">口味伙伴</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>
+              </button>
+              <span class="chat-session-name" id="chatSessionName"></span>
+            </div>
+            <div class="dialogue-pending">
+              <button id="desktopPendingToggle" type="button" aria-expanded="false" aria-controls="desktopPendingConfirmations">
+                <span class="dialogue-pending-toggle-title">待聊确认 <span class="dialogue-pending-toggle-count" id="desktopPendingCount">0</span></span>
+                <span class="dialogue-pending-toggle-chevron" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7 10 5 5 5-5"/></svg>
+                </span>
+              </button>
+              <div class="profile-card-list" id="desktopPendingConfirmations" aria-label="待聊确认列表" hidden></div>
+            </div>
+            <div class="chat-log" id="chatLog" role="region" aria-label="口味对话记录" tabindex="0"></div>
+            <form class="chat-input" id="chatForm"><input id="chatInput" aria-label="和阿B聊聊你的口味" placeholder="说说你最近怎么想——你是什么样的人、喜欢什么、讨厌什么，都可以直接说。"><button class="pill-btn primary" type="submit">发送</button></form>
+          </div>
         </div>
-        <div class="chat-log" id="chatLog" role="region" aria-label="口味对话记录" tabindex="0"></div>
-        <form class="chat-input" id="chatForm"><input id="chatInput" aria-label="和阿B聊聊你的口味" placeholder="说说你最近怎么想——你是什么样的人、喜欢什么、讨厌什么，都可以直接说。"><button class="pill-btn primary" type="submit">发送</button></form>
+        <div class="chat-popover" id="chatSkillPicker" role="dialog" aria-label="选择对话角色" hidden></div>
+        <div class="chat-drawer" id="chatTaskCenter" role="dialog" aria-label="任务中心" hidden>
+          <div class="chat-drawer-head">
+            <h3>任务中心</h3>
+            <button class="pill-btn" id="chatTaskCenterClose" type="button">关闭</button>
+          </div>
+          <div class="chat-drawer-body" id="chatTaskCenterBody"></div>
+        </div>
+        <div class="chat-drawer" id="chatApprovalsPanel" role="dialog" aria-label="待审批改动" hidden>
+          <div class="chat-drawer-head">
+            <h3>待审批</h3>
+            <button class="pill-btn" id="chatApprovalsClose" type="button">关闭</button>
+          </div>
+          <div class="chat-drawer-body" id="chatApprovalsBody"></div>
+        </div>
       </section>
 
       <section class="settings-page content-page" id="settingsPage" aria-label="后端设置" hidden>
@@ -1679,5 +1724,6 @@
        web/desktop. -->
   <script src="/shared/dialogue-confirmation.js" defer></script>
   <script src="/shared/source-status.js" defer></script>
+  <script src="/web/assets/js/chat-agent-core.js" defer></script>
   <script src="/web/assets/js/app.js" defer></script>
 </body></html>

@@ -9,6 +9,10 @@ M2 把 loop 接上了聊天 SSE 端点（真流式）；M3 交付 14 个 v1 标�
 M4 交付 skill 体系（SKILL.md 加载、4 个内置 skill、会话绑定与切换）；
 M6 交付任务中心（durable 后台任务 + 建议清单回报）；
 M7 交付 L2 审批门（hard_write 工具逐项审批 + 审计台账）；
+M8 交付桌面 Web 前端（`web/desktop/`）：agent loop 真流式过程展示
+（`assets/js/chat-agent-core.js` 桌面侧 SSE 解析与过程流渲染，503 回退旧
+假流式）、会话侧栏、skill 切换、审批卡与任务中心，详见
+[desktop-web 模块](desktop-web.md)；
 M9 交付移动 Web（`web/js/views/chat.js`）与插件 popup（`extension/popup/`）
 两端前端：agent loop 真流式过程展示（`web/shared/agent-chat.js` 共享 SSE 解析
 与过程流渲染，503 回退旧假流式）、会话列表、skill 切换、审批卡与任务中心，
