@@ -23,6 +23,7 @@ from .base import (
     LLMResponse,
     LLMResponseError,
     LLMTimeoutError,
+    LLMToolCallUnsupportedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,10 @@ class OpenAIProvider(LLMProvider):
         # "responses" → /v1/responses — needed by third-party gateways that
         # expose GPT models only through the Responses API (issue #72).
         self._api_flavor = api_flavor.strip().lower()
+        # Native function calling is implemented on the chat-completions
+        # flavor only (M1); responses-flavor instances use the service
+        # layer's prompt-simulation fallback.
+        self.supports_tool_calling = self._api_flavor != "responses"
         self._token_provider = token_provider
         self._timeout = timeout
         self._embedding_output_dimensionality = max(0, int(embedding_output_dimensionality or 0))
@@ -229,30 +234,7 @@ class OpenAIProvider(LLMProvider):
             if not content.strip():
                 raise self._empty_content_error(choice)
 
-        usage = None
-        if response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
-            # Normalize cache fields across the OpenAI-protocol family.
-            # OpenAI exposes `prompt_tokens_details.cached_tokens` since
-            # GPT-4o; DeepSeek injects `prompt_cache_hit_tokens` /
-            # `prompt_cache_miss_tokens` on the same usage object;
-            # Kimi / 通义 / 中转站 vary. We probe known fields and
-            # surface whichever the backend sent under the universal
-            # ``cached_input_tokens`` key. Downstream pricing /
-            # observability code reads only this normalized field.
-            cached = 0
-            details = getattr(response.usage, "prompt_tokens_details", None)
-            if details is not None:
-                cached = int(getattr(details, "cached_tokens", 0) or 0)
-            if not cached:
-                # DeepSeek explicit fields
-                cached = int(getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0)
-            if cached:
-                usage["cached_input_tokens"] = cached
+        usage = self._chat_usage(response)
 
         return LLMResponse(
             content=content,
@@ -261,6 +243,141 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
             raw=response,
         )
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> LLMResponse:
+        """Chat completion with OpenAI-native function calling.
+
+        Sends ``tools=[{"type": "function", ...}]`` plus ``tool_choice="auto"``
+        and normalizes ``message.tool_calls`` into ``LLMResponse.tool_calls``
+        entries of ``{"id", "name", "arguments", "arguments_raw"}``. A response
+        with tool calls and no text content is a valid result (unlike
+        ``complete()``, which raises on empty content).
+
+        The ``/v1/responses`` flavor is not wired for tool calling in M1;
+        those instances report ``supports_tool_calling = False`` and the
+        service layer falls back to prompt simulation.
+        """
+        if self._api_flavor == "responses":
+            raise LLMToolCallUnsupportedError(
+                f"{self._provider_name} (api_flavor=responses) has no native tool calling."
+            )
+        effective_model = (model or "").strip() or self._model
+        effective_reasoning_effort = self._effective_reasoning_effort(reasoning_effort)
+        kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        extra_headers = self._extra_headers()
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+        openai_effort = self._openai_reasoning_effort(
+            effective_model,
+            effective_reasoning_effort,
+        )
+        if openai_effort is not None:
+            kwargs["reasoning_effort"] = openai_effort
+        extra_body = self._extra_body(reasoning_effort=effective_reasoning_effort)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        response = await self._chat_request_with_temperature_compat(**kwargs)
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        tool_calls = self._parse_native_tool_calls(message)
+        if not content.strip() and not tool_calls:
+            raise self._empty_content_error(choice)
+
+        return LLMResponse(
+            content=content,
+            model=response.model,
+            provider=self._provider_name,
+            usage=self._chat_usage(response),
+            raw=response,
+            tool_calls=tool_calls or None,
+        )
+
+    @staticmethod
+    def _parse_native_tool_calls(message: Any) -> list[dict[str, Any]]:
+        """Normalize OpenAI ``message.tool_calls`` into plain dicts.
+
+        ``arguments`` arrives as a JSON string on the wire; parse failures
+        keep the raw payload in ``arguments_raw`` (with ``arguments={}``) so
+        the agent loop can feed the malformed call back to the model.
+        """
+        raw_calls = OpenAIProvider._read_message_field(message, "tool_calls")
+        if not isinstance(raw_calls, (list, tuple)):
+            return []
+        calls: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_calls):
+            function = (
+                raw.get("function") if isinstance(raw, dict) else getattr(raw, "function", None)
+            )
+            name = str(OpenAIProvider._read_message_field(function, "name") or "")
+            arguments_raw = str(OpenAIProvider._read_message_field(function, "arguments") or "")
+            raw_id = raw.get("id") if isinstance(raw, dict) else getattr(raw, "id", None)
+            call_id = str(raw_id or f"call_{index}")
+            arguments: dict[str, Any] = {}
+            if arguments_raw.strip():
+                try:
+                    parsed = json.loads(arguments_raw)
+                    if isinstance(parsed, dict):
+                        arguments = parsed
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Tool call %s returned malformed arguments JSON", name or call_id
+                    )
+            calls.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "arguments_raw": arguments_raw,
+                }
+            )
+        return calls
+
+    def _chat_usage(self, response: Any) -> dict[str, int] | None:
+        """Normalize a chat-completions usage object into the shared dict shape."""
+        if not response.usage:
+            return None
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
+        # Normalize cache fields across the OpenAI-protocol family.
+        # OpenAI exposes `prompt_tokens_details.cached_tokens` since
+        # GPT-4o; DeepSeek injects `prompt_cache_hit_tokens` /
+        # `prompt_cache_miss_tokens` on the same usage object;
+        # Kimi / 通义 / 中转站 vary. We probe known fields and
+        # surface whichever the backend sent under the universal
+        # ``cached_input_tokens`` key. Downstream pricing /
+        # observability code reads only this normalized field.
+        cached = 0
+        details = getattr(response.usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached = int(getattr(details, "cached_tokens", 0) or 0)
+        if not cached:
+            # DeepSeek explicit fields
+            cached = int(getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0)
+        if cached:
+            usage["cached_input_tokens"] = cached
+        return usage
 
     async def _complete_via_responses(
         self,
@@ -894,6 +1011,43 @@ class DeepSeekProvider(OpenAIProvider):
                 reasoning_effort="",
                 model=model,
             )
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> LLMResponse:
+        # Same thinking-budget floor as ``complete``: DeepSeek's max_tokens
+        # caps thinking + response combined, and a tool-calling turn still
+        # needs headroom for the reasoning phase before it can emit
+        # ``tool_calls``.
+        requested_effort = (
+            reasoning_effort if reasoning_effort is not None else self._reasoning_effort
+        ).strip()
+        effort = self._normalize_deepseek_effort(requested_effort)
+        if effort:
+            floor = _DEEPSEEK_THINKING_MAX_TOKENS_FLOOR.get(effort, 16384)
+            if max_tokens < floor:
+                logger.debug(
+                    "deepseek: bumping max_tokens from %s to %s for effort=%s",
+                    max_tokens,
+                    floor,
+                    effort,
+                )
+                max_tokens = floor
+        return await super().complete_with_tools(
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=effort,
+            model=model,
+        )
 
     def _extra_body(self, *, reasoning_effort: str | None = None) -> dict[str, Any]:
         requested = self._reasoning_effort if reasoning_effort is None else reasoning_effort

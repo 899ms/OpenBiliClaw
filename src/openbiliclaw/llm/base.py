@@ -87,6 +87,15 @@ class LLMFallbackError(LLMProviderError):
     """Raised when all candidate providers fail."""
 
 
+class LLMToolCallUnsupportedError(LLMProviderError):
+    """Raised when native tool calling is requested but no routed provider supports it.
+
+    ``LLMService`` catches this and falls back to the prompt-simulation
+    tool-calling path; it is part of the routing contract, not a user-facing
+    failure.
+    """
+
+
 def classify_llm_unavailability(exc: BaseException) -> str | None:
     """Classify an exception chain as an expected-transient LLM outage.
 
@@ -549,6 +558,12 @@ class LLMProvider(ABC):
     # vendors whose backend doesn't actually expose it.
     supports_embedding: bool = False
 
+    # Subclasses set True if they implement ``complete_with_tools()`` with
+    # native function calling (OpenAI-style ``tools=`` request field and
+    # ``message.tool_calls`` response parsing). Providers left at False are
+    # served by the service layer's prompt-simulation fallback instead.
+    supports_tool_calling: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -587,6 +602,38 @@ class LLMProvider(ABC):
             Standardized LLMResponse.
         """
         ...
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> LLMResponse:
+        """Send a chat completion request with native function calling.
+
+        Args:
+            messages: Chat messages in OpenAI format; may include assistant
+                messages with ``tool_calls`` and ``role="tool"`` results.
+            tools: OpenAI-format tool schemas
+                (``[{"type": "function", "function": {...}}]``).
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens in response.
+            reasoning_effort: Same contract as ``complete()``.
+            model: Optional per-call model override.
+
+        Returns:
+            LLMResponse with ``tool_calls`` populated when the model decided
+            to call tools; each call is normalized to
+            ``{"id", "name", "arguments", "arguments_raw"}``.
+
+        The default implementation raises ``LLMToolCallUnsupportedError``;
+        only providers that set ``supports_tool_calling = True`` override it.
+        """
+        raise LLMToolCallUnsupportedError(f"{self.name} does not implement native tool calling.")
 
     async def health_check(self) -> bool:
         """Check if the provider is accessible.
@@ -880,6 +927,184 @@ class LLMRegistry:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=json_mode,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            )
+            self._rate_limited_until.pop(target, None)
+            self._rate_limit_attempts.pop(target, None)
+            response.instance_id = target
+            return response
+        except LLMRateLimitError:
+            self._mark_rate_limited(target)
+            logger.warning("Provider %s rate-limited exact routed call.", target)
+            record_diagnostics_alert(
+                category="llm",
+                code="rate_limited",
+                message=f"LLM 实例 {target} 被限流（HTTP 429），精确路由调用失败。",
+                source=target,
+            )
+            raise
+
+    def provider_supports_tool_calling(self, name: str | None = None) -> bool:
+        """Return whether the named (or default) provider implements native FC."""
+        target = str(name or self._default).strip().lower()
+        provider = self._providers.get(target)
+        return bool(getattr(provider, "supports_tool_calling", False))
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        """Native function-calling completion over the fallback chain."""
+        return await self.complete_with_tools_chain(
+            self._fallback_order(),
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+
+    async def complete_with_tools_chain(
+        self,
+        instance_ids: list[str] | tuple[str, ...],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        """Execute one explicit ordered chain with native function calling.
+
+        Mirrors ``complete_chain``'s cooldown / rate-limit / fall-through
+        semantics. Providers without ``supports_tool_calling`` are skipped;
+        if none of the routed instances supports native FC the method raises
+        ``LLMToolCallUnsupportedError`` so the service layer can fall back to
+        prompt-level simulation.
+        """
+        last_error: Exception | None = None
+        attempted: list[str] = []
+        seen: set[str] = set()
+        order: list[str] = []
+        for raw_name in instance_ids:
+            instance_id = str(raw_name or "").strip().lower()
+            if not instance_id or instance_id in seen or not self.is_chat_capable(instance_id):
+                continue
+            seen.add(instance_id)
+            order.append(instance_id)
+
+        supports_any = False
+        for position, provider_name in enumerate(order):
+            has_next = position + 1 < len(order)
+            provider = self.get(provider_name)
+            if not getattr(provider, "supports_tool_calling", False):
+                logger.debug(
+                    "Provider %s has no native tool calling; skipping in FC chain.",
+                    provider_name,
+                )
+                continue
+            supports_any = True
+            attempted.append(provider_name)
+            if self._provider_on_cooldown(provider_name):
+                last_error = LLMRateLimitError(
+                    f"Provider {provider_name} is cooling down after rate limit."
+                )
+                logger.warning("Provider %s is cooling down after rate limit.", provider_name)
+                continue
+            try:
+                response = await provider.complete_with_tools(
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+                self._rate_limited_until.pop(provider_name, None)
+                self._rate_limit_attempts.pop(provider_name, None)
+                response.instance_id = provider_name
+                return response
+            except LLMRateLimitError as exc:
+                last_error = exc
+                self._mark_rate_limited(provider_name)
+                self._log_provider_failure(provider_name, has_next=has_next)
+                record_diagnostics_alert(
+                    category="llm",
+                    code="rate_limited",
+                    message=str(exc) or "LLM provider returned HTTP 429 (rate limited).",
+                    source=provider_name,
+                )
+            except (LLMProviderError, LLMTimeoutError) as exc:
+                last_error = exc
+                self._log_provider_failure(provider_name, has_next=has_next)
+                record_diagnostics_alert(
+                    category="llm",
+                    code=_classify_llm_error_code(exc),
+                    message=str(exc),
+                    source=provider_name,
+                )
+
+        if not supports_any:
+            raise LLMToolCallUnsupportedError(
+                "No chat-capable provider in the route supports native tool calling."
+            )
+        attempted_list = ", ".join(attempted)
+        if last_error is None:
+            raise LLMFallbackError("No provider was available to process the request.")
+        record_diagnostics_alert(
+            category="llm",
+            code="all_providers_failed",
+            message=f"所有 LLM 实例均请求失败（{attempted_list}），最后错误：{last_error}",
+            source=attempted_list,
+            severity="error",
+        )
+        raise LLMFallbackError(
+            f"All providers failed ({attempted_list}). Last error: {last_error}"
+        ) from last_error
+
+    async def complete_provider_with_tools(
+        self,
+        provider_name: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> LLMResponse:
+        """Native function-calling completion against one exact provider.
+
+        Same no-fallback contract as ``complete_provider``: an explicit
+        per-module route must not silently spill into another provider.
+        """
+        target = provider_name.strip().lower()
+        if not self.is_chat_capable(target):
+            available = ", ".join(self._fallback_order())
+            raise LLMFallbackError(
+                f"LLM provider '{target or provider_name}' is not registered "
+                f"or not chat-capable. Chat-capable providers: {available}"
+            )
+        if not self.provider_supports_tool_calling(target):
+            raise LLMToolCallUnsupportedError(
+                f"LLM provider '{target}' does not support native tool calling."
+            )
+        if self._provider_on_cooldown(target):
+            logger.warning("Provider %s is cooling down after rate limit.", target)
+            raise LLMRateLimitError(f"Provider {target} is cooling down after rate limit.")
+
+        provider = self.get(target)
+        try:
+            response = await provider.complete_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
                 model=model,
             )
