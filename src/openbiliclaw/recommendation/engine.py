@@ -4534,13 +4534,13 @@ class RecommendationEngine:
         # ``bonus`` (opt-in cover-visual, default empty) is added to the
         # relevance term only — tier priority and the timestamp/view/bvid
         # tiebreakers are untouched, so an empty map is byte-identical ranking.
-        visual = (bonus or {}).get(item.bvid, 0.0)
+        visual = (bonus or {}).get(item.scoring_key, 0.0)
         return (
             0 if item.candidate_tier == "primary" else 1,
             -(item.relevance_score + visual),
             -RecommendationEngine._timestamp_score(item.last_scored_at or item.discovered_at),
             -item.view_count,
-            item.bvid,
+            item.scoring_key,
         )
 
     @staticmethod
@@ -4629,7 +4629,7 @@ class RecommendationEngine:
                 continue
             vec = lookup(text)
             if vec:
-                result[c.bvid] = vec
+                result[c.scoring_key] = vec
         return result
 
     async def warm_mmr_embeddings(
@@ -4752,7 +4752,7 @@ class RecommendationEngine:
         if score_override:
             ranked = sorted(
                 candidates,
-                key=lambda item: -(score_override.get(item.bvid, 0.0) + bonus.get(item.bvid, 0.0)),
+                key=lambda item: -(score_override.get(item.scoring_key, 0.0) + bonus.get(item.scoring_key, 0.0)),
             )
         else:
             ranked = sorted(candidates, key=lambda item: cls._ranking_key(item, bonus))
@@ -5013,11 +5013,11 @@ class RecommendationEngine:
 
         def _relevance(item: DiscoveredContent) -> float:
             base = (
-                float(score_override.get(item.bvid, 0.0))
+                float(score_override.get(item.scoring_key, 0.0))
                 if score_override
                 else float(item.relevance_score or 0.0)
             )
-            return base + bonus.get(item.bvid, 0.0)
+            return base + bonus.get(item.scoring_key, 0.0)
 
         # Same vectors and cosine implementation throughout this selection.
         # Cache exact pair results locally; never share scores across batches.
@@ -5028,15 +5028,15 @@ class RecommendationEngine:
             cand: DiscoveredContent,
             picked: list[DiscoveredContent],
         ) -> float:
-            cand_vec = embeddings.get(cand.bvid)
+            cand_vec = embeddings.get(cand.scoring_key)
             if not cand_vec or not picked:
                 return 0.0
             best = 0.0
             for p in picked:
-                p_vec = embeddings.get(p.bvid)
+                p_vec = embeddings.get(p.scoring_key)
                 if not p_vec:
                     continue
-                pair = (cand.bvid, p.bvid)
+                pair = (cand.scoring_key, p.scoring_key)
                 sim = pair_similarity.get(pair)
                 if sim is None:
                     sim = cosine_similarity(cand_vec, p_vec)
@@ -5197,7 +5197,7 @@ class RecommendationEngine:
     ) -> float:
         if score_override is None:
             return item.relevance_score
-        return score_override.get(item.bvid, item.relevance_score)
+        return score_override.get(item.scoring_key, item.relevance_score)
 
     @staticmethod
     def _accessible_style_priority(item: DiscoveredContent) -> int:

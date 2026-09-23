@@ -364,7 +364,7 @@ def test_score_candidates_returns_all_bvids() -> None:
     ]
     context = ScoringContext()
     scores = curator.score_candidates(candidates, context)
-    assert set(scores.keys()) == {"BV1", "BV2"}
+    assert set(scores.keys()) == {c.scoring_key for c in candidates}
     assert all(v >= 0.0 for v in scores.values())
 
 
@@ -387,7 +387,7 @@ def test_score_candidates_explore_gets_serendipity_bonus() -> None:
     )
     context = ScoringContext(now=now)
     scores = curator.score_candidates([search, explore], context)
-    assert scores["BVE"] > scores["BVS"]
+    assert scores[explore.scoring_key] > scores[search.scoring_key]
 
 
 def test_publication_preference_penalizes_out_of_range_bilibili_score() -> None:
@@ -426,8 +426,8 @@ def test_publication_preference_penalizes_out_of_range_bilibili_score() -> None:
         ScoringContext(now=datetime(2024, 1, 1, tzinfo=UTC)),
     )
 
-    assert scores["BV_IN"] == 0.8
-    assert scores["BV_OUT"] == 0.4
+    assert scores[in_range.scoring_key] == 0.8
+    assert scores[out_of_range.scoring_key] == 0.4
 
 
 def test_strict_publication_preference_filters_only_bilibili_candidates() -> None:
@@ -518,7 +518,7 @@ def test_score_candidates_penalises_fatigued_topic() -> None:
         now=now,
     )
     scores = curator.score_candidates([fresh_topic, stale_topic], context)
-    assert scores["BV1"] > scores["BV2"]
+    assert scores[fresh_topic.scoring_key] > scores[stale_topic.scoring_key]
 
 
 def test_score_candidates_ranks_recent_confident_temporal_content_higher() -> None:
@@ -549,7 +549,7 @@ def test_score_candidates_ranks_recent_confident_temporal_content_higher() -> No
 
     scores = curator.score_candidates([recent, older, evergreen], ScoringContext(now=now))
 
-    assert scores["BV_RECENT"] > scores["BV_OLDER"] > scores["BV_EVERGREEN"]
+    assert scores[recent.scoring_key] > scores[older.scoring_key] > scores[evergreen.scoring_key]
 
 
 def test_temporal_ranking_shadow_records_aggregate_topk_counterfactual() -> None:
@@ -680,7 +680,7 @@ async def test_async_feedback_embedding_checks_key_and_group_once() -> None:
         embedding_service=FakeEmbeddingService(),
     )
 
-    assert scores["BV_MATCH"] == scores["BV_NEUTRAL"] - 0.10
+    assert scores[matching.scoring_key] == scores[neutral.scoring_key] - 0.10
 
 
 async def _assert_async_exact_feedback_survives_partial_embeddings(
@@ -729,7 +729,7 @@ async def _assert_async_exact_feedback_survives_partial_embeddings(
             embedding_service=SelectiveEmbeddingService(unavailable),
         )
 
-        assert scores["BV_MATCH"] == scores["BV_NEUTRAL"] + expected_adjustment
+        assert scores[matching.scoring_key] == scores[neutral.scoring_key] + expected_adjustment
 
 
 async def test_async_disliked_exact_fallback_survives_partial_embeddings() -> None:
@@ -950,3 +950,43 @@ def test_serendipity_bonus_only_rewards_explore() -> None:
     assert PoolCurator._serendipity_bonus("explore") == 1.0
     for strategy in ("trending", "hot", "feed", "search", "related_chain", "channel", "creator"):
         assert PoolCurator._serendipity_bonus(strategy) == 0.0, strategy
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform scoring: non-Bilibili items must keep individual scores
+# ---------------------------------------------------------------------------
+
+
+def test_score_candidates_cross_platform_no_collision() -> None:
+    """Non-Bilibili items have bvid=''; scores must not collide at key ''."""
+    db, _ = _make_db()
+    curator = PoolCurator(db)
+    yt_high = DiscoveredContent(
+        content_id="yt_abc",
+        source_platform="youtube",
+        relevance_score=0.9,
+        source_strategy="search",
+    )
+    yt_low = DiscoveredContent(
+        content_id="yt_xyz",
+        source_platform="youtube",
+        relevance_score=0.3,
+        source_strategy="search",
+    )
+    x_mid = DiscoveredContent(
+        content_id="tw_123",
+        source_platform="twitter",
+        relevance_score=0.6,
+        source_strategy="search",
+    )
+    # All three have bvid="" but distinct content_id/item_key.
+    assert yt_high.bvid == ""
+    assert yt_low.bvid == ""
+    assert x_mid.bvid == ""
+
+    context = ScoringContext()
+    scores = curator.score_candidates([yt_high, yt_low, x_mid], context)
+    # Each item must have its OWN key — no collisions.
+    assert len(scores) == 3, f"expected 3 distinct scores, got {len(scores)}: {scores}"
+    # The high-relevance item must outscore the low-relevance item.
+    assert scores[yt_high.scoring_key] > scores[yt_low.scoring_key]
