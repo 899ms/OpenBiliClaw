@@ -492,10 +492,24 @@ def test_current_background_callers_are_classified(caller: str) -> None:
         "soul.dialogue.tools",
         "soul.dialogue.tool_followup",
         "api.sentiment",
+        "agent.chat",
+        "agent.task",
     ],
 )
 def test_confirmed_interactive_callers(caller: str) -> None:
     assert LLMConcurrencyGate(4).classify(caller) is LLMTrafficClass.INTERACTIVE
+
+
+@pytest.mark.parametrize("caller", ["agent.chat", "agent.task"])
+async def test_agent_loop_callers_are_not_parked_by_empty_inventory(caller: str) -> None:
+    """M10: user-initiated agent lanes must not park behind an empty pool."""
+    gate = LLMConcurrencyGate(1)
+    gate.update_inventory(available=0, target=20)
+
+    async with asyncio.timeout(1):
+        await _acquire_once(gate, caller)
+
+    assert gate.status_payload()["llm_background_active"] == 0
 
 
 @pytest.mark.parametrize(

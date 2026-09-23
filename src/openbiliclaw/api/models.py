@@ -2034,6 +2034,12 @@ class ChatTurnIn(BaseModel):
             "inventory_settles_allowed",
             # Server-owned agent-loop replay log (written on stream completion).
             "agent_events",
+            # Server-owned background-task summary card (M6): written only by
+            # AgentTaskManager when a task terminates; clients must not forge
+            # a summary card for an arbitrary task.
+            "agent_task_summary",
+            "task_id",
+            "task_status",
         }
         # Card creation legitimately accepts ``evidence_refs`` as input. Once
         # a request declares a reply relation, however, even evidence is
@@ -2043,6 +2049,10 @@ class ChatTurnIn(BaseModel):
         forbidden = sorted(set(self.payload).intersection(reserved))
         if forbidden:
             raise ValueError(f"reserved_payload_key: {', '.join(forbidden)} is server-owned")
+        # The summary card is keyed on the payload ``type`` value, so blocking
+        # the keys alone is not enough — reject the value directly.
+        if str(self.payload.get("type") or "").strip() == "agent_task_summary":
+            raise ValueError("reserved_payload_key: agent_task_summary is server-owned")
         return self
 
 

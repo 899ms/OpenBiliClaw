@@ -22918,6 +22918,7 @@ def create_app(
                 ("assets/css/app.css", _desktop_dir),
                 ("assets/css/classic.css", _desktop_dir),
                 ("assets/js/app.js", _desktop_dir),
+                ("assets/js/chat-agent-core.js", _desktop_dir),
                 ("dialogue-confirmation.js", _shared_web_dir),
                 ("source-status.js", _shared_web_dir),
             ):
@@ -22946,6 +22947,10 @@ def create_app(
             html = html.replace(
                 'src="/web/assets/js/app.js"',
                 f'src="/web/assets/js/app.js?v={version}"',
+            )
+            html = html.replace(
+                'src="/web/assets/js/chat-agent-core.js"',
+                f'src="/web/assets/js/chat-agent-core.js?v={version}"',
             )
             html = html.replace(
                 'src="/shared/dialogue-confirmation.js"',
