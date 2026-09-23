@@ -1219,6 +1219,15 @@ Awareness seam 固定为 `legacy`。未发布的聚合字段
 |----|------|--------|------|
 | `satisfaction_filter_enabled` | bool | `true` | v0.3.x 事件满意度信号：默认开启。偏好分析会在构 prompt 前忽略 `quick_exit` 等被动 negative 事件，保留 positive / neutral / unknown 上下文；`feedback_type=dislike` 或 `reaction=thumbs_down` 的显式负反馈会继续进入分析器，只能作为 `disliked_topics` / 避让证据，不能提取为正向 `interests` |
 
+### `[agent]`（聊一聊 agent loop 预算）
+
+「聊一聊」多跳 agent loop 的步数与回填预算（`src/openbiliclaw/agent/loop.py`，M1 起生效）。
+
+| 键 | 类型 | 默认值 | 说明 |
+|----|------|--------|------|
+| `loop_max_steps` | int | `64` | 每轮对话「思考 → 调工具 → 再思考」的最大跳数（范围 `1..256`，越界回退默认值）。超限后 loop 发出 `step_limit_reached` 事件，并以无工具的收尾调用让模型汇报进展与建议 |
+| `tool_result_max_chars` | int | `4000` | 单次工具结果回填进 prompt 的字符上限（范围 `200..100000`），超出部分截断并标注；截断后的文本同时出现在 `tool_result` 事件（`truncated=true`）与回填消息里 |
+
 ### `[logging]`
 
 | 键 | 类型 | 默认值 | 说明 |

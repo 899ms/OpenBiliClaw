@@ -2,6 +2,13 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M1：后端核心（2026-09-23，feat/chat-agent-loop）
+
+- **JSON Schema 工具注册表（`agent/tools/`）**：新增 `Tool`（name / description / JSON Schema `parameters` / `permission_level` ∈ read/soft_write/hard_write / 同步或异步 handler）与 `ToolRegistry`（注册、skill 白名单 `subset()`、权限过滤 `filter_by_permission()`、OpenAI 格式 `llm_schemas()`、旧扁平格式 `legacy_schemas()`、参数校验 + `dispatch()`/`dispatch_sync()`）。`SOURCE_TOOLS` 三工具迁移为唯一事实来源 `agent/tools/source_tools.py`；`sources/tools.py` 的旧 `SOURCE_TOOLS` 列表与 `SourceToolDispatcher.dispatch()` 接口保持不变，委托同一组 handler（行为变化仅限：`strategy` 枚举与 `toggle_source.id` 必填现在会被参数校验拦截并回读给模型）。
+- **openai_compatible 原生 function calling**：`LLMProvider` 新增 `supports_tool_calling` 与 `complete_with_tools()`（默认抛 `LLMToolCallUnsupportedError`）；`OpenAIProvider` 实现 OpenAI `tools=[{"type":"function",...}]` 原生 FC，单次响应多 `tool_calls` 并行解析为 `{"id","name","arguments","arguments_raw"}`，带工具调用的空 content 合法；DeepSeek 继承并保留 thinking max_tokens 下限；`api_flavor="responses"` 与 Ollama 显式标 `False` 走兜底。`LLMRegistry` 新增 `complete_with_tools()` / `complete_with_tools_chain()` / `complete_provider_with_tools()` / `provider_supports_tool_calling()`，复用 fallback 链 cooldown / 限流 / 告警语义并跳过无 FC 能力实例。
+- **`LLMService.complete_with_native_tools()`**：agent loop 单跳入口，接收完整 canonical 消息列表 + OpenAI 工具 schema；路由首选 provider 支持原生 FC 走 native 链，否则把消息展平（assistant.tool_calls → 文本注释、role=tool → `[工具执行结果]`）进 prompt 模拟，解析 `{"tool_call": ...}` / `{"tool_calls": [...]}` 多调用 JSON；两条路径都不注入 core memory（loop 调用方拥有 system prompt）。旧 `complete_with_tools()`（单跳、旧扁平 schema）保持不变。
+- **多跳 `AgentLoop`（`agent/loop.py`）**：`run()` 异步生成器逐跳产出 `AgentEvent`（thinking / tool_call / tool_result / final / step_limit_reached，`to_dict()` 供 M2 SSE 序列化）；默认 64 跳上限（新增 `[agent]` 配置段 `loop_max_steps` / `tool_result_max_chars`，见 `docs/modules/config.md`），超限后发出 step_limit_reached 并以无工具收尾调用让模型汇报进展；未知工具名与参数校验失败以 `ok=false` 结果回填模型自纠；工具结果超长截断并标记。回归：`tests/test_agent_tool_registry.py` / `tests/test_llm_native_tools.py` / `tests/test_agent_loop.py` + `test_config.py` 的 `[agent]` round-trip。
+
 ## v0.3.224：自定义回复语气与设置页一键测试（2026-09-19）
 
 ### 发布日期偏好软模式入库门修复（issue #257）

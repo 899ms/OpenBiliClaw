@@ -23,6 +23,7 @@
 | 2.1 Provider 实现 | ✅ | OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OrcaRouter / OpenAI-compatible，带 retry + 超时 |
 | v0.3.x OrcaRouter Provider 支持 | ✅ | 新增 `OrcaRouterProvider`（OpenAI 兼容协议）：一个 Key 跑 150+ 模型，默认 `openai/gpt-4o`，默认端点 `https://api.orcarouter.ai/v1`；沿用统一超时 / 重试 / 错误归一化 / JSON mode 与 per-call model 覆盖。网关把 `reasoning_effort` 与嵌套 `reasoning` 对象都原样转发给上游路由，非推理模型会以 HTTP 400 拒绝（已对 `openai/gpt-4o` 实测），因此适配器**不发送任何推理参数**，推理模型使用自身默认档位 |
 | 2.2 Provider Registry | ✅ | 多端点实例注册 + 全局 / 模块有序链 + 实例级 cooldown + health check |
+| v0.3.x 原生 function calling（M1） | ✅ | `OpenAIProvider.complete_with_tools()` 走 OpenAI `tools=[{"type":"function",...}]` 原生 FC，支持单次响应多个 `tool_calls` 并行解析；`api_flavor="responses"` 实例与 Ollama 显式标 `supports_tool_calling=False`，由 service 层 prompt 模拟兜底；DeepSeek 继承原生 FC 并保留 thinking max_tokens 下限；`LLMRegistry.complete_with_tools*()` 复用 fallback 链 cooldown / 限流语义，链内跳过无 FC 能力的实例 |
 | 2.3 Prompt 管理与 Service | ✅ | Prompt 构建器 + LLMService 门面 |
 | 画像整理裁决 prompt | ✅ | `build_profile_consolidation_prompt()` 保持静态 system + 确定性 user JSON；likes 从“仅严格同义”调整为“是否重复占用同一推荐意图”，允许合并“搞笑 / 娱乐搞笑”这类无新增选择价值的同粒度标签，同时明确保留“篮球 / NBA”“AI技术 / AI视频技术”等会改变召回范围的父子兴趣。每个簇携带 `known_distinct_pairs`，模型不得重判或合并用户回滚 / 当前策略已确认分开的 pair；代码侧仍作相同约束的强校验。dislikes 继续只合并近乎同义项并严禁向上泛化 |
 | Phase 2 provider-independent cognition views | ✅ | Preference、plain Awareness、Awareness-with-confusions 与 Insight builder 都有显式 `input_view="legacy"|"compact-v1"` seam；compact 使用 `CognitionEventViewV1` 与 `CognitionProfileViewV1` 删除 transport/storage 重复字段并按 stable soul → stable preference → volatile cognition → current batch 排序，system message、输出 schema、reasoning 和 token ceiling 不变。生产 rollout 逐 task 控制：只默认开启已通过 SenseTime 门的 `soul.awareness_confusions`，plain `soul.awareness` 固定 legacy，Preference/Insight 默认 legacy。该投影不依赖 tokenizer、模型或 provider cache。 |
@@ -143,6 +144,17 @@ available = await provider.health_check()  # bool
 # health_check 使用 max_tokens=4096，兼容先输出 reasoning 再输出 content 的服务。
 # 设置页 / 插件的配置探针也使用同一个连通性探针预算。
 
+# 原生 function calling（M1；OpenAI 系 chat-completions flavor）
+# tools 为 OpenAI 格式 [{"type": "function", "function": {...}}]；
+# 响应 tool_calls 归一化为 [{"id", "name", "arguments", "arguments_raw"}]，
+# 单次响应可携带多个并行调用；带 tool_calls 的空 content 是合法结果。
+response = await provider.complete_with_tools(
+    [{"role": "user", "content": "帮我看看订阅"}],
+    tools=[{"type": "function", "function": {"name": "list_sources", ...}}],
+)
+print(response.tool_calls)
+print(provider.supports_tool_calling)  # False 时由 LLMService 走 prompt 模拟兜底
+
 provider = OpenRouterProvider(
     api_key="or-...",
     model="openai/gpt-4o-mini",
@@ -217,6 +229,14 @@ response = await registry.complete_provider(
 )
 assert registry.is_chat_capable("deepseek-cn")
 
+# 原生 function calling 链（M1）：与 complete_chain 同一套 fallback / cooldown /
+# 限流语义，但跳过不支持 FC 的实例；整条链都没有 FC 能力时抛
+# LLMToolCallUnsupportedError，由 LLMService 回落到 prompt 模拟。
+response = await registry.complete_with_tools(messages, tools)
+response = await registry.complete_with_tools_chain(["relay-hk", "deepseek-cn"], messages, tools)
+response = await registry.complete_provider_with_tools("deepseek-cn", messages, tools)
+assert registry.provider_supports_tool_calling("deepseek-cn")
+
 # 所有 chat-capable 实例的健康检查（embedding-only 项不会收到 chat 请求）
 results = await registry.health_check_all()
 # {"deepseek-cn": HealthCheckResult(available=True, is_default=True), ...}
@@ -281,6 +301,17 @@ response = await service.complete_structured_task(
 # 已在 user_input 携带完整结构化上下文的高频结构化任务
 # (如候选 eval / 推荐分类与 delight / 关键词生成 / 画像分析) 可关闭额外 core memory 注入，
 # 让 provider-side prompt cache 前缀更稳定。
+
+# Agent loop 单跳调用（M1）：接收完整 canonical 消息列表
+# （system / history / assistant.tool_calls / role=tool 结果）与 OpenAI 格式
+# 工具 schema；路由到的 provider 支持原生 FC 时走 native 链，否则把消息展平
+# 进 prompt 模拟（解析 {"tool_call": ...} / {"tool_calls": [...]} JSON）。
+# 两条路径都不注入 core memory——agent loop 调用方自己拥有 system prompt。
+response = await service.complete_with_native_tools(
+    messages=[{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
+    tools=tool_registry.llm_schemas(),
+    caller="agent.loop",
+)
 
 from openbiliclaw.llm import is_llm_rate_limit_error
 
