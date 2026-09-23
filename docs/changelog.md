@@ -2,6 +2,21 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M5：多会话模型（2026-09-23，feat/chat-agent-loop）
+
+- **会话实体与存储（`storage/database.py`）**：新增 `chat_sessions` 表（`session_id` 主键、`title`、`archived`、`metadata` JSON（additive bag，预留 M4 skill 绑定字段）、`created_at` / `updated_at` / `last_message_at`）；`chat_turns` 幂等补列 `session_id TEXT NOT NULL DEFAULT ''` + `(session_id, created_at, turn_id)` 索引，schema version 6 → 7。默认会话（`session_id='default'`，初始化时保证存在，可改名、不可归档）收编全部 `session_id=''` 的 legacy turn（归属谓词 `IN ('', 'default')`），现有历史全部保留可查、不改写旧行。CRUD：`create/get/list_chat_sessions`（按 last_activity 倒序，带 120 字符消息预览、turn_count、active_turns=pending 数）/ `rename` / `set_archived`；`create_chat_turn` 与 `complete/fail_chat_turn` 的 CAS 成功路径同步 bump 所属会话活跃时间；`list_chat_turns_by_session()` 提供 `(rows, total)` 分页。
+- **会话 API（`api/app.py` / `api/models.py`）**：`POST /api/chat/sessions`（创建，id 缺省自动生成）、`GET /api/chat/sessions`（活跃排序列表，带预览与活跃信息，`include_archived`）、`GET /api/chat/sessions/{id}`（详情 + `limit/offset` turns 分页 + `scope` 过滤）、`PATCH /api/chat/sessions/{id}`（改名/归档；空标题 422、归档默认会话 422）；不做 DELETE（删除即归档）。`POST /api/chat/turns` 与 `POST /api/chat/agent/stream` 新增可选 `session_id`：缺省归属默认会话，显式未知 id 返回 404；带 `turn_id` 时以 turn 落库时的归属为准，`agent/stream` 的 `done` 事件回显 `session_id`。`ChatTurnOut` 新增 `session_id` 字段；显式 `session_id` 纳入 `turn_id` 幂等重试的请求一致性比较（省略时保持 pre-M5 兼容）。
+- **标题自动生成**：`scope='chat'` 的首条用户消息落库后异步触发（fire-and-forget task）：`[agent] session_title_enabled=true`（默认）且能解析到 LLMService 时走 `complete_structured_task`（caller=`chat.session_title`、`reasoning_effort=""`、不注入 core memory，自动经全局并发闸）生成 ≤20 字中文标题；LLM 失败 / 超时（30s）/ JSON 非法 / 开关关闭一律回退为消息截断前缀（≤30 字符）。只在标题仍为空时写入，不覆盖手动改名。解析 / TOML 渲染 / `config.example.toml` 同步。
+- **回归**：`tests/test_chat_sessions.py` 19 条（迁移与旧数据兼容、默认会话行为、CRUD、列表预览与活跃排序、分页、标题生成 mock LLM 成功/失败回退/开关关闭/不覆盖手动改名、四个会话端点集成、turns 缺省归属与未知 session 404）。
+
+## 聊一聊 Agent Loop M4：Skill 体系（2026-09-23，feat/chat-agent-loop）
+
+- **SKILL.md 加载器（`agent/skill.py`）**：chat skill = 人设 prompt + 工具白名单 + 可用数据声明，载体 `*/SKILL.md` 目录约定。frontmatter（`name` slug 必填 / `description` 必填 / `title` / `tools` 白名单）+ 正文人设 prompt；手写 YAML 子集解析器（标量、`- ` 块列表、`[a, b]` 行内列表），不引入 PyYAML 依赖。`load_skill_catalog()` 先读内置 `agent/skills_builtin/`（随 wheel 与 PyInstaller datas 分发）再叠加 `{data_dir}/skills/`：同名用户 skill 覆盖内置并记 info，非法文件跳过并记 warning，不影响启动。既有 `Skill` ABC / `SkillRegistry` 代码技能骨架保留未动。
+- **4 个内置 skill**：`taste-companion`（口味伙伴，默认，全部 read + soft_write 共 11 个工具）；`taste-explorer`（口味探寻师：get_profile / read_memory / write_memory / search_history / submit_feedback，苏格拉底式追问人设）；`bangumi-advisor`（追番顾问：get_profile / read_memory / get_recommendations / get_watch_history / save_item / submit_feedback）；`system-steward`（系统管家：list_sources / get_config + hard_write 三件套，人设强调改动逐项经用户批准）。每个 skill 正文按「不塞数据，给入口」声明可用数据与工具入口。
+- **会话绑定与切换**：`POST /api/chat/agent/stream` body 新增可选 `skill` 字段（缺省口味伙伴，未知名 422 并附可选清单）；loop 工具集 = `ctx.agent_tool_registry.subset(skill.tools)` + `suggest_skill` 元工具，`SocraticDialogue.stream_agent_reply()` 把 skill 人设与其他 skill 清单叠加在 socratic system prompt 上（`_layer_skill_system_prompt()`）。会话中切换 = 下一回合带新 `skill` 值；agent 建议切换走 `suggest_skill` 元工具（`agent/tools/skill_tools.py`，只校验并生成建议，真实切换由用户确认后前端以下一回合 `skill` 字段发起）。终端 `done` 事件新增 `skill` 字段回显实际生效角色。新端点 `GET /api/chat/skills` 列出全部 skill（name / title / description / tools / source=builtin|custom / default）。
+- **生产接线升级**：`RuntimeContext._rebuild_components()` 的 agent loop 从 M1 的源管理三工具升级为全量 v1 工具集（`build_agent_tool_registry(AgentToolContext(...))`），并新增 `ctx.agent_tool_registry` 与 `ctx.skill_catalog` 随热重载原子 swap；degraded / 未接线场景端点惰性加载 catalog 兜底。
+- **回归**：`tests/test_agent_skills.py` 25 条（SKILL.md 解析正常/缺字段/非法 frontmatter、用户目录覆盖、非法文件跳过、4 个内置白名单与注册表一致性、subset 过滤、suggest_skill 元工具、system prompt 叠加、端点带 skill 参数集成 + 未知 skill 422 + `GET /api/chat/skills`）；`tests/test_chat_agent_stream_api.py` 更新 fake 签名与 `done` 事件断言。
+
 ## 聊一聊 Agent Loop M3：v1 标准工具集（2026-09-23，feat/chat-agent-loop）
 
 - **`AgentToolContext` + `build_agent_tool_registry()`（`agent/tools/context.py`）**：轻量 dataclass 持有工具所需的运行时组件引用（database / soul_engine / memory_manager / recommendation_engine / config / event_ingress / saved_sync_service，字段名与 `api/runtime_context.py` 对齐但本里程碑不改生产接线）；总装函数一次注册全部 v1 工具。组件缺失时 handler 抛 `ToolComponentUnavailableError`（`agent/tools/common.py`），由 dispatch 统一映射为机器可读 `handler_error` 回填模型，不向上抛异常。

@@ -467,6 +467,10 @@ class RuntimeContext:
     dialogue: Any = None
     # Multi-hop chat agent loop (「聊一聊」 M2); rebuilt alongside dialogue.
     agent_loop: Any = None
+    # Full v1 agent tool registry (M3) the loop subsets per skill, and the
+    # chat skill catalog (M4: builtin skills + data/skills/ overrides).
+    agent_tool_registry: Any = None
+    skill_catalog: Any = None
     # Wave 1: the one self-owned typed dialogue settlement queue. It is not in
     # cancel_all and uses pause/drain + exact permit handoff on hot reload.
     dialogue_settlement_queue: Any = None
@@ -1818,15 +1822,34 @@ class RuntimeContext:
         # Multi-hop chat agent loop (「聊一聊」 M2): same LLM service and
         # database as the legacy single-hop path; the interactive chat lane
         # bypasses the background LLM semaphore like ``_respond_with_tools``.
-        from openbiliclaw.agent.loop import AgentLoop
-        from openbiliclaw.agent.tools import build_source_tool_registry
+        # M3/M4: the loop runs against the full v1 tool registry (built from
+        # an AgentToolContext over the freshly rebuilt components); the chat
+        # endpoint subsets it per skill via ``ToolRegistry.subset``.
+        from pathlib import Path
 
+        from openbiliclaw.agent.loop import AgentLoop
+        from openbiliclaw.agent.skill import load_skill_catalog
+        from openbiliclaw.agent.tools import AgentToolContext, build_agent_tool_registry
+
+        new_agent_tool_registry = build_agent_tool_registry(
+            AgentToolContext(
+                database=self.database,
+                soul_engine=new_soul_engine,
+                memory_manager=self.memory_manager,
+                recommendation_engine=new_recommendation_engine,
+                config=new_config,
+                saved_sync_service=new_saved_sync_service,
+            )
+        )
         new_agent_loop = AgentLoop.from_config(
             new_llm_service,
-            build_source_tool_registry(self.database),
+            new_agent_tool_registry,
             new_config,
             caller="agent.chat",
             bypass_semaphore=True,
+        )
+        new_skill_catalog = load_skill_catalog(
+            user_dir=Path(str(getattr(new_config, "data_dir", "data"))) / "skills"
         )
 
         # 11. Auto-update service
@@ -1875,6 +1898,8 @@ class RuntimeContext:
         self.soul_engine = new_soul_engine
         self.dialogue = new_dialogue
         self.agent_loop = new_agent_loop
+        self.agent_tool_registry = new_agent_tool_registry
+        self.skill_catalog = new_skill_catalog
         self.dialogue_settlement_queue = new_settlement_queue
         self.discovery_engine = new_discovery_engine
         self.recommendation_engine = new_recommendation_engine

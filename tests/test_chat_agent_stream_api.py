@@ -38,6 +38,9 @@ class FakeAgentDialogue:
         session: str = "",
         scope: str = "chat",
         turn_id: str = "",
+        skill: Any = None,
+        tools: Any = None,
+        skill_switch_guide: str = "",
     ) -> Any:
         self.agent_calls.append(
             {
@@ -46,6 +49,9 @@ class FakeAgentDialogue:
                 "session": session,
                 "scope": scope,
                 "turn_id": turn_id,
+                "skill": skill,
+                "tools": tools,
+                "skill_switch_guide": skill_switch_guide,
             }
         )
         for item in self._script:
@@ -149,7 +155,10 @@ def test_agent_stream_multi_hop_events_and_turn_persisted(tmp_path: Path) -> Non
     assert events[1][1]["summary"] == "list_sources()"
     assert events[2][1]["ok"] is True
     assert events[3][1]["text"] == "你还没有订阅任何内容源。"
-    assert events[4][1] == {"reply": "你还没有订阅任何内容源。", "turn_id": "agent-turn-1"}
+    done = events[4][1]
+    assert done["reply"] == "你还没有订阅任何内容源。"
+    assert done["turn_id"] == "agent-turn-1"
+    assert done["skill"] == "taste-companion"
 
     # The loop ran under the dialogue lease with the turn context threaded.
     assert len(dialogue.agent_calls) == 1

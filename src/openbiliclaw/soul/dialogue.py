@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from datetime import tzinfo
 
     from openbiliclaw.agent.loop import AgentEvent, AgentLoop
+    from openbiliclaw.agent.skill import SkillDefinition
+    from openbiliclaw.agent.tools import ToolRegistry
     from openbiliclaw.llm.service import LLMService, ModuleOverride, SupportsComplete
     from openbiliclaw.soul.dialogue_learn_queue import DialogueSettlementQueue
     from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding
@@ -341,6 +343,9 @@ class SocraticDialogue:
         session: str = "",
         scope: str = "chat",
         turn_id: str = "",
+        skill: SkillDefinition | None = None,
+        tools: ToolRegistry | None = None,
+        skill_switch_guide: str = "",
     ) -> AsyncIterator[AgentEvent]:
         """Run the multi-hop agent loop for one chat turn, streaming events.
 
@@ -351,6 +356,11 @@ class SocraticDialogue:
         and queued for learning exactly like ``respond``. The dialogue lock
         is held for the whole run so the shared history stays serialized
         with the legacy path.
+
+        With ``skill`` (M4), the skill's persona prompt and the
+        ``skill_switch_guide`` block are layered on top of the base socratic
+        system prompt, and ``tools`` (the skill's whitelist subset plus meta
+        tools) overrides the loop's registry for this run.
         """
         if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
             raise DialogueLearningConfigurationError(
@@ -383,11 +393,16 @@ class SocraticDialogue:
                     dialogue_tone_prompt=str(getattr(service, "dialogue_tone_prompt", "") or ""),
                 )
                 system = prompt_messages[0]["content"] if prompt_messages else ""
+                if skill is not None:
+                    system = _layer_skill_system_prompt(
+                        system, skill, skill_switch_guide=skill_switch_guide
+                    )
                 reply = ""
                 async for event in agent_loop.run(
                     system_instruction=system,
                     user_message=prompt_user_message,
                     history=self._history_to_messages(),
+                    tools=tools,
                 ):
                     if event.type == "final":
                         reply = event.text
@@ -642,3 +657,27 @@ class SocraticDialogue:
             reply_style=str(getattr(self._soul_engine, "_reply_style", "") or ""),
             dialogue_tone_prompt=str(getattr(self._soul_engine, "_dialogue_tone_prompt", "") or ""),
         )
+
+
+def _layer_skill_system_prompt(
+    base_system: str,
+    skill: SkillDefinition,
+    *,
+    skill_switch_guide: str = "",
+) -> str:
+    """Layer a chat skill's persona prompt on top of the base socratic prompt.
+
+    The base prompt keeps the shared 阿b persona and tone; the skill block
+    narrows the role (人设 + 可用数据/工具入口声明) for this session, and the
+    optional switch guide lists the other skills the agent may propose via
+    the ``suggest_skill`` meta tool.
+    """
+    blocks = [
+        base_system,
+        f"本会话你以「{skill.display_name}」（skill: {skill.name}）的角色工作。"
+        f"\n\n{skill.system_prompt}",
+    ]
+    guide = skill_switch_guide.strip()
+    if guide:
+        blocks.append(guide)
+    return "\n\n".join(block for block in blocks if block.strip())

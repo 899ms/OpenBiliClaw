@@ -2002,6 +2002,8 @@ class ChatTurnIn(BaseModel):
     scope: str = "chat"
     subject_id: str = ""
     subject_title: str = ""
+    # Chat skill binding (M4): empty means the default skill (口味伙伴).
+    skill: str = ""
     # The only client-declared relation.  Canonical kind/ref/generation/title
     # are resolved from this durable target by the server at POST time.
     reply_to_turn_id: str = ""

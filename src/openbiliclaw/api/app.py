@@ -11181,6 +11181,14 @@ def create_app(
         for history replay; without a ``turn_id`` the run is ephemeral. The
         legacy single-hop ``/api/chat`` and ``/api/chat/stream`` endpoints
         are unaffected.
+
+        M4 skill binding: the optional ``skill`` field selects a chat skill
+        (default 口味伙伴). The loop's tools are restricted to the skill's
+        whitelist (``registry.subset``) plus the ``suggest_skill`` meta tool,
+        and the skill's persona prompt is layered onto the system prompt.
+        Switching skills mid-session is just sending the next turn with a
+        different ``skill`` value; the agent itself can only *propose* a
+        switch via the ``suggest_skill`` tool call.
         """
         message = payload.message.strip()
         if not message:
@@ -11188,6 +11196,20 @@ def create_app(
         agent_config = getattr(getattr(ctx, "config", None), "agent", None)
         if agent_config is not None and not bool(getattr(agent_config, "loop_enabled", True)):
             raise HTTPException(status_code=503, detail="Agent loop chat is disabled.")
+        skill_catalog = _resolve_skill_catalog()
+        skill_name = payload.skill.strip()
+        if skill_name:
+            skill_definition = skill_catalog.get(skill_name)
+            if skill_definition is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Unknown chat skill: {skill_name}. "
+                        f"Available: {', '.join(skill_catalog.names)}"
+                    ),
+                )
+        else:
+            skill_definition = skill_catalog.default()
         turn_id = payload.turn_id.strip()
         row = _get_chat_turn_row(turn_id) if turn_id else None
         turn = _normalize_chat_turn(row) if row else None
@@ -11213,6 +11235,13 @@ def create_app(
                         session=payload.session.strip() or (turn.session if turn else "popup"),
                         scope=turn.scope if turn is not None else "chat",
                         turn_id=turn_id,
+                        skill=skill_definition,
+                        tools=_skill_tool_subset(skill_definition, skill_catalog),
+                        skill_switch_guide=(
+                            skill_catalog.render_switch_guide(skill_definition.name)
+                            if skill_definition is not None
+                            else ""
+                        ),
                     ):
                         data = event.to_dict()
                         loop_events.append(data)
@@ -11231,7 +11260,14 @@ def create_app(
             if turn is not None and turn_id:
                 _store_chat_turn_agent_events(turn_id, loop_events)
                 _complete_chat_turn_row(turn_id, reply=final_reply)
-            yield sse("done", {"reply": final_reply, "turn_id": turn_id})
+            yield sse(
+                "done",
+                {
+                    "reply": final_reply,
+                    "turn_id": turn_id,
+                    "skill": skill_definition.name if skill_definition is not None else "",
+                },
+            )
 
         return StreamingResponse(
             _event_stream(),
@@ -11241,6 +11277,46 @@ def create_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    def _resolve_skill_catalog() -> Any:
+        """Return the runtime skill catalog, building it lazily if unwired.
+
+        Production wiring builds ``ctx.skill_catalog`` on every config
+        rebuild; tests and minimal contexts fall back to loading builtin
+        skills plus ``{data_dir}/skills`` on first use.
+        """
+        from openbiliclaw.agent.skill import load_skill_catalog
+
+        catalog = getattr(ctx, "skill_catalog", None)
+        if catalog is not None:
+            return catalog
+        data_dir = str(getattr(getattr(ctx, "config", None), "data_dir", "data") or "data")
+        catalog = load_skill_catalog(user_dir=Path(data_dir) / "skills")
+        ctx.skill_catalog = catalog
+        return catalog
+
+    def _skill_tool_subset(skill_definition: Any, skill_catalog: Any) -> Any:
+        """Skill whitelist subset of the full registry + ``suggest_skill``.
+
+        Returns ``None`` when no full registry is wired (legacy tests that
+        inject only ``ctx.agent_loop``) so the loop falls back to its own
+        registry, preserving pre-M4 behavior.
+        """
+        if skill_definition is None:
+            return None
+        base_registry = getattr(ctx, "agent_tool_registry", None)
+        if base_registry is None:
+            return None
+        from openbiliclaw.agent.tools import build_suggest_skill_tool
+
+        subset = base_registry.subset(skill_definition.tools)
+        subset.register(build_suggest_skill_tool(skill_catalog.names))
+        return subset
+
+    @app.get("/api/chat/skills")
+    async def list_chat_skills() -> JSONResponse:
+        """List available chat skills (builtin + user ``data/skills/``)."""
+        return JSONResponse(content={"skills": _resolve_skill_catalog().to_public_list()})
 
     def _record_probe_cognition(
         summary: str,

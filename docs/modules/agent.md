@@ -5,8 +5,9 @@
 `src/openbiliclaw/agent/` 承载「聊一聊」对话的多跳 agent 运行时（设计共识：
 `docs/plans/2026-09-23-chat-agent-loop-design.md`）。M1 交付后端核心三件：
 JSON Schema 工具注册表、provider 原生 function calling、多跳 `AgentLoop`；
-M2 把 loop 接上了聊天 SSE 端点（真流式）。v1 工具集扩充（M3）、skill 体系
-（M4）、L2 审批门（M7）在后续里程碑落地。
+M2 把 loop 接上了聊天 SSE 端点（真流式）；M3 交付 14 个 v1 标准工具；
+M4 交付 skill 体系（SKILL.md 加载、4 个内置 skill、会话绑定与切换）。
+L2 审批门（M7）在后续里程碑落地。
 
 ## 已实现功能
 
@@ -18,7 +19,7 @@ M2 把 loop 接上了聊天 SSE 端点（真流式）。v1 工具集扩充（M3�
 | M1 多跳 AgentLoop | ✅ | `agent/loop.py`：`AgentLoop.run()` 异步生成器逐跳产出事件，默认 64 跳上限（`[agent]` 配置），超限后无工具收尾汇报 |
 | M2 SSE 流式接线 | ✅ | 新端点 `POST /api/chat/agent/stream` 真流式转发 `AgentEvent`；`SocraticDialogue.stream_agent_reply()` 复用 persona prompt / 历史 / 学习队列；loop 事件随 turn 落 `payload.agent_events`；旧 `/api/chat` 与 `/api/chat/stream`（假流式）保持共存 |
 | M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
-| M4 skill 加载与切换 | ⬜ | `*/SKILL.md` 目录约定 + 4 个内置 skill |
+| M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
 | M7 L2 审批门 | ⬜ | hard_write 工具的对话内审批卡 |
 
 ## 模块结构
@@ -27,12 +28,19 @@ M2 把 loop 接上了聊天 SSE 端点（真流式）。v1 工具集扩充（M3�
 agent/
 ├── loop.py              # AgentLoop + AgentEvent（多跳循环与事件模型）
 ├── orchestrator.py      # 既有空壳编排器（未接 loop）
-├── skill.py             # 既有 Skill ABC + SkillRegistry 骨架（M4 填充）
+├── skill.py             # SkillDefinition / SkillCatalog / SKILL.md 加载（M4）
+│                        # + 既有 Skill ABC / SkillRegistry 代码技能骨架（未使用）
+├── skills_builtin/      # 4 个内置 skill 的 SKILL.md（随包分发）
+│   ├── taste-companion/   # 口味伙伴（默认）
+│   ├── taste-explorer/    # 口味探寻师
+│   ├── bangumi-advisor/   # 追番顾问
+│   └── system-steward/    # 系统管家
 └── tools/
     ├── registry.py      # Tool / ToolResult / ToolRegistry / validate_tool_arguments
     ├── source_tools.py  # 订阅源管理三工具的 JSON Schema 定义与 handler
     ├── common.py        # 共享错误类型（组件缺失/待审批）与输出辅助
     ├── context.py       # AgentToolContext + build_agent_tool_registry（v1 总装）
+    ├── skill_tools.py   # suggest_skill 元工具（agent 建议切换 skill）
     ├── profile_tools.py     # get_profile
     ├── memory_tools.py      # read_memory / write_memory / search_history
     ├── recommendation_tools.py  # get_recommendations / query_discovery_pool
@@ -145,6 +153,51 @@ L2 审批门在 M7 接入。
 上下文策略是「不塞数据，给入口」：工具按需查询系统数据，结果全部有
 长度上限（截断并标注）。
 
+### Skill 体系（M4）
+
+chat skill = 人设 prompt + 工具白名单 + 可用数据声明，载体是
+`*/SKILL.md` 目录约定。加载入口 `load_skill_catalog()`（`agent/skill.py`）：
+先读内置目录 `agent/skills_builtin/`（随 wheel / PyInstaller 分发），再叠加
+用户目录 `{data_dir}/skills/`——同名 skill 用户版覆盖内置版并记 info 日志；
+非法文件跳过并记 warning，不影响启动。frontmatter 是手写的 YAML 子集解析器
+（项目无 PyYAML 依赖）：仅支持 `key: value` 标量、`- item` 块列表与
+`[a, b]` 行内列表。
+
+```markdown
+---
+name: taste-companion        # 必填，slug [a-z0-9][a-z0-9-]*
+title: 口味伙伴               # 可选显示名
+description: 一句话说明        # 必填
+tools:                        # 可选白名单；缺省 = 无工具
+  - get_profile
+  - write_memory
+---
+正文即 system prompt：人设 + 可用数据与工具入口声明（必填，非空）。
+```
+
+`SkillDefinition`（name / description / system_prompt / tools / title /
+source=builtin|custom）与 `SkillCatalog`（`get` / `default` /
+`to_public_list` / `render_switch_guide`）是纯数据层，不持有运行时组件。
+
+内置 4 个 skill 及工具白名单：
+
+| name | 显示名 | 工具白名单 |
+|------|--------|-----------|
+| `taste-companion` | 口味伙伴（默认） | 全部 read + soft_write 共 11 个（无 hard_write） |
+| `taste-explorer` | 口味探寻师 | get_profile / read_memory / write_memory / search_history / submit_feedback（苏格拉底式追问人设） |
+| `bangumi-advisor` | 追番顾问 | get_profile / read_memory / get_recommendations / get_watch_history / save_item / submit_feedback |
+| `system-steward` | 系统管家 | list_sources / get_config + hard_write 三件套（create_source / toggle_source / update_config；人设强调改动需用户批准） |
+
+**会话绑定与切换**：`POST /api/chat/agent/stream` 请求体新增可选 `skill`
+字段（空 = 默认口味伙伴，未知名返回 422）。选中 skill 后：loop 的工具集 =
+`agent_tool_registry.subset(skill.tools)` + `suggest_skill` 元工具；system
+prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
+（`_layer_skill_system_prompt()`，dialogue.py）。会话中切换就是下一回合带
+新的 `skill` 值；**agent 建议切换**走 `suggest_skill` 元工具
+（`agent/tools/skill_tools.py`）：模型输出工具调用（`skill` + `reason`），
+前端把该 `tool_call` 事件渲染成切换卡片，用户确认后以下一回合的 `skill`
+字段生效——agent 自身不能切换。skill 列表见 `GET /api/chat/skills`。
+
 ### 服务层入口
 
 `AgentLoop` 只依赖 `LLMService.complete_with_native_tools()`（协议见
@@ -154,7 +207,8 @@ L2 审批门在 M7 接入。
 ### SSE 事件协议（M2，`POST /api/chat/agent/stream`）
 
 请求体复用 durable turn 结构（与 `POST /api/chat/turns` 相同的字段：
-`message` 必填，`turn_id` / `session` / `scope` 可选）。带 `turn_id` 时完成
+`message` 必填，`turn_id` / `session` / `scope` 可选），M4 起另有可选
+`skill` 字段（默认口味伙伴，未知名 422）。带 `turn_id` 时完成
 该 pending durable turn（`streaming=True` 创建）并把整段事件流落库；不带
 `turn_id` 则为临时运行（不落库）。
 
@@ -168,7 +222,7 @@ L2 审批门在 M7 接入。
 | `tool_result` | `type` / `step` / `tool_name` / `text` / `ok` / `truncated` | 工具执行结果（已按 `tool_result_max_chars` 截断）；`ok=false` 表示未知工具 / 参数校验失败 / handler 异常 |
 | `step_limit_reached` | `type` / `step` / `text` | 达到步数上限时发一次，**随后必跟一个 `final`**（无工具收尾汇报） |
 | `final` | `type` / `step` / `text` | 最终答复，每个 run 恰好一个；发完后流进入收尾 |
-| `done` | `reply` / `turn_id` | 终端事件（端点级，非 loop 事件）；`reply` 即 `final.text` |
+| `done` | `reply` / `turn_id` / `skill` | 终端事件（端点级，非 loop 事件）；`reply` 即 `final.text`，`skill` 是本回合实际生效的 skill 名 |
 | `error` | `error` | LLM 异常等失败的唯一事件（安全文案），发出后流结束；带 `turn_id` 时 turn 置为 `failed` |
 
 `step` 从 1 开始编号。turn 落库时关键步骤（含 thinking / tool_call /
@@ -180,8 +234,10 @@ tool_result / step_limit_reached / final）以相同 dict 结构写入
 
 - `RuntimeContext._rebuild_components()` 在构造 `SocraticDialogue` 后同步构造
   `ctx.agent_loop = AgentLoop.from_config(llm_service,
-  build_source_tool_registry(database), config, caller="agent.chat",
-  bypass_semaphore=True)`，随热重载原子 swap。
+  build_agent_tool_registry(agent_tool_context), config, caller="agent.chat",
+  bypass_semaphore=True)`（M4 起从 M1 的源管理三工具升级为全量 v1 工具集），
+  同时暴露 `ctx.agent_tool_registry`（端点按 skill 做 `subset()`）与
+  `ctx.skill_catalog`（内置 + `data/skills/`），随热重载原子 swap。
 - 端点在 `DialogueExecutionCoordinator` 租约内运行整个 loop（与旧单跳路径
   串行），历史与学习由 `SocraticDialogue.stream_agent_reply()` 在
   `_respond_lock` 下完成：user turn 先 append（失败回滚）、socratic system
