@@ -4839,6 +4839,21 @@ def create_app(
             return True
         return False
 
+    def _store_chat_turn_agent_events(turn_id: str, events: list[dict[str, Any]]) -> bool:
+        """Persist the agent-loop event stream into the turn payload for replay."""
+        store = _chat_db_method("store_chat_turn_agent_events")
+        if store is not None:
+            return bool(store(turn_id, events=events))
+        row = fallback_chat_turns.get(turn_id)
+        if row is None:
+            return False
+        stored_payload = row.get("payload")
+        if not isinstance(stored_payload, dict):
+            stored_payload = {}
+            row["payload"] = stored_payload
+        stored_payload["agent_events"] = [dict(event) for event in events]
+        return True
+
     def _health_profile_ready() -> bool | None:
         soul_engine = getattr(ctx, "soul_engine", None)
         if soul_engine is None:
@@ -11141,6 +11156,82 @@ def create_app(
                 yield sse("content", {"delta": reply[i : i + 18]})
                 await asyncio.sleep(0.015)
             yield sse("done", {"reply": reply})
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/chat/agent/stream")
+    async def chat_agent_stream(payload: ChatTurnIn) -> StreamingResponse:
+        """True-streaming multi-hop agent chat endpoint (「聊一聊」 M2).
+
+        Runs ``AgentLoop`` under the app-wide dialogue execution lease and
+        forwards every ``AgentEvent`` as one SSE event named by its type
+        (``thinking`` / ``tool_call`` / ``tool_result`` /
+        ``step_limit_reached`` / ``final``), followed by a terminal ``done``
+        carrying the final reply. LLM failures map to a single ``error``
+        event. With a ``turn_id`` (created via ``POST /api/chat/turns`` with
+        ``streaming=True``) the turn is completed/failed durably and the
+        loop's events are persisted into the turn payload's ``agent_events``
+        for history replay; without a ``turn_id`` the run is ephemeral. The
+        legacy single-hop ``/api/chat`` and ``/api/chat/stream`` endpoints
+        are unaffected.
+        """
+        message = payload.message.strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="Chat message is required.")
+        agent_config = getattr(getattr(ctx, "config", None), "agent", None)
+        if agent_config is not None and not bool(getattr(agent_config, "loop_enabled", True)):
+            raise HTTPException(status_code=503, detail="Agent loop chat is disabled.")
+        turn_id = payload.turn_id.strip()
+        row = _get_chat_turn_row(turn_id) if turn_id else None
+        turn = _normalize_chat_turn(row) if row else None
+
+        async def _event_stream() -> AsyncIterator[str]:
+            import json as _json
+
+            def sse(event: str, data: dict[str, Any]) -> str:
+                return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+
+            loop_events: list[dict[str, Any]] = []
+            final_reply = ""
+            try:
+                async with _dialogue_execution_lease() as current_dialogue:
+                    agent_loop = getattr(ctx, "agent_loop", None)
+                    stream_fn = getattr(current_dialogue, "stream_agent_reply", None)
+                    if agent_loop is None or not callable(stream_fn):
+                        raise RuntimeError("Agent chat is not configured.")
+                    chat_message = _contextual_chat_message(turn) if turn is not None else message
+                    async for event in stream_fn(
+                        agent_loop,
+                        chat_message,
+                        session=payload.session.strip() or (turn.session if turn else "popup"),
+                        scope=turn.scope if turn is not None else "chat",
+                        turn_id=turn_id,
+                    ):
+                        data = event.to_dict()
+                        loop_events.append(data)
+                        if event.type == "final":
+                            final_reply = event.text
+                        yield sse(event.type, data)
+            except Exception as exc:
+                logger.exception("Agent chat stream failed")
+                error_message = safe_llm_failure_message(exc)
+                if turn_id:
+                    _store_chat_turn_agent_events(turn_id, loop_events)
+                    _fail_chat_turn_row(turn_id, error=error_message)
+                yield sse("error", {"error": error_message})
+                return
+
+            if turn is not None and turn_id:
+                _store_chat_turn_agent_events(turn_id, loop_events)
+                _complete_chat_turn_row(turn_id, reply=final_reply)
+            yield sse("done", {"reply": final_reply, "turn_id": turn_id})
 
         return StreamingResponse(
             _event_stream(),

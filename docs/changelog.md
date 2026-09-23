@@ -2,6 +2,15 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M2：SSE 真流式接线（2026-09-23，feat/chat-agent-loop）
+
+- **新端点 `POST /api/chat/agent/stream`（真流式）**：消费 `AgentLoop.run()`，每个 `AgentEvent.to_dict()` 发一条 SSE event（event 名 = `type`：`thinking` / `tool_call` / `tool_result` / `step_limit_reached` / `final`），`final` 后紧跟端点级 `done`（`reply` + `turn_id`）；LLM 异常映射为单个 `error` 事件并结束流。无工具调用的跳只发 `final`，`step_limit_reached` 后必跟一个收尾 `final`。旧单跳 `/api/chat` 与假流式 `/api/chat/stream` 完全共存不动。事件协议详见 `docs/modules/agent.md`。
+- **对话侧接线 `SocraticDialogue.stream_agent_reply()`**：在 `_respond_lock` 下与 legacy `respond()` 串行，复用同一 socratic persona system prompt、认知历史与时间戳包装；user turn 先 append（loop 异常或空 final 回滚本轮、不触发学习），完成后 append agent 答复。学习提交逻辑抽取为 `_queue_dialogue_learning()`，`respond()` 与新入口共用（queued / legacy_direct / reply_only_test 语义不变；`test_api_app.py` 的 ordinary-chat-settle 结构契约随之指向新符号）。
+- **RuntimeContext 接线**：`_rebuild_components()` 在构造 dialogue 后同步构建 `ctx.agent_loop = AgentLoop.from_config(llm_service, build_source_tool_registry(database), config, caller="agent.chat", bypass_semaphore=True)`，随热重载原子 swap（swappable 组件计数 12 → 13）；degraded context 无 agent_loop，端点以 `error` 事件降级。
+- **并发与持久化**：整个 loop 在 app-owned `DialogueExecutionCoordinator` 租约内运行，与所有生产对话入口串行。带 `turn_id`（先经 `POST /api/chat/turns` 以 `streaming=True` 创建 pending turn）时按既有 CAS 语义 `complete_chat_turn` / `fail_chat_turn` 落终态，并新增 `Database.store_chat_turn_agent_events()` 把整段事件流以 `json_set` 写入 `chat_turns.payload.agent_events`（复用 payload JSON 列，无 schema 迁移），供历史回放；`agent_events` 加入 `ChatTurnIn` server-owned 保留键。不带 `turn_id` 为临时运行（不落库）。
+- **配置**：`[agent]` 新增 `loop_enabled`（默认 `true`），为 false 时端点返回 503；解析 / TOML 渲染 / `config.example.toml` / `docs/modules/config.md` 同步。
+- **回归**：`tests/test_chat_agent_stream_api.py`（多跳事件序列 + turn 落库、step_limit_reached→final→done、error 事件 + turn failed + 部分事件落库、无 turn_id 临时运行、开关 503、无 loop 降级、旧端点不受影响）与 `tests/test_dialogue_agent_stream.py`（事件转发 + 历史记录、queued 学习 payload、LLM 异常回滚、空 final 报错回滚）；`test_config.py` 补 `loop_enabled` round-trip。
+
 ## 聊一聊 Agent Loop M1：后端核心（2026-09-23，feat/chat-agent-loop）
 
 - **JSON Schema 工具注册表（`agent/tools/`）**：新增 `Tool`（name / description / JSON Schema `parameters` / `permission_level` ∈ read/soft_write/hard_write / 同步或异步 handler）与 `ToolRegistry`（注册、skill 白名单 `subset()`、权限过滤 `filter_by_permission()`、OpenAI 格式 `llm_schemas()`、旧扁平格式 `legacy_schemas()`、参数校验 + `dispatch()`/`dispatch_sync()`）。`SOURCE_TOOLS` 三工具迁移为唯一事实来源 `agent/tools/source_tools.py`；`sources/tools.py` 的旧 `SOURCE_TOOLS` 列表与 `SourceToolDispatcher.dispatch()` 接口保持不变，委托同一组 handler（行为变化仅限：`strategy` 枚举与 `toggle_source.id` 必填现在会被参数校验拦截并回读给模型）。

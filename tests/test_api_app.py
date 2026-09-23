@@ -174,7 +174,7 @@ def _dialogue_entry_source(symbol: str, branch_predicate: str = "") -> str:
             id="pending-open-anchor",
         ),
         pytest.param(
-            "SocraticDialogue.respond",
+            "SocraticDialogue._queue_dialogue_learning",
             "self._learning_mode is DialogueLearningMode.QUEUED",
             ("queue.submit(", "DialogueJobKind.LEARN"),
             ("learn_fn(", "_apply_dialogue_settlement("),

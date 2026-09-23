@@ -4338,8 +4338,21 @@ class TestAgentConfig:
 
     def test_defaults(self) -> None:
         config = Config()
+        assert config.agent.loop_enabled is True
         assert config.agent.loop_max_steps == 64
         assert config.agent.tool_result_max_chars == 4000
+
+    def test_loop_enabled_round_trip(self, tmp_path: Path) -> None:
+        config = Config()
+        config.agent.loop_enabled = False
+        target = tmp_path / "config.toml"
+
+        save_config(config, target)
+        rendered = target.read_text(encoding="utf-8")
+        loaded = load_config(target)
+
+        assert "loop_enabled = false" in rendered
+        assert loaded.agent.loop_enabled is False
 
     def test_round_trip_through_toml(self, tmp_path: Path) -> None:
         config = Config()

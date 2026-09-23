@@ -2012,7 +2012,7 @@ class ChatTurnIn(BaseModel):
 
     @model_validator(mode="after")
     def reject_reserved_binding_payload(self) -> Self:
-        """Do not accept client-supplied canonical binding facts."""
+        """Do not accept client-supplied canonical binding facts or replay data."""
         reserved = {
             "dialogue_binding",
             "source_type",
@@ -2027,6 +2027,8 @@ class ChatTurnIn(BaseModel):
             "context",
             "mode",
             "inventory_settles_allowed",
+            # Server-owned agent-loop replay log (written on stream completion).
+            "agent_events",
         }
         # Card creation legitimately accepts ``evidence_refs`` as input. Once
         # a request declares a reply relation, however, even evidence is

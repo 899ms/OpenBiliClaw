@@ -1690,12 +1690,15 @@ class SoulConfig:
 class AgentConfig:
     """Chat agent-loop knobs (「聊一聊」 multi-hop tool calling).
 
-    ``loop_max_steps`` caps the think → tool → observe hops per user turn;
-    when exhausted the model is asked to wrap up and report progress.
-    ``tool_result_max_chars`` bounds each tool result fed back into the
-    prompt (longer results are truncated with a marker).
+    ``loop_enabled`` gates the streaming agent chat endpoint
+    (``POST /api/chat/agent/stream``); the legacy single-hop endpoints stay
+    available either way. ``loop_max_steps`` caps the think → tool → observe
+    hops per user turn; when exhausted the model is asked to wrap up and
+    report progress. ``tool_result_max_chars`` bounds each tool result fed
+    back into the prompt (longer results are truncated with a marker).
     """
 
+    loop_enabled: bool = True
     loop_max_steps: int = 64
     tool_result_max_chars: int = 4000
 
@@ -2659,6 +2662,7 @@ def _build_config(
 
     agent_raw = raw.get("agent", {}) if isinstance(raw.get("agent"), dict) else {}
     agent = AgentConfig(
+        loop_enabled=bool(agent_raw.get("loop_enabled", True)),
         loop_max_steps=_normalize_scheduler_int(
             agent_raw.get("loop_max_steps"),
             default=64,
@@ -6226,6 +6230,10 @@ def _render_config_toml(
             f"{_toml_bool(config.soul.preference.satisfaction_filter_enabled)}",
             "",
             "[agent]",
+            "# 「聊一聊」 agent loop switch (M2). When false, the streaming",
+            "# agent endpoint POST /api/chat/agent/stream is disabled; the",
+            "# legacy single-hop chat endpoints stay available.",
+            f"loop_enabled = {_toml_bool(config.agent.loop_enabled)}",
             "# 「聊一聊」 agent loop budgets (M1). loop_max_steps caps the",
             "# think -> tool -> observe hops per user turn; when exhausted",
             "# the model is asked to wrap up and report progress.",

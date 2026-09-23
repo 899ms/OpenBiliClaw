@@ -465,6 +465,8 @@ class RuntimeContext:
     saved_sync_service: Any = None
     soul_engine: Any = None
     dialogue: Any = None
+    # Multi-hop chat agent loop (「聊一聊」 M2); rebuilt alongside dialogue.
+    agent_loop: Any = None
     # Wave 1: the one self-owned typed dialogue settlement queue. It is not in
     # cancel_all and uses pause/drain + exact permit handoff on hot reload.
     dialogue_settlement_queue: Any = None
@@ -1813,6 +1815,20 @@ class RuntimeContext:
             settlement_queue=new_settlement_queue,
         )
 
+        # Multi-hop chat agent loop (「聊一聊」 M2): same LLM service and
+        # database as the legacy single-hop path; the interactive chat lane
+        # bypasses the background LLM semaphore like ``_respond_with_tools``.
+        from openbiliclaw.agent.loop import AgentLoop
+        from openbiliclaw.agent.tools import build_source_tool_registry
+
+        new_agent_loop = AgentLoop.from_config(
+            new_llm_service,
+            build_source_tool_registry(self.database),
+            new_config,
+            caller="agent.chat",
+            bypass_semaphore=True,
+        )
+
         # 11. Auto-update service
         try:
             new_auto_update = AutoUpdateService(
@@ -1858,6 +1874,7 @@ class RuntimeContext:
         self.saved_sync_service = new_saved_sync_service
         self.soul_engine = new_soul_engine
         self.dialogue = new_dialogue
+        self.agent_loop = new_agent_loop
         self.dialogue_settlement_queue = new_settlement_queue
         self.discovery_engine = new_discovery_engine
         self.recommendation_engine = new_recommendation_engine
@@ -1899,7 +1916,7 @@ class RuntimeContext:
 
         logger.info(
             "Hot-reload complete — rebuilt %d swappable components",
-            12,
+            13,
         )
 
     async def restart_background_tasks(

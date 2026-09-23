@@ -19,9 +19,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
     from datetime import tzinfo
 
+    from openbiliclaw.agent.loop import AgentEvent, AgentLoop
     from openbiliclaw.llm.service import LLMService, ModuleOverride, SupportsComplete
     from openbiliclaw.soul.dialogue_learn_queue import DialogueSettlementQueue
     from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding
@@ -266,62 +267,156 @@ class SocraticDialogue:
             }
             if binding is not None:
                 payload["dialogue_binding"] = binding.to_mapping()
-            if self._learning_mode is DialogueLearningMode.QUEUED:
-                from openbiliclaw.soul.dialogue_learn_queue import (
-                    ANCHOR_NOT_APPLICABLE,
-                    AnchorAdmissionSnapshot,
-                    AnchorPersisted,
-                    DialogueJobKind,
-                )
-
-                queue = self._settlement_queue
-                assert queue is not None
-                # ``submit`` synchronously freezes the queue-global logical
-                # anchor head before the immutable learn envelope is put.
-                frozen_snapshot: AnchorAdmissionSnapshot | None = None
-                if binding is not None:
-                    if binding.mode.value == "bound" and binding.context is not None:
-                        frozen_snapshot = AnchorPersisted(
-                            kind=binding.context.kind,
-                            ref=binding.context.ref,
-                            generation=binding.context.generation,
-                        )
-                    else:
-                        frozen_snapshot = ANCHOR_NOT_APPLICABLE
-                if frozen_snapshot is None:
-                    # Keep the long-standing queue protocol for ordinary
-                    # unbound turns.  Besides avoiding an unnecessary marker,
-                    # this keeps lightweight queue adapters source-compatible.
-                    admitted = queue.submit(DialogueJobKind.LEARN, payload)
-                else:
-                    admitted = queue.submit(
-                        DialogueJobKind.LEARN,
-                        payload,
-                        _server_frozen_anchor_snapshot=frozen_snapshot,
-                    )
-                if admitted is None:
-                    raise DialogueLearningConfigurationError(
-                        "dialogue settlement queue is not accepting learn jobs"
-                    )
-            elif self._learning_mode is DialogueLearningMode.LEGACY_DIRECT:
-                learn_fn = getattr(self._soul_engine, "learn_from_dialogue", None)
-                if callable(learn_fn):
-
-                    async def _background_learn() -> None:
-                        try:
-                            # This explicitly named compatibility path is owned
-                            # only by CLI/OpenClaw. It preserves their baseline
-                            # detached learning semantics without joining the
-                            # API settlement queue or worker guard.
-                            from openbiliclaw.llm.service import _background_admission_bypass
-
-                            with _background_admission_bypass():
-                                await learn_fn(**payload)
-                        except Exception:
-                            logger.exception("Failed to learn from dialogue turn.")
-
-                    asyncio.create_task(_background_learn())
+            self._queue_dialogue_learning(payload, binding=binding)
             return reply
+
+    def _queue_dialogue_learning(
+        self,
+        payload: dict[str, object],
+        *,
+        binding: DialogueTurnBinding | None = None,
+    ) -> None:
+        """Submit post-reply learning according to the learning mode."""
+        if self._learning_mode is DialogueLearningMode.QUEUED:
+            from openbiliclaw.soul.dialogue_learn_queue import (
+                ANCHOR_NOT_APPLICABLE,
+                AnchorAdmissionSnapshot,
+                AnchorPersisted,
+                DialogueJobKind,
+            )
+
+            queue = self._settlement_queue
+            assert queue is not None
+            # ``submit`` synchronously freezes the queue-global logical
+            # anchor head before the immutable learn envelope is put.
+            frozen_snapshot: AnchorAdmissionSnapshot | None = None
+            if binding is not None:
+                if binding.mode.value == "bound" and binding.context is not None:
+                    frozen_snapshot = AnchorPersisted(
+                        kind=binding.context.kind,
+                        ref=binding.context.ref,
+                        generation=binding.context.generation,
+                    )
+                else:
+                    frozen_snapshot = ANCHOR_NOT_APPLICABLE
+            if frozen_snapshot is None:
+                # Keep the long-standing queue protocol for ordinary
+                # unbound turns.  Besides avoiding an unnecessary marker,
+                # this keeps lightweight queue adapters source-compatible.
+                admitted = queue.submit(DialogueJobKind.LEARN, payload)
+            else:
+                admitted = queue.submit(
+                    DialogueJobKind.LEARN,
+                    payload,
+                    _server_frozen_anchor_snapshot=frozen_snapshot,
+                )
+            if admitted is None:
+                raise DialogueLearningConfigurationError(
+                    "dialogue settlement queue is not accepting learn jobs"
+                )
+        elif self._learning_mode is DialogueLearningMode.LEGACY_DIRECT:
+            learn_fn = getattr(self._soul_engine, "learn_from_dialogue", None)
+            if callable(learn_fn):
+
+                async def _background_learn() -> None:
+                    try:
+                        # This explicitly named compatibility path is owned
+                        # only by CLI/OpenClaw. It preserves their baseline
+                        # detached learning semantics without joining the
+                        # API settlement queue or worker guard.
+                        from openbiliclaw.llm.service import _background_admission_bypass
+
+                        with _background_admission_bypass():
+                            await learn_fn(**payload)
+                    except Exception:
+                        logger.exception("Failed to learn from dialogue turn.")
+
+                asyncio.create_task(_background_learn())
+
+    async def stream_agent_reply(
+        self,
+        agent_loop: AgentLoop,
+        user_message: str,
+        *,
+        session: str = "",
+        scope: str = "chat",
+        turn_id: str = "",
+    ) -> AsyncIterator[AgentEvent]:
+        """Run the multi-hop agent loop for one chat turn, streaming events.
+
+        Shares the legacy single-hop path's history, persona prompt and
+        post-reply learning: the user turn is appended before the loop runs
+        (rolled back on failure), the socratic system prompt becomes the
+        loop's system instruction, and the completed exchange is recorded
+        and queued for learning exactly like ``respond``. The dialogue lock
+        is held for the whole run so the shared history stays serialized
+        with the legacy path.
+        """
+        if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
+            raise DialogueLearningConfigurationError(
+                "queued dialogue learning requires DialogueSettlementQueue"
+            )
+
+        from openbiliclaw.llm.prompts import build_socratic_dialogue_prompt
+
+        async with self._respond_lock:
+            self._ensure_history_loaded()
+            history_length = len(self._history)
+            self._history.append(
+                DialogueTurn(
+                    role="user", content=user_message, timestamp=self._local_now().isoformat()
+                )
+            )
+            try:
+                service = self._llm_service or self._build_service()
+                prompt_user_message = self._user_prompt_with_current_time(user_message)
+                tone_profile = None
+                build_tone = getattr(service, "_build_dialogue_tone_profile", None)
+                if callable(build_tone):
+                    tone_profile = build_tone()
+                prompt_messages = build_socratic_dialogue_prompt(
+                    user_message=prompt_user_message,
+                    history=self._history_to_messages(),
+                    core_memory_text="",
+                    tone_profile=tone_profile,
+                    reply_style=str(getattr(service, "reply_style", "") or ""),
+                    dialogue_tone_prompt=str(getattr(service, "dialogue_tone_prompt", "") or ""),
+                )
+                system = prompt_messages[0]["content"] if prompt_messages else ""
+                reply = ""
+                async for event in agent_loop.run(
+                    system_instruction=system,
+                    user_message=prompt_user_message,
+                    history=self._history_to_messages(),
+                ):
+                    if event.type == "final":
+                        reply = event.text
+                    yield event
+                if not reply.strip():
+                    from openbiliclaw.llm.service import LLMResponseContentError
+
+                    raise LLMResponseContentError("LLM returned an empty response")
+            except BaseException:
+                del self._history[history_length:]
+                logger.exception("Failed to generate agent dialogue response.")
+                raise
+
+            self._history.append(
+                DialogueTurn(
+                    role="agent",
+                    content=reply,
+                    timestamp=self._local_now().isoformat(),
+                )
+            )
+            self._queue_dialogue_learning(
+                {
+                    "user_message": user_message,
+                    "assistant_reply": reply,
+                    "session": session.strip() or self._session,
+                    "scope": scope,
+                    "turn_id": turn_id,
+                }
+            )
 
     async def _respond_with_tools(
         self, service: Any, user_message: str, progress: Any = None

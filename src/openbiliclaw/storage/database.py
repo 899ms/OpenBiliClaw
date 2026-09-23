@@ -3718,6 +3718,35 @@ class Database:
         )
         return int(cursor.rowcount or 0) == 1
 
+    def store_chat_turn_agent_events(
+        self,
+        turn_id: str,
+        *,
+        events: list[Mapping[str, object]],
+    ) -> bool:
+        """Persist one agent-loop event stream inside the turn payload.
+
+        The events (``AgentEvent.to_dict()`` shapes: thinking / tool_call /
+        tool_result / step_limit_reached / final) live under
+        ``payload.agent_events`` so chat history replay can re-render the
+        loop's steps without a schema migration.
+        """
+        serialized = json.dumps([dict(event) for event in events], ensure_ascii=False)
+        cursor = self._execute_write(
+            """
+            UPDATE chat_turns
+            SET payload = json_set(
+                    CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                    '$.agent_events',
+                    json(?)
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE turn_id = ?
+            """,
+            (serialized, turn_id),
+        )
+        return int(cursor.rowcount or 0) == 1
+
     def try_create_card_settlement(
         self,
         *,

@@ -1227,6 +1227,7 @@ Awareness seam 固定为 `legacy`。未发布的聚合字段
 |----|------|--------|------|
 | `loop_max_steps` | int | `64` | 每轮对话「思考 → 调工具 → 再思考」的最大跳数（范围 `1..256`，越界回退默认值）。超限后 loop 发出 `step_limit_reached` 事件，并以无工具的收尾调用让模型汇报进展与建议 |
 | `tool_result_max_chars` | int | `4000` | 单次工具结果回填进 prompt 的字符上限（范围 `200..100000`），超出部分截断并标注；截断后的文本同时出现在 `tool_result` 事件（`truncated=true`）与回填消息里 |
+| `loop_enabled` | bool | `true` | 流式 agent 聊天端点 `POST /api/chat/agent/stream` 的开关（M2 起生效）；`false` 时该端点返回 503，旧单跳端点 `/api/chat` 与 `/api/chat/stream` 不受影响 |
 
 ### `[logging]`
 
