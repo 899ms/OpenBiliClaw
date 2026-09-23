@@ -17,7 +17,7 @@ M2 把 loop 接上了聊天 SSE 端点（真流式）。v1 工具集扩充（M3�
 | M1 原生 function calling | ✅ | 见 [llm 模块](llm.md)：OpenAI 系 chat-completions flavor 原生 FC，其余 provider 走 prompt 模拟兜底 |
 | M1 多跳 AgentLoop | ✅ | `agent/loop.py`：`AgentLoop.run()` 异步生成器逐跳产出事件，默认 64 跳上限（`[agent]` 配置），超限后无工具收尾汇报 |
 | M2 SSE 流式接线 | ✅ | 新端点 `POST /api/chat/agent/stream` 真流式转发 `AgentEvent`；`SocraticDialogue.stream_agent_reply()` 复用 persona prompt / 历史 / 学习队列；loop 事件随 turn 落 `payload.agent_events`；旧 `/api/chat` 与 `/api/chat/stream`（假流式）保持共存 |
-| M3 v1 工具集（10–12 个） | ⬜ | 画像/记忆/推荐/B 站数据/discovery/配置只读等 |
+| M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
 | M4 skill 加载与切换 | ⬜ | `*/SKILL.md` 目录约定 + 4 个内置 skill |
 | M7 L2 审批门 | ⬜ | hard_write 工具的对话内审批卡 |
 
@@ -30,7 +30,15 @@ agent/
 ├── skill.py             # 既有 Skill ABC + SkillRegistry 骨架（M4 填充）
 └── tools/
     ├── registry.py      # Tool / ToolResult / ToolRegistry / validate_tool_arguments
-    └── source_tools.py  # 订阅源管理三工具的 JSON Schema 定义与 handler
+    ├── source_tools.py  # 订阅源管理三工具的 JSON Schema 定义与 handler
+    ├── common.py        # 共享错误类型（组件缺失/待审批）与输出辅助
+    ├── context.py       # AgentToolContext + build_agent_tool_registry（v1 总装）
+    ├── profile_tools.py     # get_profile
+    ├── memory_tools.py      # read_memory / write_memory / search_history
+    ├── recommendation_tools.py  # get_recommendations / query_discovery_pool
+    ├── bilibili_tools.py    # get_watch_history（本地数据层）
+    ├── feedback_tools.py    # submit_feedback / save_item（soft_write）
+    └── config_tools.py      # get_config（脱敏只读）/ update_config（审批占位）
 ```
 
 ## 公开 API
@@ -105,6 +113,37 @@ result = registry.dispatch_sync("save_note", {...})  # 旧同步调用方
 `enum`、`items`、`additionalProperties: false`），刻意不做全量实现；handler 内
 部仍保留各自的防御性检查。`permission_level` 目前只是元数据 + 过滤能力，
 L2 审批门在 M7 接入。
+
+### v1 标准工具集（M3）
+
+`AgentToolContext`（`agent/tools/context.py`）是一个轻量 dataclass，持有
+工具所需的运行时组件引用（`database` / `soul_engine` / `memory_manager` /
+`recommendation_engine` / `config` / `event_ingress` / `saved_sync_service`，
+字段名与 `api/runtime_context.py` 对齐，生产接线在后续里程碑完成）。
+`build_agent_tool_registry(ctx)` 总装全部 14 个工具；除源管理三工具
+（构造期绑定 database，无 database 时不注册）外，所有工具始终注册，
+组件缺失时 handler 抛 `ToolComponentUnavailableError`，由 dispatch 映射为
+机器可读的 `handler_error` 结果回填模型。
+
+| 工具 | 权限 | 说明 |
+|------|------|------|
+| `get_profile` | read | 当前生效画像（洋葱模型，`SoulEngine.get_profile()` ⊕ 用户覆盖，markdown 渲染） |
+| `read_memory` | read | 记忆五层读取（core 摘要或 event/preference/awareness/insight/soul 原始 JSON，可截断） |
+| `search_history` | read | 历史对话（`chat_turns` 新增 `Database.search_chat_turns()`）+ 行为事件（`query_events`）关键词/时间范围检索 |
+| `get_recommendations` | read | 推荐池头部只读预览（`get_pool_candidates` / `get_pool_candidates_for_platform`），不消耗池、不标记已展示 |
+| `get_watch_history` | read | 本地内容历史（clicked/shown/removed 投影）与收藏/稍后再看清单，不触发真实抓取 |
+| `query_discovery_pool` | read | discovery 候选池库存：可服务数、待处理数、有货平台、可选抽样 |
+| `get_config` | read | 配置只读，api_key/cookie/token/password 等键递归打码 |
+| `list_sources` | read | 订阅源列表（M1 已有） |
+| `write_memory` | soft_write | 写记忆到各层 `agent_notes` 命名空间（event/preference/awareness/insight），不覆盖引擎字段，soul 层禁写 |
+| `submit_feedback` | soft_write | 推荐反馈（like/dislike/dismiss/comment），复用 `POST /api/feedback` 同款 durable 事件流入（event_ingress 幂等 + 推荐行投影 + 轻量认知钩子） |
+| `save_item` | soft_write | 本地收藏/稍后再看（`SavedSyncService.save_local(auto_sync=False)`，不同步平台账号） |
+| `create_source` | hard_write | 创建订阅源（M1 已有） |
+| `toggle_source` | hard_write | 订阅源开关（M1 已有） |
+| `update_config` | hard_write | 配置修改占位：仅 schema + 登记，handler 抛 `ToolApprovalRequiredError`，真写入待 M7 审批门 |
+
+上下文策略是「不塞数据，给入口」：工具按需查询系统数据，结果全部有
+长度上限（截断并标注）。
 
 ### 服务层入口
 

@@ -2,6 +2,14 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 聊一聊 Agent Loop M3：v1 标准工具集（2026-09-23，feat/chat-agent-loop）
+
+- **`AgentToolContext` + `build_agent_tool_registry()`（`agent/tools/context.py`）**：轻量 dataclass 持有工具所需的运行时组件引用（database / soul_engine / memory_manager / recommendation_engine / config / event_ingress / saved_sync_service，字段名与 `api/runtime_context.py` 对齐但本里程碑不改生产接线）；总装函数一次注册全部 v1 工具。组件缺失时 handler 抛 `ToolComponentUnavailableError`（`agent/tools/common.py`），由 dispatch 统一映射为机器可读 `handler_error` 回填模型，不向上抛异常。
+- **read 级 8 个**：`get_profile`（`SoulEngine.get_profile()` 生效画像 markdown 渲染，未初始化返回可读提示）；`read_memory`（core 摘要 / 五层原始 JSON，`max_chars` 截断）；`search_history`（新增 `Database.search_chat_turns()` 关键词/时间范围检索 + `query_events` 行为事件，source=chat/event/all）；`get_recommendations`（推荐池头部只读预览，走 `get_pool_candidates` 而非 `serve()`，不消耗池）；`get_watch_history`（本地 30 天内容历史投影 clicked/shown/removed + 收藏/稍后再看清单，不触发抓取）；`query_discovery_pool`（候选池库存统计 + 可选抽样）；`get_config`（Config 递归脱敏：api_key/cookie/token/secret/password/credential/sessdata/access_key 一律打码，支持 section 过滤）；`list_sources`（M1 已有）。
+- **soft_write 级 3 个**：`write_memory`（写 event/preference/awareness/insight 层的 `agent_notes` 命名空间，键名/长度校验，soul 层 schema 级禁写）；`submit_feedback`（复用 `POST /api/feedback` / OpenClaw `submit_feedback` 同款 durable 流：`build_event` → `event_ingress.accept` 幂等（缺省自动生成 `chat-agent-<uuid>` ingest_key）→ `update_recommendation_feedback` 投影 → 非阻塞 `record_immediate_feedback_cognition` 钩子；duplicate 不重复投影）；`save_item`（`SavedSyncService.save_local(auto_sync=False)` 本地收藏/稍后再看，不同步平台账号）。
+- **hard_write 级 3 个**：`create_source` / `toggle_source`（M1 已有）；`update_config` 仅定义 schema + 占位 handler（抛 `ToolApprovalRequiredError`，登记 key/value/原因但不落盘），真写入待 M7 审批门。
+- 回归：`tests/test_agent_tool_context.py`（总装/权限过滤/白名单/schema 渲染）、`tests/test_agent_profile_memory_tools.py`、`tests/test_agent_recommendation_tools.py`、`tests/test_agent_bilibili_config_tools.py`（含 get_config 脱敏断言与 `Database.search_chat_turns` 真实库测试），共 54 条新增用例。
+
 ## 聊一聊 Agent Loop M2：SSE 真流式接线（2026-09-23，feat/chat-agent-loop）
 
 - **新端点 `POST /api/chat/agent/stream`（真流式）**：消费 `AgentLoop.run()`，每个 `AgentEvent.to_dict()` 发一条 SSE event（event 名 = `type`：`thinking` / `tool_call` / `tool_result` / `step_limit_reached` / `final`），`final` 后紧跟端点级 `done`（`reply` + `turn_id`）；LLM 异常映射为单个 `error` 事件并结束流。无工具调用的跳只发 `final`，`step_limit_reached` 后必跟一个收尾 `final`。旧单跳 `/api/chat` 与假流式 `/api/chat/stream` 完全共存不动。事件协议详见 `docs/modules/agent.md`。

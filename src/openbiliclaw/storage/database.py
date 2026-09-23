@@ -3600,6 +3600,51 @@ class Database:
         )
         return [self._normalize_chat_turn_row(row) for row in cursor.fetchall()]
 
+    def search_chat_turns(
+        self,
+        *,
+        keyword: str = "",
+        session: str = "",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search durable chat turns by keyword and optional time range, newest first.
+
+        Backs the agent-loop ``search_history`` tool: keyword matches against
+        both the user message and the assistant reply.
+        """
+        self._ensure_fresh_read()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            clauses.append("(message LIKE ? OR reply LIKE ?)")
+            params.extend([like, like])
+        if session:
+            clauses.append("session = ?")
+            params.append(session)
+        if start_time is not None:
+            clauses.append("created_at >= ?")
+            params.append(start_time.isoformat(sep=" "))
+        if end_time is not None:
+            clauses.append("created_at <= ?")
+            params.append(end_time.isoformat(sep=" "))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        cursor = self.conn.execute(
+            f"""
+            SELECT turn_id, session, scope, subject_id, subject_title, reply_to_turn_id, message,
+                   status, reply, error, payload, created_at, updated_at
+            FROM chat_turns
+            {where}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            params,
+        )
+        return [self._normalize_chat_turn_row(row) for row in cursor.fetchall()]
+
     def list_pending_chat_turn_ids(self, *, limit: int | None = None) -> list[str]:
         """Return recoverable pending turns in durable insertion order."""
         self._ensure_fresh_read()
