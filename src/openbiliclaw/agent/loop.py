@@ -1,0 +1,311 @@
+"""Multi-hop agent loop for the 「聊一聊」 chat.
+
+Extends the single-hop tool flow of ``SocraticDialogue._respond_with_tools``
+into a bounded think → call → observe loop. Each hop is one LLM completion;
+tool calls are dispatched through a ``ToolRegistry`` (with JSON Schema
+validation) and results are fed back until the model answers in text or the
+step budget is exhausted.
+
+The loop is an async generator of ``AgentEvent`` so the API layer (M2) can
+stream thinking / tool_call / tool_result / final over SSE without waiting
+for the whole run.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from openbiliclaw.config import Config
+    from openbiliclaw.llm.base import LLMResponse
+
+    from .tools import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_AGENT_LOOP_MAX_STEPS = 64
+DEFAULT_TOOL_RESULT_MAX_CHARS = 4000
+
+AgentEventType = Literal["thinking", "tool_call", "tool_result", "final", "step_limit_reached"]
+
+_STEP_LIMIT_WRAP_UP_INSTRUCTION = (
+    "你已达到本次任务的步数上限，不能再调用任何工具。"
+    "请根据目前已经获得的信息，直接向用户汇报：完成了什么、发现了什么、"
+    "哪些还没做完，以及你建议的下一步。"
+)
+
+
+class SupportsNativeToolCompletion(Protocol):
+    """The slice of ``LLMService`` the agent loop depends on."""
+
+    async def complete_with_native_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        caller: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        bypass_semaphore: bool = False,
+    ) -> LLMResponse: ...
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    """One streamed step of the agent loop.
+
+    ``type`` discriminates the payload: ``thinking`` (per-hop assistant
+    text), ``tool_call`` (name + arguments + summary), ``tool_result``
+    (truncated result text + ok flag), ``final`` (the reply text) and
+    ``step_limit_reached`` (emitted once before the wrap-up ``final``).
+    """
+
+    type: AgentEventType
+    step: int = 0
+    text: str = ""
+    tool_name: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    ok: bool = True
+    truncated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for SSE / JSON transport (M2 wires this into /api/chat)."""
+        data: dict[str, Any] = {"type": self.type, "step": self.step}
+        if self.text:
+            data["text"] = self.text
+        if self.tool_name:
+            data["tool_name"] = self.tool_name
+        if self.arguments:
+            data["arguments"] = self.arguments
+        if self.summary:
+            data["summary"] = self.summary
+        if self.type == "tool_result":
+            data["ok"] = self.ok
+            data["truncated"] = self.truncated
+        return data
+
+
+@dataclass(frozen=True)
+class _NormalizedToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    arguments_raw: str
+
+
+class AgentLoop:
+    """Bounded multi-hop tool-calling loop."""
+
+    def __init__(
+        self,
+        llm: SupportsNativeToolCompletion,
+        tools: ToolRegistry,
+        *,
+        max_steps: int = DEFAULT_AGENT_LOOP_MAX_STEPS,
+        tool_result_max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
+        caller: str = "agent.loop",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        bypass_semaphore: bool = False,
+    ) -> None:
+        self._llm = llm
+        self._tools = tools
+        self._max_steps = max(1, int(max_steps))
+        self._tool_result_max_chars = max(200, int(tool_result_max_chars))
+        self._caller = caller
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+        self._bypass_semaphore = bypass_semaphore
+
+    @classmethod
+    def from_config(
+        cls,
+        llm: SupportsNativeToolCompletion,
+        tools: ToolRegistry,
+        config: Config,
+        **overrides: Any,
+    ) -> AgentLoop:
+        """Build a loop whose budgets come from the ``[agent]`` config section."""
+        agent_config = getattr(config, "agent", None)
+        max_steps = int(getattr(agent_config, "loop_max_steps", DEFAULT_AGENT_LOOP_MAX_STEPS))
+        result_chars = int(
+            getattr(agent_config, "tool_result_max_chars", DEFAULT_TOOL_RESULT_MAX_CHARS)
+        )
+        kwargs: dict[str, Any] = {
+            "max_steps": max_steps,
+            "tool_result_max_chars": result_chars,
+        }
+        kwargs.update(overrides)
+        return cls(llm, tools, **kwargs)
+
+    @property
+    def max_steps(self) -> int:
+        return self._max_steps
+
+    async def run(
+        self,
+        *,
+        system_instruction: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        tools: ToolRegistry | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Run the loop, yielding one event per observable step.
+
+        ``tools`` optionally overrides the registry for this run (e.g. a
+        per-skill whitelist subset). LLM failures propagate to the caller;
+        tool failures are fed back to the model as error results.
+        """
+        registry = tools if tools is not None else self._tools
+        tool_schemas = registry.llm_schemas()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_instruction},
+            *(dict(item) for item in (history or [])),
+            {"role": "user", "content": user_message},
+        ]
+
+        step = 0
+        while step < self._max_steps:
+            step += 1
+            response = await self._complete(messages, tool_schemas)
+            text = (response.content or "").strip()
+            calls = self._normalize_tool_calls(response)
+            if not calls:
+                yield AgentEvent(type="final", step=step, text=text)
+                return
+            # Assistant text accompanying tool calls is intermediate
+            # reasoning, not the reply — surface it as a thinking step.
+            if text:
+                yield AgentEvent(type="thinking", step=step, text=text)
+
+            messages.append(self._assistant_message(text, calls))
+            for call in calls:
+                yield AgentEvent(
+                    type="tool_call",
+                    step=step,
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    summary=_summarize_tool_call(call.name, call.arguments),
+                )
+                result = await registry.dispatch(call.name, call.arguments)
+                content, truncated = self._truncate_result(result.content)
+                if not result.ok:
+                    logger.info(
+                        "Agent loop tool failure (%s): %s -> %s",
+                        result.error,
+                        call.name,
+                        content,
+                    )
+                yield AgentEvent(
+                    type="tool_result",
+                    step=step,
+                    tool_name=call.name,
+                    text=content,
+                    ok=result.ok,
+                    truncated=truncated,
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": content,
+                    }
+                )
+
+        yield AgentEvent(
+            type="step_limit_reached",
+            step=self._max_steps,
+            text=f"已达到本次任务的步数上限（{self._max_steps} 跳）。",
+        )
+        messages.append({"role": "user", "content": _STEP_LIMIT_WRAP_UP_INSTRUCTION})
+        try:
+            wrap_up = await self._complete(messages, [])
+            wrap_up_text = (wrap_up.content or "").strip()
+        except Exception:
+            logger.exception("Agent loop wrap-up completion failed.")
+            wrap_up_text = ""
+        if not wrap_up_text:
+            wrap_up_text = (
+                "这次任务已经跑到了步数上限，我先把目前的进展同步给你："
+                "上面的每一步工具调用和结果都在对话里，"
+                "还没完成的部分建议你告诉我继续，我会接着做。"
+            )
+        yield AgentEvent(type="final", step=self._max_steps, text=wrap_up_text)
+
+    async def _complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMResponse:
+        return await self._llm.complete_with_native_tools(
+            messages=messages,
+            tools=tools,
+            caller=self._caller,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            bypass_semaphore=self._bypass_semaphore,
+        )
+
+    @staticmethod
+    def _normalize_tool_calls(response: LLMResponse) -> list[_NormalizedToolCall]:
+        calls: list[_NormalizedToolCall] = []
+        for index, raw in enumerate(response.tool_calls or []):
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            arguments = raw.get("arguments")
+            calls.append(
+                _NormalizedToolCall(
+                    id=str(raw.get("id") or f"call_{index}"),
+                    name=name,
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                    arguments_raw=str(raw.get("arguments_raw") or ""),
+                )
+            )
+        return calls
+
+    @staticmethod
+    def _assistant_message(
+        text: str,
+        calls: list[_NormalizedToolCall],
+    ) -> dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments_raw
+                        or json.dumps(call.arguments, ensure_ascii=False),
+                    },
+                }
+                for call in calls
+            ],
+        }
+
+    def _truncate_result(self, content: str) -> tuple[str, bool]:
+        if len(content) <= self._tool_result_max_chars:
+            return content, False
+        return content[: self._tool_result_max_chars] + "…（结果已截断）", True
+
+
+def _summarize_tool_call(name: str, arguments: dict[str, Any], *, max_chars: int = 120) -> str:
+    """One-line human summary of a tool call for the collapsed step view."""
+    if arguments:
+        args_text = ", ".join(f"{key}={value!r}" for key, value in arguments.items())
+        summary = f"{name}({args_text})"
+    else:
+        summary = f"{name}()"
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1] + "…"
+    return summary

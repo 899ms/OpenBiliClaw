@@ -1687,6 +1687,20 @@ class SoulConfig:
 
 
 @dataclass
+class AgentConfig:
+    """Chat agent-loop knobs (「聊一聊」 multi-hop tool calling).
+
+    ``loop_max_steps`` caps the think → tool → observe hops per user turn;
+    when exhausted the model is asked to wrap up and report progress.
+    ``tool_result_max_chars`` bounds each tool result fed back into the
+    prompt (longer results are truncated with a marker).
+    """
+
+    loop_max_steps: int = 64
+    tool_result_max_chars: int = 4000
+
+
+@dataclass
 class ApiAuthConfig:
     """Optional password gate for LAN / remote access (see
     ``docs/plans/2026-05-30-web-password-auth-design.md``).
@@ -1779,6 +1793,8 @@ class Config:
     # Top-level `[soul]` is distinct from `[llm.soul]` (per-module
     # provider override): this carries soul-engine behavior toggles.
     soul: SoulConfig = field(default_factory=SoulConfig)
+    # Top-level `[agent]` carries the chat agent-loop budgets (M1).
+    agent: AgentConfig = field(default_factory=AgentConfig)
     tls_proxy: TlsProxyConfig = field(default_factory=TlsProxyConfig)
     tailnet: TailnetConfig = field(default_factory=TailnetConfig)
 
@@ -2641,6 +2657,22 @@ def _build_config(
         dialogue_tone_prompt=raw_dialogue_tone_prompt,
     )
 
+    agent_raw = raw.get("agent", {}) if isinstance(raw.get("agent"), dict) else {}
+    agent = AgentConfig(
+        loop_max_steps=_normalize_scheduler_int(
+            agent_raw.get("loop_max_steps"),
+            default=64,
+            min_value=1,
+            max_value=256,
+        ),
+        tool_result_max_chars=_normalize_scheduler_int(
+            agent_raw.get("tool_result_max_chars"),
+            default=4000,
+            min_value=200,
+            max_value=100000,
+        ),
+    )
+
     api_auth = _build_api_auth(api_raw, consult_environment=consult_environment)
 
     return Config(
@@ -2894,6 +2926,7 @@ def _build_config(
             )
         ),
         soul=soul,
+        agent=agent,
         tls_proxy=_build_tls_proxy(raw, consult_environment=consult_environment),
         tailnet=_build_tailnet(raw, consult_environment=consult_environment),
     )
@@ -6191,6 +6224,15 @@ def _render_config_toml(
             "# evidence instead of being learned as a positive interest.",
             "satisfaction_filter_enabled = "
             f"{_toml_bool(config.soul.preference.satisfaction_filter_enabled)}",
+            "",
+            "[agent]",
+            "# 「聊一聊」 agent loop budgets (M1). loop_max_steps caps the",
+            "# think -> tool -> observe hops per user turn; when exhausted",
+            "# the model is asked to wrap up and report progress.",
+            f"loop_max_steps = {max(1, int(config.agent.loop_max_steps))}",
+            "# Per-tool-result character budget fed back into the prompt;",
+            "# longer results are truncated with a marker.",
+            f"tool_result_max_chars = {max(200, int(config.agent.tool_result_max_chars))}",
             "",
         ]
     )
