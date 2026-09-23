@@ -1,6 +1,6 @@
 """Agent tool registry package (M1: JSON Schema tools + dispatch; M3: v1 tool set)."""
 
-from .common import ToolApprovalRequiredError, ToolComponentUnavailableError
+from .common import ToolComponentUnavailableError
 from .context import AgentToolContext, build_agent_tool_registry
 from .registry import PermissionLevel, Tool, ToolRegistry, ToolResult, validate_tool_arguments
 from .skill_tools import SUGGEST_SKILL_TOOL_NAME, build_suggest_skill_tool
@@ -11,7 +11,6 @@ __all__ = [
     "AgentToolContext",
     "PermissionLevel",
     "Tool",
-    "ToolApprovalRequiredError",
     "ToolComponentUnavailableError",
     "ToolRegistry",
     "ToolResult",

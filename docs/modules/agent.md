@@ -8,7 +8,7 @@ JSON Schema 工具注册表、provider 原生 function calling、多跳 `AgentLo
 M2 把 loop 接上了聊天 SSE 端点（真流式）；M3 交付 14 个 v1 标准工具；
 M4 交付 skill 体系（SKILL.md 加载、4 个内置 skill、会话绑定与切换）；
 M6 交付任务中心（durable 后台任务 + 建议清单回报）；
-L2 审批门（M7）在后续里程碑落地。
+M7 交付 L2 审批门（hard_write 工具逐项审批 + 审计台账）。
 
 ## 已实现功能
 
@@ -22,13 +22,14 @@ L2 审批门（M7）在后续里程碑落地。
 | M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
 | M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
 | M6 任务中心（durable 后台任务） | ✅ | `agent/tasks.py`：`AgentTaskRunner` 在 `BackgroundTaskRegistry` 登记的 asyncio task 里跑**只读** AgentLoop（`filter_by_permission("read")` ∩ skill 白名单），事件逐步落 `agent_tasks.steps`；写动作只经 `propose_suggestion` 元工具产出结构化建议清单，完成后往来源会话写汇总消息；交互侧另有 `start_background_task` 元工具（同 suggest_skill 确认卡模式）。见下文「任务中心（M6）」 |
-| M7 L2 审批门 | ⬜ | hard_write 工具的对话内审批卡 |
+| M7 L2 审批门 | ✅ | `agent/approvals.py`：loop 拦截 hard_write 调用 → `approval_request` SSE 事件 + durable 审批记录（JSON 文件存储，免迁移）；`/api/chat/approvals` 端点批准（二次 dispatch 真执行，幂等）/拒绝；审计落 `profile_update_ledger`。见下文「L2 审批门（M7）」 |
 
 ## 模块结构
 
 ```
 agent/
-├── loop.py              # AgentLoop + AgentEvent（多跳循环与事件模型）
+├── loop.py              # AgentLoop + AgentEvent（多跳循环与事件模型，含 M7 审批拦截）
+├── approvals.py         # ApprovalStore + ApprovalRecord（M7 审批台账，JSON 文件持久化）
 ├── orchestrator.py      # 既有空壳编排器（未接 loop）
 ├── skill.py             # SkillDefinition / SkillCatalog / SKILL.md 加载（M4）
 │                        # + 既有 Skill ABC / SkillRegistry 代码技能骨架（未使用）
@@ -41,7 +42,7 @@ agent/
 └── tools/
     ├── registry.py      # Tool / ToolResult / ToolRegistry / validate_tool_arguments
     ├── source_tools.py  # 订阅源管理三工具的 JSON Schema 定义与 handler
-    ├── common.py        # 共享错误类型（组件缺失/待审批）与输出辅助
+    ├── common.py        # 共享错误类型（组件缺失）与输出辅助
     ├── context.py       # AgentToolContext + build_agent_tool_registry（v1 总装）
     ├── skill_tools.py   # suggest_skill 元工具（agent 建议切换 skill）
     ├── profile_tools.py     # get_profile
@@ -49,7 +50,7 @@ agent/
     ├── recommendation_tools.py  # get_recommendations / query_discovery_pool
     ├── bilibili_tools.py    # get_watch_history（本地数据层）
     ├── feedback_tools.py    # submit_feedback / save_item（soft_write）
-    └── config_tools.py      # get_config（脱敏只读）/ update_config（审批占位）
+    └── config_tools.py      # get_config（脱敏只读）/ update_config（白名单真写入，M7）
 ```
 
 ## 公开 API
@@ -82,6 +83,10 @@ async for event in loop.run(
 - `tool_result`：工具执行结果（`text` 已按 `tool_result_max_chars` 截断，
   `ok` 区分成功/失败，`truncated` 标记截断）。未知工具名与参数校验失败都以
   `ok=false` 的结果回填给模型，让模型自我纠正。
+- `approval_request`（M7）：hard_write 调用被审批门拦截、**未执行**时发出
+  （`approval_id` / `tool_name` / `arguments` / `summary` / `impact`），
+  随后紧跟一条 `tool_result`（回填给模型的「等待审批」说明）。仅在 loop
+  接线了 approval gate 时出现；未接线时保持 M1 直执行为。
 - `step_limit_reached`：达到 `max_steps` 时发出一次，随后 loop 追加一条收尾指令
   并做一次**无工具**调用，让模型汇报进展。
 - `final`：最终回复文本，每个 run 恰好一个（正常收尾或步数上限收尾）。
@@ -122,8 +127,8 @@ result = registry.dispatch_sync("save_note", {...})  # 旧同步调用方
 
 参数校验是 JSON Schema 子集（`type` 含联合类型、`properties`、`required`、
 `enum`、`items`、`additionalProperties: false`），刻意不做全量实现；handler 内
-部仍保留各自的防御性检查。`permission_level` 目前只是元数据 + 过滤能力，
-L2 审批门在 M7 接入。
+部仍保留各自的防御性检查。`permission_level` 是过滤能力 + M7 审批门依据：
+接线 approval gate 的 loop 会把 hard_write 调用拦截为待审批记录。
 
 ### v1 标准工具集（M3）
 
@@ -151,7 +156,7 @@ L2 审批门在 M7 接入。
 | `save_item` | soft_write | 本地收藏/稍后再看（`SavedSyncService.save_local(auto_sync=False)`，不同步平台账号） |
 | `create_source` | hard_write | 创建订阅源（M1 已有） |
 | `toggle_source` | hard_write | 订阅源开关（M1 已有） |
-| `update_config` | hard_write | 配置修改占位：仅 schema + 登记，handler 抛 `ToolApprovalRequiredError`，真写入待 M7 审批门 |
+| `update_config` | hard_write | 配置修改（M7 起真写入）：白名单内已存在标量键（文本/数字/布尔），密钥类与路径/存储类一律拒绝；批准后经 `config_persist_hook` 落 config.toml（失败回滚）并触发 `config_reload_hook` 热重载 |
 
 上下文策略是「不塞数据，给入口」：工具按需查询系统数据，结果全部有
 长度上限（截断并标注）。
@@ -222,16 +227,63 @@ prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
 |-------|-----------|------|
 | `thinking` | `type` / `step` / `text` | 带工具调用的中间跳里模型输出的文本；无工具调用的跳只发 `final`，不重复发 thinking |
 | `tool_call` | `type` / `step` / `tool_name` / `arguments` / `summary` | 一次工具调用；`summary` 是一行折叠摘要（如 `list_sources()`） |
-| `tool_result` | `type` / `step` / `tool_name` / `text` / `ok` / `truncated` | 工具执行结果（已按 `tool_result_max_chars` 截断）；`ok=false` 表示未知工具 / 参数校验失败 / handler 异常 |
+| `tool_result` | `type` / `step` / `tool_name` / `text` / `ok` / `truncated` | 工具执行结果（已按 `tool_result_max_chars` 截断）；`ok=false` 表示未知工具 / 参数校验失败 / handler 异常。hard_write 被拦截时该事件携带的是「已提交审批、等待批准」说明而非真实执行结果 |
+| `approval_request` | `type` / `step` / `approval_id` / `tool_name` / `arguments` / `summary` / `impact` | M7：hard_write 调用已登记为待批准动作（**未执行**），前端据此渲染审批卡（做什么 = `summary`+`arguments`，影响 = `impact`），用户批准后调 `POST /api/chat/approvals/{approval_id}/approve` |
 | `step_limit_reached` | `type` / `step` / `text` | 达到步数上限时发一次，**随后必跟一个 `final`**（无工具收尾汇报） |
 | `final` | `type` / `step` / `text` | 最终答复，每个 run 恰好一个；发完后流进入收尾 |
 | `done` | `reply` / `turn_id` / `skill` | 终端事件（端点级，非 loop 事件）；`reply` 即 `final.text`，`skill` 是本回合实际生效的 skill 名 |
 | `error` | `error` | LLM 异常等失败的唯一事件（安全文案），发出后流结束；带 `turn_id` 时 turn 置为 `failed` |
 
 `step` 从 1 开始编号。turn 落库时关键步骤（含 thinking / tool_call /
-tool_result / step_limit_reached / final）以相同 dict 结构写入
+tool_result / approval_request / step_limit_reached / final）以相同 dict 结构写入
 `chat_turns.payload.agent_events`（JSON 数组，免迁移），历史回放直接读
 `GET /api/chat/turns/{turn_id}` 的 `payload.agent_events`。
+
+### L2 审批门（M7）
+
+hard_write 工具（create_source / toggle_source / update_config）在 agent loop
+里**绝不直接执行**：接线了 approval gate 的 `AgentLoop` 拦截这类调用，把
+「待批准动作」登记进 `ApprovalStore`（`agent/approvals.py`），流出
+`approval_request` 事件，并把「此操作需用户批准，已提交审批 #id」作为
+`tool_result` 回填给模型——**当前回合正常结束**，不在 SSE 流中间挂起等待。
+用户批准后，approve 端点用登记时的原 arguments 二次 `registry.dispatch`
+执行真写入，并把一条 `approval_result` 事件追加进来源 turn 的
+`payload.agent_events`，使历史回放能看到审批结局。
+
+**存储**：`ApprovalStore` 是单 JSON 文件存储（`{data_dir}/chat_approvals.json`，
+tmp + os.replace 原子写，进程内 threading.Lock 串行化），刻意不动
+`storage/database.py`（免迁移）；`path=None` 时为纯内存（测试）。记录字段：
+approval_id（`ap_*`）/ tool_name / arguments / summary（做什么）/ reason
+（为什么，取参数的 `reason`）/ impact（影响说明，来自 `Tool.impact_hint`）/
+session / session_id / turn_id / status / 时间戳 / result / error。
+
+**状态机**：`pending → approved → executed`、`pending → rejected`、
+`pending → expired`（默认 24h TTL，读取/写入时惰性过期）。幂等：重复 approve
+已 approved/executed 的记录直接返回现状（**不重执行**）；重复 reject 同理且
+不再写审计。`mark_executed` 只接受 approved 态，从机制上禁止二次执行；端点侧
+另有一把 asyncio 锁把 approve→execute→mark 串成原子段。approve 后进程崩溃
+会留下 approved 未执行的记录，再次 approve 可重试执行（仅崩溃场景）。
+
+**审计**：每次真实决策（批准执行成功/失败、拒绝）经 `ProfileLedger`
+（`soul/ledger.py`）写 `profile_update_ledger` 一行：`write_point` =
+`agent.approval.<tool>`，`source` = `chat_agent_loop`，`before` 携带
+approval_id + arguments + summary，`after` 携带 status + result，
+`gate_verdict` = approved/rejected，`held_id` = approval_id，`turn_id` 溯源。
+best-effort：台账写入失败不阻塞审批动作。
+
+**端点**（详见 [api 模块](api.md)）：`GET /api/chat/approvals`
+（`?status=&limit=`）、`POST /api/chat/approvals/{id}/approve`、
+`POST /api/chat/approvals/{id}/reject`（body 可带 `reason`）。
+
+**update_config 白名单**：批准后的真写入只允许「已存在的普通标量键」——
+目标字段当前值必须是 str/int/float/bool（新值按当前类型 coercion，布尔接受
+true/false/1/0/yes/no/on/off）；键任一段命中密钥类标记（api_key / cookie /
+token / secret / password / credential / sessdata / access_key）或路径/存储类
+标记（dir / path / file / database 分词匹配，外加显式 `data_dir`）一律拒绝。
+写入顺序：改 live Config → `config_persist_hook` 落盘（失败即回滚内存值并抛错）
+→ `config_reload_hook` 触发热重载（生产接线 = app 层
+`_rebuild_runtime_with_lane_handoff`，经 `ctx.config_reload_delegate` 委托；
+未接线时结果文案注明重启后生效）。
 
 ### 任务中心（M6，durable 后台任务）
 
@@ -274,9 +326,14 @@ skill?)` 元工具（read 级、无副作用，注册进每个 skill 子集，�
 - `RuntimeContext._rebuild_components()` 在构造 `SocraticDialogue` 后同步构造
   `ctx.agent_loop = AgentLoop.from_config(llm_service,
   build_agent_tool_registry(agent_tool_context), config, caller="agent.chat",
-  bypass_semaphore=True)`（M4 起从 M1 的源管理三工具升级为全量 v1 工具集），
-  同时暴露 `ctx.agent_tool_registry`（端点按 skill 做 `subset()`）与
-  `ctx.skill_catalog`（内置 + `data/skills/`），随热重载原子 swap。
+  bypass_semaphore=True, approval_gate=chat_approval_store)`（M4 起从 M1 的源管理
+  三工具升级为全量 v1 工具集；M7 起挂审批门），同时暴露
+  `ctx.agent_tool_registry`（端点按 skill 做 `subset()`）、`ctx.agent_tool_context`
+  （M7：update_config 的 persist/reload hook 载体）、`ctx.chat_approval_store`
+  （M7：`{data_dir}/chat_approvals.json`）与 `ctx.skill_catalog`
+  （内置 + `data/skills/`），随热重载原子 swap；`ctx.config_reload_delegate`
+  由 `create_app` 启动时一次性指向 `_rebuild_runtime_with_lane_handoff`，
+  不随 rebuild 覆盖。
 - 端点在 `DialogueExecutionCoordinator` 租约内运行整个 loop（与旧单跳路径
   串行），历史与学习由 `SocraticDialogue.stream_agent_reply()` 在
   `_respond_lock` 下完成：user turn 先 append（失败回滚）、socratic system

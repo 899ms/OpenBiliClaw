@@ -16,10 +16,6 @@ class ToolComponentUnavailableError(RuntimeError):
     """Raised when a handler's required runtime component is not wired."""
 
 
-class ToolApprovalRequiredError(RuntimeError):
-    """Raised by hard_write placeholder handlers pending the M7 approval gate."""
-
-
 def require_component(component: Any, name: str) -> Any:
     """Return ``component`` or raise a machine-diagnosable unavailability error."""
     if component is None:

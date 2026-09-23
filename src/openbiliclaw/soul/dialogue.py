@@ -343,6 +343,7 @@ class SocraticDialogue:
         session: str = "",
         scope: str = "chat",
         turn_id: str = "",
+        session_id: str = "",
         skill: SkillDefinition | None = None,
         tools: ToolRegistry | None = None,
         skill_switch_guide: str = "",
@@ -361,6 +362,10 @@ class SocraticDialogue:
         ``skill_switch_guide`` block are layered on top of the base socratic
         system prompt, and ``tools`` (the skill's whitelist subset plus meta
         tools) overrides the loop's registry for this run.
+
+        M7: ``session`` / ``session_id`` / ``turn_id`` are forwarded as the
+        loop's approval context so parked hard_write approvals can be traced
+        back to the conversation that requested them.
         """
         if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
             raise DialogueLearningConfigurationError(
@@ -403,6 +408,11 @@ class SocraticDialogue:
                     user_message=prompt_user_message,
                     history=self._history_to_messages(),
                     tools=tools,
+                    approval_context={
+                        "session": session.strip() or self._session,
+                        "session_id": session_id.strip(),
+                        "turn_id": turn_id,
+                    },
                 ):
                     if event.type == "final":
                         reply = event.text

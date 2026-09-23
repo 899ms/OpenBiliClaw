@@ -28,7 +28,14 @@ from .source_tools import build_source_tool_registry
 
 @dataclass
 class AgentToolContext:
-    """Runtime component references available to the chat-agent tools."""
+    """Runtime component references available to the chat-agent tools.
+
+    ``config_persist_hook`` / ``config_reload_hook`` are the M7 seams used
+    by the ``update_config`` tool once its approval is granted: the persist
+    hook saves the mutated ``Config`` (returns the saved path), the reload
+    hook triggers the runtime hot-reload (may return an awaitable). Both
+    are optional; without them the tool refuses to write.
+    """
 
     database: Any = None
     soul_engine: Any = None
@@ -37,6 +44,8 @@ class AgentToolContext:
     config: Any = None
     event_ingress: Any = None
     saved_sync_service: Any = None
+    config_persist_hook: Any = None
+    config_reload_hook: Any = None
 
 
 def build_agent_tool_registry(ctx: AgentToolContext) -> ToolRegistry:

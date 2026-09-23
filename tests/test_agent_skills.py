@@ -346,6 +346,7 @@ class FakeSkillDialogue:
         session: str = "",
         scope: str = "chat",
         turn_id: str = "",
+        session_id: str = "",
         skill: Any = None,
         tools: Any = None,
         skill_switch_guide: str = "",
@@ -353,6 +354,7 @@ class FakeSkillDialogue:
         self.agent_calls.append(
             {
                 "message": message,
+                "session_id": session_id,
                 "skill": skill,
                 "tools": tools,
                 "skill_switch_guide": skill_switch_guide,

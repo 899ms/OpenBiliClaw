@@ -3311,6 +3311,9 @@ def create_app(
     # Keeping it on app.state also makes drain/publication invariants directly
     # testable without forcing a config.toml write through the HTTP surface.
     app.state._rebuild_runtime_with_lane_handoff = _rebuild_runtime_with_lane_handoff
+    # M7: the update_config tool (post-approval) hot-reloads through the same
+    # lane-handoff path instead of rebuilding raw inside a chat turn.
+    ctx.config_reload_delegate = _rebuild_runtime_with_lane_handoff
 
     def _set_config_apply_status(
         state: Literal["idle", "queued", "applying", "applied", "failed"],
@@ -11464,6 +11467,7 @@ def create_app(
                         session=payload.session.strip() or (turn.session if turn else "popup"),
                         scope=turn.scope if turn is not None else "chat",
                         turn_id=turn_id,
+                        session_id=effective_session_id,
                         skill=skill_definition,
                         tools=_skill_tool_subset(skill_definition, skill_catalog),
                         skill_switch_guide=(
@@ -13129,6 +13133,199 @@ def create_app(
             user_initiated=True,
         )
         return turn
+
+    # ── M7: L2 hard-write approval gate ─────────────────────────────
+    # The agent loop parks hard_write tool calls as durable approval records
+    # (``ctx.chat_approval_store``, JSON-backed, no schema migration) and
+    # streams an ``approval_request`` SSE event. These endpoints are the only
+    # execution path: approve re-dispatches the recorded tool call exactly
+    # once (idempotent), reject closes the record. Both write the audit
+    # ledger (``soul/ledger.py`` → ``profile_update_ledger``) and append an
+    # ``approval_result`` event to the originating turn's ``agent_events``
+    # so history replay shows the outcome inline.
+
+    _chat_approval_execution_lock = asyncio.Lock()
+
+    def _chat_approval_store_or_503() -> Any:
+        store = getattr(ctx, "chat_approval_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Chat approvals are not configured.")
+        return store
+
+    def _chat_approval_or_404(store: Any, approval_id: str) -> Any:
+        record = store.get(approval_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Approval not found.")
+        return record
+
+    def _record_chat_approval_ledger(
+        record: Any,
+        *,
+        verdict: str,
+        outcome: str,
+        error: str = "",
+    ) -> None:
+        """Best-effort audit row: who/when/tool/arguments/result per decision."""
+        from openbiliclaw.soul.ledger import ProfileLedger
+
+        ProfileLedger(getattr(ctx, "database", None)).record(
+            write_point=f"agent.approval.{record.tool_name}",
+            source="chat_agent_loop",
+            before={
+                "approval_id": record.approval_id,
+                "summary": record.summary,
+                "arguments": record.arguments,
+            },
+            after={"status": record.status, "result": record.result},
+            outcome=outcome,
+            turn_id=getattr(record, "turn_id", ""),
+            gate_verdict=verdict,
+            held_id=record.approval_id,
+            error=error,
+        )
+
+    def _append_chat_turn_agent_event(turn_id: str, event: dict[str, Any]) -> bool:
+        """Append one event to a durable turn's ``payload.agent_events``."""
+        if not turn_id.strip():
+            return False
+        row = _read_chat_turn_row(turn_id.strip())
+        if row is None:
+            return False
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        existing = payload.get("agent_events")
+        events = (
+            [dict(item) for item in existing if isinstance(item, dict)]
+            if isinstance(existing, list)
+            else []
+        )
+        events.append(dict(event))
+        return _store_chat_turn_agent_events(turn_id.strip(), events)
+
+    def _approval_result_event(
+        record: Any, *, decision: str, ok: bool, text: str
+    ) -> dict[str, Any]:
+        return {
+            "type": "approval_result",
+            "approval_id": record.approval_id,
+            "tool_name": record.tool_name,
+            "decision": decision,
+            "ok": ok,
+            "text": text[:2000],
+        }
+
+    @app.get("/api/chat/approvals", response_model=None)
+    async def list_chat_approvals(
+        status: str = Query(default=""),
+        limit: int = Query(default=50),
+    ) -> dict[str, Any]:
+        """List hard-write approvals (default: all states, newest first)."""
+        store = _chat_approval_store_or_503()
+        normalized = status.strip()
+        if normalized and normalized not in {
+            "pending",
+            "approved",
+            "rejected",
+            "executed",
+            "expired",
+        }:
+            raise HTTPException(status_code=422, detail=f"Unknown approval status: {status}")
+        records = store.list(status=normalized, limit=limit)
+        return {"count": len(records), "items": [record.to_dict() for record in records]}
+
+    @app.post("/api/chat/approvals/{approval_id}/approve", response_model=None)
+    async def approve_chat_approval(approval_id: str) -> dict[str, Any]:
+        """Approve one parked hard-write action and execute it exactly once.
+
+        Idempotent: re-approving an executed record returns the stored result
+        without re-running the tool. Rejected/expired records conflict (409).
+        Execution results feed the audit ledger and the originating turn's
+        event stream; the next chat turn sees the outcome in history.
+        """
+        from openbiliclaw.agent.approvals import ApprovalConflictError
+
+        store = _chat_approval_store_or_503()
+        _chat_approval_or_404(store, approval_id)
+        # One execution at a time: the lock makes approve→execute→mark atomic
+        # against concurrent duplicate clicks.
+        async with _chat_approval_execution_lock:
+            try:
+                record = store.approve(approval_id)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="Approval not found.") from exc
+            except ApprovalConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if record.status == "executed":
+                return {
+                    "approval": record.to_dict(),
+                    "executed": False,
+                    "already_executed": True,
+                    "ok": not record.error,
+                    "result": record.result,
+                }
+            registry = getattr(ctx, "agent_tool_registry", None)
+            dispatch = getattr(registry, "dispatch", None)
+            if not callable(dispatch):
+                raise HTTPException(status_code=503, detail="Agent tools are not configured.")
+            outcome = await dispatch(record.tool_name, dict(record.arguments))
+            record = store.mark_executed(
+                approval_id,
+                ok=outcome.ok,
+                result=outcome.content,
+                error="" if outcome.ok else (outcome.error or "执行失败"),
+            )
+        _record_chat_approval_ledger(
+            record,
+            verdict="approved",
+            outcome="success" if outcome.ok else "failed",
+            error="" if outcome.ok else outcome.content,
+        )
+        _append_chat_turn_agent_event(
+            record.turn_id,
+            _approval_result_event(
+                record, decision="approved", ok=outcome.ok, text=outcome.content
+            ),
+        )
+        return {
+            "approval": record.to_dict(),
+            "executed": True,
+            "already_executed": False,
+            "ok": outcome.ok,
+            "result": outcome.content,
+        }
+
+    @app.post("/api/chat/approvals/{approval_id}/reject", response_model=None)
+    async def reject_chat_approval(
+        approval_id: str,
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+    ) -> dict[str, Any]:
+        """Reject one pending approval; the action is never executed."""
+        from openbiliclaw.agent.approvals import ApprovalConflictError
+
+        store = _chat_approval_store_or_503()
+        # Snapshot the status: the store returns the live mutable record.
+        before_status = _chat_approval_or_404(store, approval_id).status
+        reason = str((payload or {}).get("reason") or "").strip()
+        try:
+            record = store.reject(approval_id, reason=reason)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Approval not found.") from exc
+        except ApprovalConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if before_status != "rejected":
+            # Skip the audit row / replay event on idempotent re-rejects.
+            _record_chat_approval_ledger(record, verdict="rejected", outcome="success")
+            _append_chat_turn_agent_event(
+                record.turn_id,
+                _approval_result_event(
+                    record,
+                    decision="rejected",
+                    ok=True,
+                    text="用户拒绝了该操作，未执行。",
+                ),
+            )
+        return {"approval": record.to_dict(), "ok": True}
 
     @app.post("/api/chat/cards/{turn_id}/action", response_model=None)
     async def act_on_chat_card(

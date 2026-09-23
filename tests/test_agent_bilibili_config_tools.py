@@ -144,21 +144,103 @@ class TestGetConfig:
 
 
 class TestUpdateConfig:
-    async def test_placeholder_requires_approval(self) -> None:
-        ctx = AgentToolContext(config=Config())
+    def _ctx(self, **hooks: Any) -> AgentToolContext:
+        return AgentToolContext(config=Config(), **hooks)
+
+    async def test_real_write_applies_persists_and_reloads(self) -> None:
+        persisted: list[str] = []
+        reloaded: list[str] = []
+        ctx = self._ctx(
+            config_persist_hook=lambda cfg: persisted.append(cfg.language) or "/tmp/config.toml",
+            config_reload_hook=lambda cfg: reloaded.append(cfg.language),
+        )
         result = await _registry(build_config_tools, ctx=ctx).dispatch(
-            "update_config", {"key": "llm.default_provider", "value": "claude"}
+            "update_config", {"key": "language", "value": "en-US", "reason": "用户要求"}
+        )
+        assert result.ok
+        assert ctx.config.language == "en-US"
+        assert persisted == ["en-US"]
+        assert reloaded == ["en-US"]
+        assert "language" in result.content
+        assert "热重载" in result.content
+
+    async def test_secret_key_refused(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "llm.deepseek.api_key", "value": "sk-x"}
+        )
+        assert result.ok
+        assert "敏感" in result.content
+        assert ctx.config.llm.deepseek.api_key != "sk-x"
+
+    async def test_path_key_refused(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "data_dir", "value": "/elsewhere"}
+        )
+        assert result.ok
+        assert "不允许" in result.content
+
+    async def test_unknown_key_refused(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "llm.no_such_field", "value": "x"}
+        )
+        assert result.ok
+        assert "不存在" in result.content
+
+    async def test_bool_coercion(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        current = ctx.config.scheduler.auto_update_enabled
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config",
+            {"key": "scheduler.auto_update_enabled", "value": "false" if current else "true"},
+        )
+        assert result.ok, result.content
+        assert ctx.config.scheduler.auto_update_enabled is (not current)
+
+    async def test_bool_coercion_failure_is_readable(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "scheduler.auto_update_enabled", "value": "maybe"}
+        )
+        assert result.ok
+        assert "布尔" in result.content
+
+    async def test_persist_failure_rolls_back(self) -> None:
+        def _failing_hook(cfg: Any) -> str:
+            raise OSError("disk full")
+
+        ctx = self._ctx(config_persist_hook=_failing_hook)
+        before = ctx.config.language
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "language", "value": "en-US"}
         )
         assert not result.ok
         assert result.error == "handler_error"
-        assert "审批" in result.content
-        assert "未执行任何写入" in result.content
+        assert ctx.config.language == before
+
+    async def test_missing_persist_hook_is_unavailable(self) -> None:
+        result = await _registry(build_config_tools, ctx=self._ctx()).dispatch(
+            "update_config", {"key": "language", "value": "en-US"}
+        )
+        assert not result.ok
+        assert result.error == "handler_error"
+
+    async def test_same_value_is_a_noop(self) -> None:
+        ctx = self._ctx(config_persist_hook=lambda cfg: "/tmp/config.toml")
+        result = await _registry(build_config_tools, ctx=ctx).dispatch(
+            "update_config", {"key": "language", "value": ctx.config.language}
+        )
+        assert result.ok
+        assert "无需修改" in result.content
 
     async def test_permission_level_is_hard_write(self) -> None:
         registry = _registry(build_config_tools, ctx=AgentToolContext(config=Config()))
         tool = registry.get("update_config")
         assert tool is not None
         assert tool.permission_level == "hard_write"
+        assert tool.impact_hint
 
     async def test_missing_required_fields(self) -> None:
         ctx = AgentToolContext(config=Config())

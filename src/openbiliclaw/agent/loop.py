@@ -8,7 +8,8 @@ step budget is exhausted.
 
 The loop is an async generator of ``AgentEvent`` so the API layer (M2) can
 stream thinking / tool_call / tool_result / final over SSE without waiting
-for the whole run.
+for the whole run. With an approval gate wired (M7), hard_write calls are
+intercepted into pending approvals instead of being executed.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
 
     from openbiliclaw.config import Config
     from openbiliclaw.llm.base import LLMResponse
@@ -31,12 +32,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_AGENT_LOOP_MAX_STEPS = 64
 DEFAULT_TOOL_RESULT_MAX_CHARS = 4000
 
-AgentEventType = Literal["thinking", "tool_call", "tool_result", "final", "step_limit_reached"]
+AgentEventType = Literal[
+    "thinking",
+    "tool_call",
+    "tool_result",
+    "approval_request",
+    "final",
+    "step_limit_reached",
+]
 
 _STEP_LIMIT_WRAP_UP_INSTRUCTION = (
     "你已达到本次任务的步数上限，不能再调用任何工具。"
     "请根据目前已经获得的信息，直接向用户汇报：完成了什么、发现了什么、"
     "哪些还没做完，以及你建议的下一步。"
+)
+
+_APPROVAL_PENDING_FEEDBACK = (
+    "此操作属于高风险写入（hard_write），必须经用户逐项审批，本次未执行。"
+    "已生成待批准动作卡片（审批 ID: {approval_id}）。不要重复调用该工具；"
+    "请直接继续回答用户，说明该动作已提交审批、等待用户在对话中批准，"
+    "批准后系统会自动执行并反馈结果。"
 )
 
 
@@ -56,13 +71,37 @@ class SupportsNativeToolCompletion(Protocol):
     ) -> LLMResponse: ...
 
 
+class SupportsApprovalGate(Protocol):
+    """The slice of ``ApprovalStore`` the agent loop depends on (M7).
+
+    ``submit`` registers one pending approval and returns a record carrying
+    an ``approval_id`` attribute. Implementations must never execute the
+    tool — execution happens only via the approval endpoints.
+    """
+
+    def submit(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        summary: str,
+        reason: str = "",
+        impact: str = "",
+        session: str = "",
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> Any: ...
+
+
 @dataclass(frozen=True)
 class AgentEvent:
     """One streamed step of the agent loop.
 
     ``type`` discriminates the payload: ``thinking`` (per-hop assistant
     text), ``tool_call`` (name + arguments + summary), ``tool_result``
-    (truncated result text + ok flag), ``final`` (the reply text) and
+    (truncated result text + ok flag), ``approval_request`` (M7: a
+    hard_write call was intercepted and parked as a pending approval,
+    carrying ``approval_id`` + ``impact``), ``final`` (the reply text) and
     ``step_limit_reached`` (emitted once before the wrap-up ``final``).
     """
 
@@ -74,6 +113,8 @@ class AgentEvent:
     summary: str = ""
     ok: bool = True
     truncated: bool = False
+    approval_id: str = ""
+    impact: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for SSE / JSON transport (M2 wires this into /api/chat)."""
@@ -86,6 +127,10 @@ class AgentEvent:
             data["arguments"] = self.arguments
         if self.summary:
             data["summary"] = self.summary
+        if self.approval_id:
+            data["approval_id"] = self.approval_id
+        if self.impact:
+            data["impact"] = self.impact
         if self.type == "tool_result":
             data["ok"] = self.ok
             data["truncated"] = self.truncated
@@ -114,6 +159,7 @@ class AgentLoop:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         bypass_semaphore: bool = False,
+        approval_gate: SupportsApprovalGate | None = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -123,6 +169,7 @@ class AgentLoop:
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._bypass_semaphore = bypass_semaphore
+        self._approval_gate = approval_gate
 
     @classmethod
     def from_config(
@@ -156,15 +203,26 @@ class AgentLoop:
         user_message: str,
         history: list[dict[str, str]] | None = None,
         tools: ToolRegistry | None = None,
+        approval_context: Mapping[str, str] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the loop, yielding one event per observable step.
 
         ``tools`` optionally overrides the registry for this run (e.g. a
         per-skill whitelist subset). LLM failures propagate to the caller;
         tool failures are fed back to the model as error results.
+
+        M7 approval gate: when an ``approval_gate`` is wired, hard_write
+        tool calls are NOT executed. Each one is submitted to the gate,
+        streamed as an ``approval_request`` event, and answered to the
+        model with an "awaiting approval" tool result so the turn can
+        finish; the user then executes it via the approval endpoints.
+        ``approval_context`` carries session/session_id/turn_id onto the
+        approval record. Without a gate the legacy direct-execution
+        behavior is preserved.
         """
         registry = tools if tools is not None else self._tools
         tool_schemas = registry.llm_schemas()
+        approval_context = dict(approval_context or {})
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_instruction},
             *(dict(item) for item in (history or [])),
@@ -187,13 +245,69 @@ class AgentLoop:
 
             messages.append(self._assistant_message(text, calls))
             for call in calls:
+                summary = _summarize_tool_call(call.name, call.arguments)
                 yield AgentEvent(
                     type="tool_call",
                     step=step,
                     tool_name=call.name,
                     arguments=call.arguments,
-                    summary=_summarize_tool_call(call.name, call.arguments),
+                    summary=summary,
                 )
+                tool = registry.get(call.name)
+                if (
+                    tool is not None
+                    and tool.permission_level == "hard_write"
+                    and self._approval_gate is not None
+                ):
+                    content = ""
+                    try:
+                        record = self._approval_gate.submit(
+                            tool_name=call.name,
+                            arguments=call.arguments,
+                            summary=summary,
+                            reason=str(call.arguments.get("reason") or ""),
+                            impact=tool.impact_hint,
+                            session=str(approval_context.get("session", "")),
+                            session_id=str(approval_context.get("session_id", "")),
+                            turn_id=str(approval_context.get("turn_id", "")),
+                        )
+                        approval_id = str(getattr(record, "approval_id", "") or "")
+                    except Exception as exc:
+                        logger.exception("Approval gate submission failed: %s", call.name)
+                        content = f"审批登记失败，操作未执行: {exc}"
+                        yield AgentEvent(
+                            type="tool_result",
+                            step=step,
+                            tool_name=call.name,
+                            text=content,
+                            ok=False,
+                        )
+                    else:
+                        yield AgentEvent(
+                            type="approval_request",
+                            step=step,
+                            tool_name=call.name,
+                            arguments=call.arguments,
+                            summary=summary,
+                            approval_id=approval_id,
+                            impact=tool.impact_hint,
+                        )
+                        content = _APPROVAL_PENDING_FEEDBACK.format(approval_id=approval_id)
+                        yield AgentEvent(
+                            type="tool_result",
+                            step=step,
+                            tool_name=call.name,
+                            text=content,
+                            ok=True,
+                        )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": content,
+                        }
+                    )
+                    continue
                 result = await registry.dispatch(call.name, call.arguments)
                 content, truncated = self._truncate_result(result.content)
                 if not result.ok:

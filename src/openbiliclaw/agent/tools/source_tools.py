@@ -25,6 +25,7 @@ def build_source_tool_registry(database: Any) -> ToolRegistry:
                 name="create_source",
                 description="创建新的内容源订阅。当用户说想关注某个平台的某类内容时调用。",
                 permission_level="hard_write",
+                impact_hint="新增一个内容源订阅，会参与后续的内容发现与推荐。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -64,6 +65,7 @@ def build_source_tool_registry(database: Any) -> ToolRegistry:
                 name="toggle_source",
                 description="启用或禁用某个内容源订阅。",
                 permission_level="hard_write",
+                impact_hint="改变该订阅的启用状态，会影响后续内容发现与推荐。",
                 parameters={
                     "type": "object",
                     "properties": {

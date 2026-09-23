@@ -76,6 +76,13 @@ def _pool_source_shares_from_config(config: Any) -> dict[str, int]:
     return effective_pool_source_shares(config)
 
 
+def _persist_agent_config(config: Any) -> str:
+    """Persist hook for the M7 ``update_config`` tool; returns the saved path."""
+    from openbiliclaw.config import save_config
+
+    return str(save_config(config))
+
+
 def build_youtube_discovery_strategies(
     *,
     config: Any,
@@ -475,6 +482,15 @@ class RuntimeContext:
     # layer and resolves loop/registry/catalog from this context at run start,
     # so one instance survives the hot-reload atomic swap.
     agent_task_runner: Any = None
+    # M7: the AgentToolContext behind the registry (kept so the API layer can
+    # inspect/rewire hooks) and the durable hard-write approval store backing
+    # the loop's approval gate and the /api/chat/approvals endpoints.
+    agent_tool_context: Any = None
+    chat_approval_store: Any = None
+    # Stable app-owned delegate (set once by create_app) used by the
+    # update_config tool to hot-reload through the lane-handoff path. Not
+    # reassigned by _rebuild_components.
+    config_reload_delegate: Any = None
     # Wave 1: the one self-owned typed dialogue settlement queue. It is not in
     # cancel_all and uses pause/drain + exact permit handoff on hot reload.
     dialogue_settlement_queue: Any = None
@@ -528,6 +544,19 @@ class RuntimeContext:
         """Register a stable post-commit observer once for this context."""
         if callback not in self._pool_inventory_commit_subscribers:
             self._pool_inventory_commit_subscribers.append(callback)
+
+    def _request_config_reload(self, new_config: Any) -> Any:
+        """Reload hook for the M7 ``update_config`` tool.
+
+        Delegates to the app-layer lane-handoff rebuild when wired (returns
+        its awaitable so the tool handler can await it); returns ``None``
+        when no delegate is installed, letting the tool note that a restart
+        is required instead.
+        """
+        delegate = self.config_reload_delegate
+        if not callable(delegate):
+            return None
+        return delegate(new_config)
 
     async def _handle_pool_inventory_commit(
         self,
@@ -1831,26 +1860,34 @@ class RuntimeContext:
         # endpoint subsets it per skill via ``ToolRegistry.subset``.
         from pathlib import Path
 
+        from openbiliclaw.agent.approvals import ApprovalStore
         from openbiliclaw.agent.loop import AgentLoop
         from openbiliclaw.agent.skill import load_skill_catalog
         from openbiliclaw.agent.tools import AgentToolContext, build_agent_tool_registry
 
-        new_agent_tool_registry = build_agent_tool_registry(
-            AgentToolContext(
-                database=self.database,
-                soul_engine=new_soul_engine,
-                memory_manager=self.memory_manager,
-                recommendation_engine=new_recommendation_engine,
-                config=new_config,
-                saved_sync_service=new_saved_sync_service,
-            )
+        # M7: hard_write calls are parked in a durable approval store instead
+        # of executing in-loop; the approve endpoint re-dispatches them.
+        new_chat_approval_store = ApprovalStore(
+            Path(str(getattr(new_config, "data_dir", "data") or "data")) / "chat_approvals.json"
         )
+        new_agent_tool_context = AgentToolContext(
+            database=self.database,
+            soul_engine=new_soul_engine,
+            memory_manager=self.memory_manager,
+            recommendation_engine=new_recommendation_engine,
+            config=new_config,
+            saved_sync_service=new_saved_sync_service,
+            config_persist_hook=_persist_agent_config,
+            config_reload_hook=self._request_config_reload,
+        )
+        new_agent_tool_registry = build_agent_tool_registry(new_agent_tool_context)
         new_agent_loop = AgentLoop.from_config(
             new_llm_service,
             new_agent_tool_registry,
             new_config,
             caller="agent.chat",
             bypass_semaphore=True,
+            approval_gate=new_chat_approval_store,
         )
         new_skill_catalog = load_skill_catalog(
             user_dir=Path(str(getattr(new_config, "data_dir", "data"))) / "skills"
@@ -1903,6 +1940,8 @@ class RuntimeContext:
         self.dialogue = new_dialogue
         self.agent_loop = new_agent_loop
         self.agent_tool_registry = new_agent_tool_registry
+        self.agent_tool_context = new_agent_tool_context
+        self.chat_approval_store = new_chat_approval_store
         self.skill_catalog = new_skill_catalog
         self.dialogue_settlement_queue = new_settlement_queue
         self.discovery_engine = new_discovery_engine

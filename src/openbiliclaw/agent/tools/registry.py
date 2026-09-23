@@ -36,7 +36,9 @@ class Tool:
     ``handler`` receives the validated arguments and returns a human-readable
     result string; it may be sync or async. ``permission_level`` follows the
     chat-agent-loop design: ``read`` (L0), ``soft_write`` (L1), ``hard_write``
-    (L2, approval-gated upstream).
+    (L2, approval-gated upstream). ``impact_hint`` is a short user-facing
+    note of what a hard_write call will change, surfaced on the approval
+    card (M7).
     """
 
     name: str
@@ -44,6 +46,7 @@ class Tool:
     handler: Callable[[dict[str, Any]], Any]
     parameters: dict[str, Any] = field(default_factory=dict)
     permission_level: PermissionLevel = "read"
+    impact_hint: str = ""
 
 
 @dataclass(frozen=True)
