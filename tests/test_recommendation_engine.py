@@ -430,7 +430,7 @@ async def test_select_diversified_batch_async_matches_sync_output() -> None:
         for i in range(8)
     ]
     embeddings = {
-        item.bvid: [float(index % 3 == axis) for axis in range(3)]
+        item.scoring_key: [float(index % 3 == axis) for axis in range(3)]
         for index, item in enumerate(candidates)
     }
 
@@ -706,7 +706,7 @@ def test_curator_scoring_records_temporal_shadow_without_changing_scores() -> No
                 context: object,
             ) -> dict[str, float]:
                 del context
-                return {item.bvid: 0.73 for item in candidates}
+                return {item.scoring_key: 0.73 for item in candidates}
 
             def record_temporal_ranking_shadow_audit(
                 self,
@@ -726,7 +726,7 @@ def test_curator_scoring_records_temporal_shadow_without_changing_scores() -> No
 
         scores, amplification = engine._score_candidates_with_curator(candidates)
 
-        assert scores == {"BV1": 0.73}
+        assert scores == {candidates[0].scoring_key: 0.73}
         assert amplification == frozenset()
         assert len(curator.audit_calls) == 1
         assert curator.audit_calls[0][1] is scores
@@ -5483,7 +5483,9 @@ async def test_visual_bonus_map_empty_when_inactive() -> None:
             embedding_service=_CoverVisualEmb(key_map, active=False),  # type: ignore[arg-type]
         )
         try:
-            assert (await active._visual_bonus_map(cands, _build_profile())).get("BVX", 0.0) > 0.0
+            assert (await active._visual_bonus_map(cands, _build_profile())).get(
+                cands[0].scoring_key, 0.0
+            ) > 0.0
             assert await inactive._visual_bonus_map(cands, _build_profile()) == {}
         finally:
             db.close()
@@ -6906,7 +6908,7 @@ def test_mmr_reuses_each_cosine_pair_only_within_one_batch(monkeypatch, partial)
         for i in range(30)
     ]
     embeddings = {
-        item.bvid: [0.0 if i % 4 == 0 else float(j == i % 16) for j in range(16)]
+        item.scoring_key: [0.0 if i % 4 == 0 else float(j == i % 16) for j in range(16)]
         for i, item in enumerate(candidates)
         if not partial or i % 3 != 0
     }

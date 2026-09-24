@@ -999,8 +999,8 @@ class RecommendationEngine:
         danmaku_bonus = await self._danmaku_bonus_map(candidates, profile)
         combined_bonus: dict[str, float] = dict(visual_bonus)
         for extra in (visual_profile_bonus, keyframe_bonus, danmaku_bonus):
-            for bvid, bonus in extra.items():
-                combined_bonus[bvid] = combined_bonus.get(bvid, 0.0) + bonus
+            for scoring_key, bonus in extra.items():
+                combined_bonus[scoring_key] = combined_bonus.get(scoring_key, 0.0) + bonus
 
         # Cross-platform fairness: align the stacked bonus within each
         # platform's own pool around semantic zero. Without this, a
@@ -2675,7 +2675,7 @@ class RecommendationEngine:
             warmed += 1
             bonus = self._cover_bonus_from_vec(cover_vec, anchor_vecs)
             if bonus > 0.0:
-                bonuses[bvid] = bonus
+                bonuses[candidate.scoring_key] = bonus
         # Fairness guard: withhold the bonus for the whole batch until enough
         # cover-bearing candidates are warmed, so a half-backfilled pool doesn't
         # tilt the ranking toward freshly-discovered items over older ones.
@@ -3196,7 +3196,7 @@ class RecommendationEngine:
             # Signed: keep both boosts (>0) and suppressions (<0). A zero means
             # the candidate is in the contested/gray band — no entry, no nudge.
             if abs(bonus) > 0.0:
-                bonuses[bvid] = bonus
+                bonuses[candidate.scoring_key] = bonus
         # Fairness guard (same rationale as _visual_bonus_map): withhold the
         # bonus for the whole batch until enough cover-bearing candidates are
         # warmed, so a half-backfilled pool doesn't tilt toward fresh items.
@@ -3242,16 +3242,16 @@ class RecommendationEngine:
         """
         if not combined_bonus:
             return combined_bonus
-        # bvid -> platform, defaulting bilibili (the historical single-platform
-        # behavior) so a missing/blank platform never forms its own singleton
-        # group and change the ranking for pre-existing rows.
+        # scoring_key -> platform, defaulting bilibili (the historical
+        # single-platform behavior) so a missing/blank platform never forms
+        # its own singleton group and change the ranking for pre-existing rows.
         platform_of: dict[str, str] = {}
         for cand in candidates:
-            bvid = str(getattr(cand, "bvid", "") or "")
-            if not bvid:
+            scoring_key = cand.scoring_key
+            if not scoring_key:
                 continue
             platform = str(getattr(cand, "source_platform", "") or "").strip() or "bilibili"
-            platform_of[bvid] = platform
+            platform_of[scoring_key] = platform
 
         # Group every current candidate, including missing bonus entries (which
         # are semantic zeroes), so a platform with only one signal still gets a
@@ -3259,19 +3259,21 @@ class RecommendationEngine:
         # missing rows. Unknown keys remain supported for legacy callers.
         groups: dict[str, list[tuple[str, float]]] = {}
         seen: set[str] = set()
-        for bvid, platform in platform_of.items():
-            seen.add(bvid)
-            groups.setdefault(platform, []).append((bvid, float(combined_bonus.get(bvid, 0.0))))
-        for bvid, bonus in combined_bonus.items():
-            if bvid not in seen:
-                groups.setdefault("bilibili", []).append((bvid, float(bonus)))
+        for scoring_key, platform in platform_of.items():
+            seen.add(scoring_key)
+            groups.setdefault(platform, []).append(
+                (scoring_key, float(combined_bonus.get(scoring_key, 0.0)))
+            )
+        for scoring_key, bonus in combined_bonus.items():
+            if scoring_key not in seen:
+                groups.setdefault("bilibili", []).append((scoring_key, float(bonus)))
 
         if not groups:
             return combined_bonus
 
         cap = _COMBINED_BONUS_CAP
-        normalized = {bvid: 0.0 for bvid in platform_of}
-        normalized.update({bvid: 0.0 for bvid in combined_bonus})
+        normalized = {scoring_key: 0.0 for scoring_key in platform_of}
+        normalized.update({scoring_key: 0.0 for scoring_key in combined_bonus})
         # A one-platform batch must preserve absolute semantics. With several
         # platforms, only the structurally shorter groups are stretched toward
         # the strongest currently observed group; no signal is inflated to the
@@ -3294,19 +3296,19 @@ class RecommendationEngine:
         for items in groups.values():
             positive_max = max((value for _, value in items if value > 0.0), default=0.0)
             negative_magnitude = max((-value for _, value in items if value < 0.0), default=0.0)
-            for bvid, bonus in items:
+            for scoring_key, bonus in items:
                 if bonus > 0.0 and positive_max > 0.0:
                     target = global_positive_max if multi_platform else min(cap, positive_max)
-                    normalized[bvid] = min(cap, target * bonus / positive_max)
+                    normalized[scoring_key] = min(cap, target * bonus / positive_max)
                 elif bonus < 0.0 and negative_magnitude > 0.0:
                     target = (
                         global_negative_magnitude
                         if multi_platform
                         else min(cap, negative_magnitude)
                     )
-                    normalized[bvid] = -min(cap, target * (-bonus) / negative_magnitude)
+                    normalized[scoring_key] = -min(cap, target * (-bonus) / negative_magnitude)
                 else:
-                    normalized[bvid] = 0.0
+                    normalized[scoring_key] = 0.0
         return normalized
 
     def _keyframe_bonus_from_vecs(
@@ -3462,7 +3464,7 @@ class RecommendationEngine:
                 frame_vecs, pos_centroids, neg_centroids, contested
             )
             if abs(bonus) > 0.0:
-                bonuses[bvid] = bonus
+                bonuses[candidate.scoring_key] = bonus
         return bonuses
 
     async def prewarm_pool_keyframes(self, *, limit: int = 50) -> int:
@@ -3708,7 +3710,7 @@ class RecommendationEngine:
             norm = max(0.0, min(1.0, (max_sim - _DANMAKU_SIM_FLOOR) / span))
             bonus = _DANMAKU_BONUS_MAX * norm
             if bonus > 0.0:
-                bonuses[bvid] = bonus
+                bonuses[candidate.scoring_key] = bonus
         return bonuses
 
     async def _danmaku_anchor_vectors(self, profile: SoulProfile) -> list[list[float]]:
@@ -4534,13 +4536,13 @@ class RecommendationEngine:
         # ``bonus`` (opt-in cover-visual, default empty) is added to the
         # relevance term only — tier priority and the timestamp/view/bvid
         # tiebreakers are untouched, so an empty map is byte-identical ranking.
-        visual = (bonus or {}).get(item.bvid, 0.0)
+        visual = (bonus or {}).get(item.scoring_key, 0.0)
         return (
             0 if item.candidate_tier == "primary" else 1,
             -(item.relevance_score + visual),
             -RecommendationEngine._timestamp_score(item.last_scored_at or item.discovered_at),
             -item.view_count,
-            item.bvid,
+            item.scoring_key,
         )
 
     @staticmethod
@@ -4614,7 +4616,7 @@ class RecommendationEngine:
         startup) is responsible for filling the L2 SQLite cache so this
         lookup hits next time.
 
-        Returns ``{bvid: vector}`` only for items already cached. Pure
+        Returns ``{scoring_key: vector}`` only for items already cached. Pure
         synchronous-via-async; no I/O.
         """
         if self._embedding_service is None or not candidates:
@@ -4629,7 +4631,7 @@ class RecommendationEngine:
                 continue
             vec = lookup(text)
             if vec:
-                result[c.bvid] = vec
+                result[c.scoring_key] = vec
         return result
 
     async def warm_mmr_embeddings(
@@ -4752,7 +4754,9 @@ class RecommendationEngine:
         if score_override:
             ranked = sorted(
                 candidates,
-                key=lambda item: -(score_override.get(item.bvid, 0.0) + bonus.get(item.bvid, 0.0)),
+                key=lambda item: (
+                    -(score_override.get(item.scoring_key, 0.0) + bonus.get(item.scoring_key, 0.0))
+                ),
             )
         else:
             ranked = sorted(candidates, key=lambda item: cls._ranking_key(item, bonus))
@@ -5013,11 +5017,11 @@ class RecommendationEngine:
 
         def _relevance(item: DiscoveredContent) -> float:
             base = (
-                float(score_override.get(item.bvid, 0.0))
+                float(score_override.get(item.scoring_key, 0.0))
                 if score_override
                 else float(item.relevance_score or 0.0)
             )
-            return base + bonus.get(item.bvid, 0.0)
+            return base + bonus.get(item.scoring_key, 0.0)
 
         # Same vectors and cosine implementation throughout this selection.
         # Cache exact pair results locally; never share scores across batches.
@@ -5028,15 +5032,15 @@ class RecommendationEngine:
             cand: DiscoveredContent,
             picked: list[DiscoveredContent],
         ) -> float:
-            cand_vec = embeddings.get(cand.bvid)
+            cand_vec = embeddings.get(cand.scoring_key)
             if not cand_vec or not picked:
                 return 0.0
             best = 0.0
             for p in picked:
-                p_vec = embeddings.get(p.bvid)
+                p_vec = embeddings.get(p.scoring_key)
                 if not p_vec:
                     continue
-                pair = (cand.bvid, p.bvid)
+                pair = (cand.scoring_key, p.scoring_key)
                 sim = pair_similarity.get(pair)
                 if sim is None:
                     sim = cosine_similarity(cand_vec, p_vec)
@@ -5197,7 +5201,7 @@ class RecommendationEngine:
     ) -> float:
         if score_override is None:
             return item.relevance_score
-        return score_override.get(item.bvid, item.relevance_score)
+        return score_override.get(item.scoring_key, item.relevance_score)
 
     @staticmethod
     def _accessible_style_priority(item: DiscoveredContent) -> int:

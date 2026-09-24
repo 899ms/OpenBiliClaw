@@ -534,7 +534,7 @@ B 站候选池打分保留历史 `weight` 语义：范围外候选的最终分�
 # 从当前数据库状态构建评分上下文
 context: ScoringContext = curator.build_context()
 
-# 对候选列表评分，返回 bvid → rec_score 的映射（不修改输入）
+# 对候选列表评分，返回 scoring_key → rec_score 的映射（不修改输入）
 scores: dict[str, float] = curator.score_candidates(candidates, context)
 
 # 聚合比较含 bonus 排序与 no-bonus 反事实；不改变 scores/serving
@@ -545,7 +545,7 @@ curator.record_temporal_ranking_shadow_audit(candidates, scores, context)
 report: PoolHealthReport = curator.check_pool_health()
 ```
 
-`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，本身不改变 eligibility 或自动调整硬期限。
+`score_candidates()` 以叠加覆盖层的形式返回新的分数映射，不会修改传入的候选对象。映射键统一取 `DiscoveredContent.scoring_key`：正常候选使用平台限定的 `item_key`，只有缺少 `item_key` 的旧行才回退到 `bvid`。MMR embedding、封面/视觉画像/关键帧/弹幕加分、跨平台归一化和最终排序使用同一键契约，避免非 B 站空 `bvid` 碰撞，也避免生产端与消费端键不一致而静默丢失信号。`PoolCurator` 的所有方法均不修改输入数据。shadow 的年龄桶固定为 `<=1d / 1-7d / 7-30d / 30-180d / >180d / unknown`，用于与 2026-08 历史回放口径连续比较；它只回答“bonus 改了谁的相对位置”，本身不改变 eligibility 或自动调整硬期限。
 
 ## 示例：记忆如何影响推荐结果
 
