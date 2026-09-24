@@ -222,6 +222,7 @@ from openbiliclaw.recommendation_runtime import (
 from openbiliclaw.runtime import embedding_progress
 from openbiliclaw.runtime.dialogue_reply_scheduler import (
     DialogueExecutionCoordinator,
+    DialogueLeaseTimeoutError,
     DurableChatReplyScheduler,
     TerminalChatReplyError,
 )
@@ -457,6 +458,11 @@ _CONFIRMATION_GLOBAL_COOLDOWN_HOURS = 12
 _CONFIRMATION_OBJECT_COOLDOWN_HOURS = 72
 _RUNTIME_STREAM_HEARTBEAT_SECONDS = 20.0
 _DIALOGUE_EXECUTION_DRAIN_TIMEOUT_SECONDS = 1500.0
+# Interactive agent-stream admission budget: a hot reload can hold the
+# dialogue lane paused for the full drain window above, which left SSE
+# requests hanging for minutes with zero feedback. 30s is generous for a
+# normal reload yet short enough for the client to surface the error event.
+_AGENT_STREAM_LEASE_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -11391,9 +11397,14 @@ def create_app(
         (``thinking`` / ``tool_call`` / ``tool_result`` /
         ``step_limit_reached`` / ``final``), followed by a terminal ``done``
         carrying the final reply. LLM failures map to a single ``error``
-        event. With a ``turn_id`` (created via ``POST /api/chat/turns`` with
-        ``streaming=True``) the turn is completed/failed durably and the
-        loop's events are persisted into the turn payload's ``agent_events``
+        event. Lease admission is bounded (30s): while a config hot reload
+        holds the dialogue lane, the stream ends with one ``error`` event
+        ("系统正在重载配置，请稍后再试") instead of hanging, and a durable
+        turn stays ``pending`` so the fallback worker completes it (running
+        the same agent loop) once the lane resumes. With a ``turn_id``
+        (created via ``POST /api/chat/turns`` with ``streaming=True``) the
+        turn is completed/failed durably and the loop's events are
+        persisted into the turn payload's ``agent_events``
         for history replay; without a ``turn_id`` the run is ephemeral. The
         legacy single-hop ``/api/chat`` and ``/api/chat/stream`` endpoints
         are unaffected.
@@ -11455,7 +11466,9 @@ def create_app(
             loop_events: list[dict[str, Any]] = []
             final_reply = ""
             try:
-                async with _dialogue_execution_lease() as current_dialogue:
+                async with _dialogue_execution_lease(
+                    timeout=_AGENT_STREAM_LEASE_TIMEOUT_SECONDS
+                ) as current_dialogue:
                     agent_loop = getattr(ctx, "agent_loop", None)
                     stream_fn = getattr(current_dialogue, "stream_agent_reply", None)
                     if agent_loop is None or not callable(stream_fn):
@@ -11481,6 +11494,17 @@ def create_app(
                         if event.type == "final":
                             final_reply = event.text
                         yield sse(event.type, data)
+            except DialogueLeaseTimeoutError as exc:
+                # Hot reload held the lane past the admission budget. The
+                # loop never started, so keep the durable turn pending and
+                # re-wake the fallback worker: it re-runs the agent loop
+                # (with full agent_events) once the lane resumes.
+                logger.info("Agent stream admission timed out during reload: %s", turn_id or "-")
+                if turn_id:
+                    _store_chat_turn_agent_events(turn_id, loop_events)
+                    chat_reply_scheduler.schedule(turn_id)
+                yield sse("error", {"error": exc.safe_message})
+                return
             except Exception as exc:
                 logger.exception("Agent chat stream failed")
                 error_message = safe_llm_failure_message(exc)
@@ -12016,9 +12040,14 @@ def create_app(
         return turn.message
 
     @asynccontextmanager
-    async def _dialogue_execution_lease() -> AsyncIterator[Any]:
-        """Hold the app-stable dialogue lease and then resolve current ctx."""
-        async with dialogue_execution_coordinator.lease():
+    async def _dialogue_execution_lease(timeout: float | None = None) -> AsyncIterator[Any]:
+        """Hold the app-stable dialogue lease and then resolve current ctx.
+
+        ``timeout`` bounds admission (seconds); on expiry a
+        :class:`DialogueLeaseTimeoutError` propagates. ``None`` waits
+        indefinitely (durable worker / legacy paths, which retry anyway).
+        """
+        async with dialogue_execution_coordinator.lease(timeout=timeout):
             current_dialogue = getattr(ctx, "dialogue", None)
             if current_dialogue is None:
                 raise RuntimeError("Dialogue service is not configured.")
@@ -12084,6 +12113,64 @@ def create_app(
                 "producer_source": "durable_confusion_ensure",
             },
         )
+
+    def _is_agent_stream_turn(turn: ChatTurnOut) -> bool:
+        """Whether the turn was created for the agent streaming endpoint.
+
+        The marker is written server-side at ``POST /api/chat/turns`` (and
+        client-forged copies are rejected by the payload validator), so the
+        durable fallback can trust it to re-run the agent loop instead of
+        the legacy single-hop reply when the interactive stream died.
+        """
+        return bool(turn.payload.get("agent_stream"))
+
+    async def _generate_durable_agent_turn_reply(
+        turn: ChatTurnOut, dialogue_owner: Any
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        """Re-run the multi-hop agent loop for a disconnected streaming turn.
+
+        Returns ``(reply, agent_events)`` mirroring the interactive
+        ``POST /api/chat/agent/stream`` path (same skill binding, same tool
+        subset), or ``None`` when the agent loop is not wired — the caller
+        then falls back to the legacy single-hop reply so the durable lane
+        keeps working in degraded runtimes.
+        """
+        agent_loop = getattr(ctx, "agent_loop", None)
+        stream_fn = getattr(dialogue_owner, "stream_agent_reply", None)
+        if agent_loop is None or not callable(stream_fn):
+            return None
+        skill_catalog = _resolve_skill_catalog()
+        skill_name = str(turn.payload.get("agent_skill") or "").strip()
+        skill_definition = skill_catalog.get(skill_name) if skill_name else None
+        if skill_definition is None:
+            # Unknown/unrecorded skill degrades to the catalog default,
+            # exactly like an interactive request without a skill field.
+            skill_definition = skill_catalog.default()
+        events: list[dict[str, Any]] = []
+        reply = ""
+        async for event in stream_fn(
+            agent_loop,
+            _contextual_chat_message(turn),
+            session=turn.session,
+            scope=turn.scope or "chat",
+            turn_id=turn.turn_id,
+            session_id=turn.session_id or DEFAULT_CHAT_SESSION_ID,
+            skill=skill_definition,
+            tools=_skill_tool_subset(skill_definition, skill_catalog),
+            skill_switch_guide=(
+                skill_catalog.render_switch_guide(skill_definition.name)
+                if skill_definition is not None
+                else ""
+            ),
+        ):
+            events.append(event.to_dict())
+            if event.type == "final":
+                reply = event.text
+        if not reply.strip():
+            from openbiliclaw.llm.service import LLMResponseContentError
+
+            raise LLMResponseContentError("LLM returned an empty response")
+        return reply, events
 
     async def _generate_durable_chat_reply(
         turn: ChatTurnOut, dialogue_owner: Any, progress: Any = None
@@ -12914,11 +13001,20 @@ def create_app(
                 _chat_no_provider_streak.pop(turn_id, None)
                 return
             turn = _normalize_chat_turn(row)
+            agent_events: list[dict[str, Any]] | None = None
             try:
                 binding = _binding_from_turn(turn)
                 if binding is None or binding.mode.value != "bound":
                     await _ensure_confusion_dialogue_anchor(turn)
-                reply = await _generate_durable_chat_reply(turn, current_dialogue)
+                agent_reply = (
+                    await _generate_durable_agent_turn_reply(turn, current_dialogue)
+                    if _is_agent_stream_turn(turn)
+                    else None
+                )
+                if agent_reply is not None:
+                    reply, agent_events = agent_reply
+                else:
+                    reply = await _generate_durable_chat_reply(turn, current_dialogue)
             except asyncio.CancelledError:
                 # Shutdown leaves the durable row pending for startup recovery.
                 raise
@@ -12941,6 +13037,11 @@ def create_app(
                 raise
             _chat_no_provider_streak.pop(turn_id, None)
 
+            if agent_events is not None:
+                # Persist the loop's process stream before the completion CAS
+                # so history replay never shows a completed agent turn
+                # without its steps.
+                _store_chat_turn_agent_events(turn_id, agent_events)
             completed = _complete_chat_turn_row(turn_id, reply=reply)
             if not completed:
                 current = _get_chat_turn_row(turn_id)
@@ -13078,6 +13179,15 @@ def create_app(
         )
         structured_payload = dict(payload.payload)
         structured_payload["dialogue_binding"] = binding.to_mapping()
+        if payload.streaming:
+            # Server-owned markers for the durable fallback worker: a
+            # streaming turn whose client disconnected is completed by
+            # re-running the agent loop (same skill binding) so the reply
+            # and its ``agent_events`` replay stream stay consistent with
+            # the interactive path.
+            structured_payload["agent_stream"] = True
+            if payload.skill.strip():
+                structured_payload["agent_skill"] = payload.skill.strip()
         row = _create_chat_turn_row(
             canonical_request,
             turn_id=turn_id,
@@ -13138,12 +13248,18 @@ def create_app(
     # The agent loop parks hard_write tool calls as durable approval records
     # (``ctx.chat_approval_store``, JSON-backed, no schema migration) and
     # streams an ``approval_request`` SSE event. These endpoints are the only
-    # execution path: approve re-dispatches the recorded tool call exactly
-    # once (idempotent), reject closes the record. Both write the audit
-    # ledger (``soul/ledger.py`` → ``profile_update_ledger``) and append an
-    # ``approval_result`` event to the originating turn's ``agent_events``
-    # so history replay shows the outcome inline.
+    # execution path: approve moves the record to ``executing`` and returns
+    # immediately while a tracked background task re-dispatches the recorded
+    # tool call exactly once (idempotent), reject closes the record. The
+    # background execution writes the audit ledger (``soul/ledger.py`` →
+    # ``profile_update_ledger``) and appends an ``approval_result`` event to
+    # the originating turn's ``agent_events`` so history replay shows the
+    # outcome inline. Execution is decoupled because hard_write tools (e.g.
+    # update_config) can wait minutes on the hot-reload lane handoff; the
+    # frontend polls ``GET /api/chat/approvals`` for the terminal state.
 
+    # Serializes approve→mark_executing→enqueue per process so duplicate
+    # clicks can never queue two executions for the same record.
     _chat_approval_execution_lock = asyncio.Lock()
 
     def _chat_approval_store_or_503() -> Any:
@@ -13226,29 +13342,104 @@ def create_app(
         if normalized and normalized not in {
             "pending",
             "approved",
+            "executing",
             "rejected",
             "executed",
+            "failed",
             "expired",
         }:
             raise HTTPException(status_code=422, detail=f"Unknown approval status: {status}")
         records = store.list(status=normalized, limit=limit)
         return {"count": len(records), "items": [record.to_dict() for record in records]}
 
+    def _enqueue_chat_approval_execution(approval_id: str) -> None:
+        """Track the background execution through the runtime task registry.
+
+        The task name is excluded from the hot-reload ``cancel_all`` sweep
+        (``api/runtime_context.py``) so a user-confirmed write — including
+        the update_config reload it may itself trigger — always runs to a
+        terminal state instead of being cancelled mid-dispatch.
+        """
+        coro = _execute_chat_approval(approval_id)
+        registry = getattr(ctx, "task_registry", None)
+        track = getattr(registry, "track", None)
+        if callable(track):
+            track("chat_approval_execute", coro)
+        else:  # minimal test contexts without a registry
+            asyncio.create_task(coro, name="chat_approval_execute")
+
+    async def _execute_chat_approval(approval_id: str) -> None:
+        """Dispatch one ``executing`` approval and settle it to a terminal state."""
+        store = getattr(ctx, "chat_approval_store", None)
+        if store is None:
+            return
+        try:
+            record = store.get(approval_id)
+            if record is None or record.status != "executing":
+                return
+            tool_name = record.tool_name
+            registry = getattr(ctx, "agent_tool_registry", None)
+            dispatch = getattr(registry, "dispatch", None)
+            if not callable(dispatch):
+                ok, content, error = False, "", "Agent tools are not configured."
+            else:
+                try:
+                    outcome = await dispatch(tool_name, dict(record.arguments))
+                except Exception as exc:
+                    logger.exception(
+                        "Chat approval dispatch crashed: %s (%s)", approval_id, tool_name
+                    )
+                    ok, content, error = False, "", safe_llm_failure_message(exc)
+                else:
+                    ok = bool(outcome.ok)
+                    content = str(outcome.content or "")
+                    error = "" if ok else str(outcome.error or "执行失败")
+            try:
+                record = store.mark_executed(
+                    approval_id,
+                    ok=ok,
+                    result=content,
+                    error=error,
+                )
+            except Exception:
+                # Another owner already settled the record (e.g. store swapped);
+                # never double-record.
+                logger.exception("Chat approval settle failed: %s", approval_id)
+                return
+            _record_chat_approval_ledger(
+                record,
+                verdict="approved",
+                outcome="success" if ok else "failed",
+                error="" if ok else (error or content),
+            )
+            _append_chat_turn_agent_event(
+                record.turn_id,
+                _approval_result_event(record, decision="approved", ok=ok, text=content or error),
+            )
+        except Exception:
+            logger.exception("Chat approval execution crashed: %s", approval_id)
+
     @app.post("/api/chat/approvals/{approval_id}/approve", response_model=None)
     async def approve_chat_approval(approval_id: str) -> dict[str, Any]:
-        """Approve one parked hard-write action and execute it exactly once.
+        """Approve one parked hard-write action; execution runs in the background.
 
-        Idempotent: re-approving an executed record returns the stored result
-        without re-running the tool. Rejected/expired records conflict (409).
-        Execution results feed the audit ledger and the originating turn's
-        event stream; the next chat turn sees the outcome in history.
+        Returns immediately with the record in ``executing`` state — the
+        actual dispatch (which can take minutes when the tool triggers a
+        config hot-reload) runs as a tracked background task. Poll
+        ``GET /api/chat/approvals`` until the status reaches a terminal
+        state (``executed`` / ``failed``) for the outcome; the originating
+        turn's ``agent_events`` also receives an ``approval_result`` event.
+
+        Idempotent: re-approving an ``executing``/``executed``/``failed``
+        record returns the stored state without queueing a second
+        execution. Rejected/expired records conflict (409).
         """
         from openbiliclaw.agent.approvals import ApprovalConflictError
 
         store = _chat_approval_store_or_503()
         _chat_approval_or_404(store, approval_id)
-        # One execution at a time: the lock makes approve→execute→mark atomic
-        # against concurrent duplicate clicks.
+        # Fast critical section only: state transitions + enqueue. The
+        # dispatch itself never runs inside the request.
         async with _chat_approval_execution_lock:
             try:
                 record = store.approve(approval_id)
@@ -13256,44 +13447,34 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Approval not found.") from exc
             except ApprovalConflictError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if record.status == "executed":
+            if record.status in ("executed", "failed"):
                 return {
                     "approval": record.to_dict(),
                     "executed": False,
                     "already_executed": True,
+                    "queued": False,
                     "ok": not record.error,
                     "result": record.result,
                 }
-            registry = getattr(ctx, "agent_tool_registry", None)
-            dispatch = getattr(registry, "dispatch", None)
-            if not callable(dispatch):
-                raise HTTPException(status_code=503, detail="Agent tools are not configured.")
-            outcome = await dispatch(record.tool_name, dict(record.arguments))
-            record = store.mark_executed(
-                approval_id,
-                ok=outcome.ok,
-                result=outcome.content,
-                error="" if outcome.ok else (outcome.error or "执行失败"),
-            )
-        _record_chat_approval_ledger(
-            record,
-            verdict="approved",
-            outcome="success" if outcome.ok else "failed",
-            error="" if outcome.ok else outcome.content,
-        )
-        _append_chat_turn_agent_event(
-            record.turn_id,
-            _approval_result_event(
-                record, decision="approved", ok=outcome.ok, text=outcome.content
-            ),
-        )
-        return {
-            "approval": record.to_dict(),
-            "executed": True,
-            "already_executed": False,
-            "ok": outcome.ok,
-            "result": outcome.content,
-        }
+            if record.status == "approved":
+                registry = getattr(ctx, "agent_tool_registry", None)
+                dispatch = getattr(registry, "dispatch", None)
+                if not callable(dispatch):
+                    raise HTTPException(status_code=503, detail="Agent tools are not configured.")
+                record = store.mark_executing(approval_id)
+                _enqueue_chat_approval_execution(approval_id)
+                queued_now = True
+            else:  # executing: an execution is already in flight
+                queued_now = False
+            return {
+                "approval": record.to_dict(),
+                "executed": False,
+                "already_executed": False,
+                "queued": True,
+                "already_queued": not queued_now,
+                "ok": None,
+                "result": "",
+            }
 
     @app.post("/api/chat/approvals/{approval_id}/reject", response_model=None)
     async def reject_chat_approval(

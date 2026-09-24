@@ -2162,6 +2162,23 @@ body.chat-view-active .back-to-top {
   line-height: 1.5;
 }
 
+.chat-history-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px 24px;
+  color: var(--text-muted);
+}
+
+.chat-history-loading .spinner {
+  margin: 0;
+}
+
+.chat-history-loading-text {
+  font-size: 14px;
+}
+
 /* ── Spinner ──────────────────────────────────────────────── */
 .spinner {
   width: 20px; height: 20px;
@@ -3129,7 +3146,9 @@ body.auth-locked #tab-bar {
 }
 
 .agent-approval-status { font-size: 11px; color: var(--text-secondary); font-weight: 400; }
-.agent-approval-status[data-tone="pending"] { color: var(--brand); }
+.agent-approval-status[data-tone="pending"],
+.agent-approval-status[data-tone="approved"],
+.agent-approval-status[data-tone="executing"] { color: var(--brand); }
 .agent-approval-status[data-tone="executed"] { color: #22a06b; }
 .agent-approval-status[data-tone="rejected"],
 .agent-approval-status[data-tone="failed"] { color: var(--danger); }

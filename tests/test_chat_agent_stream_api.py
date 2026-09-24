@@ -9,17 +9,21 @@ SSE event per ``AgentEvent``; durable turns persist the loop's events into
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from fastapi.testclient import TestClient
 
 from openbiliclaw.agent.loop import AgentEvent
+from openbiliclaw.api import app as app_module
 from openbiliclaw.api.app import create_app
 from openbiliclaw.storage.database import Database
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 class FakeAgentDialogue:
@@ -312,3 +316,159 @@ def test_legacy_chat_endpoints_unaffected(tmp_path: Path) -> None:
 
     assert dialogue.agent_calls == []
     assert dialogue.legacy_calls == ["你好", "你好"]
+
+
+def test_streaming_turn_persists_agent_markers(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue([AgentEvent(type="final", step=1, text="hi")])
+    app = _app(tmp_path, dialogue)
+
+    with TestClient(app) as client:
+        client.post(
+            "/api/chat/turns",
+            json={
+                "turn_id": "marked-turn",
+                "session": "desktop",
+                "message": "你好",
+                "streaming": True,
+                "skill": "system-steward",
+            },
+        )
+        client.post(
+            "/api/chat/turns",
+            json={"turn_id": "plain-turn", "session": "desktop", "message": "在吗"},
+        )
+
+    database = app.state.runtime_context.database
+    marked = database.get_chat_turn("marked-turn")
+    assert marked is not None
+    assert marked["payload"]["agent_stream"] is True
+    assert marked["payload"]["agent_skill"] == "system-steward"
+    plain = database.get_chat_turn("plain-turn")
+    assert plain is not None
+    assert "agent_stream" not in plain["payload"]
+
+
+def test_agent_stream_lease_timeout_errors_and_fallback_completes_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Hot reload holds the lane: the stream errors fast, the durable
+    fallback later re-runs the agent loop and persists ``agent_events``."""
+    monkeypatch.setattr(app_module, "_AGENT_STREAM_LEASE_TIMEOUT_SECONDS", 0.05)
+    dialogue = FakeAgentDialogue(_multi_hop_script())
+    app = _app(tmp_path, dialogue)
+    coordinator = app.state.dialogue_execution_coordinator
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/chat/turns",
+            json={
+                "turn_id": "reload-turn",
+                "session": "desktop",
+                "scope": "chat",
+                "message": "我订阅了什么？",
+                "streaming": True,
+            },
+        )
+        assert created.status_code == 200
+
+        # Pause the lane exactly like the hot-reload handoff does.
+        client.portal.call(lambda: coordinator.pause_and_drain(timeout=1.0))
+        try:
+            response = client.post(
+                "/api/chat/agent/stream",
+                json={"turn_id": "reload-turn", "session": "desktop", "message": "我订阅了什么？"},
+            )
+            assert response.status_code == 200
+            events = _parse_sse(response.text)
+            assert [name for name, _data in events] == ["error"]
+            assert "重载配置" in events[0][1]["error"]
+
+            # The loop never ran and the turn was NOT failed: it stays
+            # pending for the durable fallback worker (already re-woken).
+            row = app.state.runtime_context.database.get_chat_turn("reload-turn")
+            assert row is not None
+            assert row["status"] == "pending"
+            assert dialogue.agent_calls == []
+        finally:
+            client.portal.call(coordinator.resume)
+
+        # The fallback worker re-runs the agent loop for the streaming turn
+        # and persists the full process stream for history replay.
+        deadline = time.monotonic() + 5
+        row = None
+        while time.monotonic() < deadline:
+            row = app.state.runtime_context.database.get_chat_turn("reload-turn")
+            if row is not None and row["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["reply"] == "你还没有订阅任何内容源。"
+        persisted = row["payload"]["agent_events"]
+        assert [event["type"] for event in persisted] == [
+            "thinking",
+            "tool_call",
+            "tool_result",
+            "final",
+        ]
+        # The fallback path ran the agent loop (not the legacy single hop).
+        assert len(dialogue.agent_calls) == 1
+        assert dialogue.agent_calls[0]["turn_id"] == "reload-turn"
+        assert dialogue.legacy_calls == []
+
+
+def test_durable_fallback_reruns_agent_loop_for_orphaned_streaming_turn(
+    tmp_path: Path,
+) -> None:
+    """A streaming turn whose client disconnected is completed by the
+    durable worker through the agent loop, with ``agent_events`` persisted."""
+    dialogue = FakeAgentDialogue(_multi_hop_script())
+    app = _app(tmp_path, dialogue)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/chat/turns",
+            json={
+                "turn_id": "orphan-turn",
+                "session": "desktop",
+                "scope": "chat",
+                "message": "我订阅了什么？",
+                "streaming": True,
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["status"] == "pending"
+
+        # The stream was never consumed (client died). A non-streaming
+        # retry of the same turn wakes the durable reply worker.
+        retry = client.post(
+            "/api/chat/turns",
+            json={
+                "turn_id": "orphan-turn",
+                "session": "desktop",
+                "scope": "chat",
+                "message": "我订阅了什么？",
+            },
+        )
+        assert retry.status_code == 200
+
+        deadline = time.monotonic() + 5
+        row = None
+        while time.monotonic() < deadline:
+            row = app.state.runtime_context.database.get_chat_turn("orphan-turn")
+            if row is not None and row["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["reply"] == "你还没有订阅任何内容源。"
+        persisted = row["payload"]["agent_events"]
+        assert [event["type"] for event in persisted] == [
+            "thinking",
+            "tool_call",
+            "tool_result",
+            "final",
+        ]
+        assert len(dialogue.agent_calls) == 1
+        assert dialogue.legacy_calls == []

@@ -57,6 +57,7 @@ import {
   getProbeMessageActions,
   getAvoidanceProbeMessageActions,
   getMobileChatSession,
+  getChatHistoryViewState,
   getCoverImageAttrs,
   getSourceLabel,
   buildContentUrl,
@@ -96,11 +97,14 @@ if (!agentChat) {
 }
 const {
   applyAgentEvent,
+  applyApprovalRecordToRun,
   agentEventsFromTurn,
   agentRunFromEvents,
   createAgentRun,
   isAgentTaskActive,
   isAgentTaskSummaryTurn,
+  isApprovalTerminalStatus,
+  normalizeApproveResponse,
   renderAgentRunMarkup,
   renderAgentTaskDetailMarkup,
   renderAgentTaskRowMarkup,
@@ -112,6 +116,7 @@ const {
 let $root = null;
 let loaded = false;
 let turns = [];
+let historyLoaded = false;
 let sending = false;
 let pendingTurnId = null;
 let pollTimer = null;
@@ -182,6 +187,13 @@ let chatSkills = [];
 let skillsSheetOpen = false;
 let pendingApprovals = [];
 let approvalsExpanded = false;
+// 异步审批执行（approve 只入队）：本页批准、等待终态的审批（id → turnId），
+// 以及后端 executing 记录（刷新/回放时把 pending 卡恢复成「执行中…」）。
+const executingApprovals = new Map();
+let approvalExecutingOverrides = new Map();
+// 本页已观察到终态的记录：approval_result 事件落进 turn 回放前，
+// 轮询重渲染也用这份快照保持终态展示。
+const approvalTerminalOverrides = new Map();
 let tasksOverlayOpen = false;
 let agentTasks = [];
 let agentTaskDetail = null;
@@ -365,9 +377,15 @@ function createPendingPanel(previousScrollTop = 0) {
 function agentRunForTurn(turn) {
   if (!turn?.turn_id) return null;
   const live = agentRunsByTurnId.get(turn.turn_id);
-  if (live) return live;
   const events = agentEventsFromTurn(turn);
-  return events.length > 0 ? agentRunFromEvents(events) : null;
+  const run = live || (events.length > 0 ? agentRunFromEvents(events) : null);
+  // 回放只归约 approval_request → pending；用 executing 列表恢复中间态，
+  // 避免刷新后露出可重复点击的批准按钮。
+  if (run) {
+    for (const record of approvalTerminalOverrides.values()) applyApprovalRecordToRun(run, record);
+    for (const record of approvalExecutingOverrides.values()) applyApprovalRecordToRun(run, record);
+  }
+  return run;
 }
 
 function agentRunHasContent(run) {
@@ -434,7 +452,9 @@ function createApprovalsPanel() {
   const panel = document.createElement("section");
   panel.className = "chat-pending chat-approvals";
   panel.setAttribute("aria-label", "待审批操作");
-  panel.hidden = pendingApprovals.length === 0 && !approvalsExpanded;
+  // 面板同时列出执行中的审批（无按钮，只显示「执行中…」状态）。
+  const visibleApprovals = [...pendingApprovals, ...approvalExecutingOverrides.values()];
+  panel.hidden = visibleApprovals.length === 0 && !approvalsExpanded;
 
   const toggle = document.createElement("button");
   toggle.className = `chat-pending-toggle${approvalsExpanded ? " is-expanded" : ""}`;
@@ -453,7 +473,7 @@ function createApprovalsPanel() {
   list.className = "chat-pending-list chat-approvals-list";
   list.hidden = !approvalsExpanded;
   list.setAttribute("aria-label", "待审批操作列表");
-  list.innerHTML = pendingApprovals
+  list.innerHTML = visibleApprovals
     .map((approval) => renderApprovalCardMarkup(approval))
     .join("");
   list.addEventListener("click", (event) => {
@@ -563,21 +583,30 @@ async function handleApprovalAction(button) {
   for (const btn of card.querySelectorAll("button")) btn.disabled = true;
   try {
     if (action === "approve") {
-      const result = await approveChatApproval(approvalId);
-      const ok = result?.ok !== false;
-      markApprovalCardSettled(card, ok ? "已批准并执行" : `批准了但执行失败：${result?.result || ""}`, ok);
-      setDialogueStatus(ok ? "已批准并执行。" : "批准了，但执行失败。", ok ? "success" : "error");
+      const response = normalizeApproveResponse(await approveChatApproval(approvalId));
+      if (response.kind === "queued") {
+        // 异步执行协议：批准只入队，卡片进「执行中…」，终态交给
+        // refreshApprovals 的 2.5s 轮询落到 executed/failed。
+        markApprovalCardExecuting(card);
+        executingApprovals.set(approvalId, findApprovalTurnId(approvalId));
+        setRunApprovalStatus(approvalId, "executing");
+        setDialogueStatus(
+          response.alreadyQueued ? "这项改动已在执行中。" : "已批准，正在执行…",
+          "info",
+        );
+      } else {
+        // 旧协议（同步返回 ok/result）或幂等终态应答：直接显示结果。
+        const ok = response.ok !== false;
+        markApprovalCardSettled(card, ok ? "已批准并执行" : `批准了但执行失败：${response.resultText || ""}`, ok);
+        setRunApprovalStatus(approvalId, ok ? "executed" : "failed", response.resultText);
+        setDialogueStatus(ok ? "已批准并执行。" : "批准了，但执行失败。", ok ? "success" : "error");
+      }
     } else if (action === "reject-submit") {
       const reason = card.querySelector(".agent-approval-reason")?.value?.trim() || "";
       await rejectChatApproval(approvalId, reason);
       markApprovalCardSettled(card, "已拒绝，不会执行。", true);
+      setRunApprovalStatus(approvalId, "rejected");
       setDialogueStatus("已拒绝这个操作。", "info");
-    }
-    for (const run of agentRunsByTurnId.values()) {
-      const approval = run.approvals.find((item) => item.approval_id === approvalId);
-      if (approval) {
-        approval.status = action === "approve" ? "executed" : "rejected";
-      }
     }
     void refreshApprovals();
   } catch (error) {
@@ -586,12 +615,56 @@ async function handleApprovalAction(button) {
   }
 }
 
+function findApprovalTurnId(approvalId) {
+  for (const [turnId, run] of agentRunsByTurnId) {
+    if (run.approvals.some((item) => item.approval_id === approvalId)) return turnId;
+  }
+  return "";
+}
+
+function setRunApprovalStatus(approvalId, status, resultText = "") {
+  for (const run of agentRunsByTurnId.values()) {
+    const approval = run.approvals.find((item) => item.approval_id === approvalId);
+    if (approval) {
+      approval.status = status;
+      if (resultText) approval.resultText = resultText;
+    }
+  }
+}
+
+function markApprovalCardExecuting(card) {
+  card.dataset.status = "executing";
+  const status = card.querySelector(".agent-approval-status");
+  if (status instanceof HTMLElement) {
+    status.textContent = "执行中…";
+    status.dataset.tone = "executing";
+  }
+  card.querySelector(".agent-approval-actions")?.remove();
+  card.querySelector(".agent-approval-reject")?.remove();
+}
+
 function markApprovalCardSettled(card, message, ok) {
   card.dataset.status = ok ? "executed" : "failed";
   const status = card.querySelector(".agent-approval-status");
-  if (status instanceof HTMLElement) status.textContent = message;
+  if (status instanceof HTMLElement) {
+    status.textContent = message;
+    status.dataset.tone = ok ? "executed" : "failed";
+  }
   card.querySelector(".agent-approval-actions")?.remove();
   card.querySelector(".agent-approval-reject")?.remove();
+}
+
+// 轮询发现本页批准的审批到达终态：更新 run 模型、重绘过程流并提示结果。
+function settleTrackedApproval(approvalId, turnId, record) {
+  const ok = record.status === "executed";
+  approvalTerminalOverrides.set(approvalId, record);
+  setRunApprovalStatus(approvalId, record.status, record.resultText || "");
+  if (turnId) updateAgentRunDom(turnId);
+  setDialogueStatus(
+    ok ? "已批准并执行。" : `批准了，但执行失败${record.resultText ? `：${record.resultText}` : "。"}`,
+    ok ? "success" : "error",
+  );
+  return true;
 }
 
 function handleSkillSwitchCard(button) {
@@ -667,10 +740,25 @@ async function refreshSessions() {
 async function refreshApprovals() {
   if (!state.online) return false;
   try {
-    const next = await fetchChatApprovals({ status: "pending" });
-    const changedApprovals = JSON.stringify(next) !== JSON.stringify(pendingApprovals);
+    // pending 之外同时拉 executing（回放恢复中间态），并在有本页批准的
+    // 审批时拉全量快照跟踪到终态；挂在既有 2.5s 历史刷新节奏上。
+    const [next, executing] = await Promise.all([
+      fetchChatApprovals({ status: "pending" }),
+      fetchChatApprovals({ status: "executing" }),
+    ]);
+    let changed = JSON.stringify(next) !== JSON.stringify(pendingApprovals);
     pendingApprovals = next;
-    return changedApprovals;
+    approvalExecutingOverrides = new Map(executing.map((record) => [record.approval_id, record]));
+    if (executingApprovals.size) {
+      const all = await fetchChatApprovals({ status: "", limit: 100 });
+      for (const [approvalId, turnId] of [...executingApprovals]) {
+        const record = all.find((item) => item.approval_id === approvalId);
+        if (!record || !isApprovalTerminalStatus(record.status)) continue;
+        executingApprovals.delete(approvalId);
+        changed = settleTrackedApproval(approvalId, turnId, record) || changed;
+      }
+    }
+    return changed;
   } catch {
     // 503 (approval gate unwired) or offline: keep the last snapshot.
     return false;
@@ -732,6 +820,7 @@ async function switchSession(sessionId) {
     globalThis.localStorage?.setItem(CHAT_SESSION_STORAGE_KEY, sessionId);
   } catch { /* storage unavailable */ }
   turns = [];
+  historyLoaded = false;
   lastHistorySignature = null;
   pendingTurnId = null;
   sending = false;
@@ -967,7 +1056,14 @@ function render() {
 
   const dialogueTurns = selectDialogueTurns(turns);
   dialogueTurnsById.clear();
-  if (dialogueTurns.length === 0 && !sending) {
+  const historyViewState = getChatHistoryViewState({
+    historyLoaded,
+    turnCount: dialogueTurns.length,
+    sending,
+  });
+  if (historyViewState === "loading") {
+    messages.innerHTML = `<div class="chat-history-loading" role="status"><div class="spinner"></div><div class="chat-history-loading-text">正在加载聊天记录…</div></div>`;
+  } else if (historyViewState === "empty") {
     messages.innerHTML = `<div class="empty-state"><div class="empty-state-icon">\u{1F4AC}</div><div class="empty-state-text">\u548C AI \u804A\u804A\u4F60\u7684\u5174\u8DA3\u548C\u60F3\u6CD5</div></div>`;
   }
 
@@ -1709,7 +1805,15 @@ function updateBadgeCount() {
 
 // ── Load ─────────────────────────────────────────────────────
 async function loadHistory() {
-  if (!state.online || historyRefreshInFlight) return;
+  if (!state.online || historyRefreshInFlight) {
+    // Offline before the first snapshot: stop showing the loading indicator
+    // instead of spinning forever; the next online sync refetches anyway.
+    if (!state.online && !historyLoaded) {
+      historyLoaded = true;
+      render();
+    }
+    return;
+  }
   historyRefreshInFlight = true;
   const existingMessages = document.getElementById("chat-messages");
   const shouldStickToBottom =
@@ -1774,7 +1878,9 @@ async function loadHistory() {
     if ((dialogueContextSelection?.reply_to_turn_id || "") !== contextBefore) {
       changed = true;
     }
-    if (!changed) return;
+    const firstLoad = !historyLoaded;
+    historyLoaded = true;
+    if (!changed && !firstLoad) return;
     render();
     if (!shouldStickToBottom) {
       window.requestAnimationFrame(() => {
@@ -1790,6 +1896,12 @@ async function loadHistory() {
     // Keep the last durable snapshot while offline.
   } finally {
     historyRefreshInFlight = false;
+    // Even a failed first fetch must clear the loading indicator; the
+    // periodic sync repaints with real data once the backend responds.
+    if (!historyLoaded) {
+      historyLoaded = true;
+      render();
+    }
   }
 }
 
@@ -1854,6 +1966,9 @@ export function initChatView(root) {
     void refreshSessions().then(render);
     void refreshAgentTasks().then(render);
   }
+  // Paint immediately so the first entry shows the history loading indicator
+  // instead of an empty message list while the fetch is in flight.
+  render();
   loadHistory();
 }
 

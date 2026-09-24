@@ -16,7 +16,7 @@
 | M8 流式过程展示 | ✅ | `POST /api/chat/agent/stream` 真流式：thinking 过程文本 + 每步一行折叠工具摘要（可展开参数/结果）+ 审批卡内嵌；完成后整体折叠为「过程（N 步）」；`final` 落成答复气泡；历史回放从 `payload.agent_events` 重建同一视图 |
 | M8 会话列表 | ✅ | 侧栏（新建/切换/内联改名/归档/显示已归档），默认会话徽标，`active_turns>0` 活跃圆点，标题与预览轮询刷新（复用 2.5s 共享聊天轮询），当前会话持久化到 localStorage |
 | M8 skill 切换 | ✅ | 会话条 skill chip（图标+名称）弹出角色选择浮层（`GET /api/chat/skills`），按会话记忆选择、下一回合生效；`suggest_skill` 工具调用渲染为切换卡（一键切换/忽略） |
-| M8 审批卡 | ✅ | `approval_request` 渲染审批卡（summary+参数+impact，批准并执行/拒绝可填理由）；侧栏「待审批」入口带未读 badge（轮询 `?status=pending`），抽屉里可批准/拒绝；回放里 `approval_result` 显示审批结局与执行结果 |
+| M8 审批卡 | ✅ | `approval_request` 渲染审批卡（summary+参数+impact，批准并执行/拒绝可填理由）；侧栏「待审批」入口带未读 badge（轮询 `?status=pending`，抽屉并列展示 executing 记录）；approve 端点异步执行：批准只入队，卡片就地转「执行中…」（按钮移除防重复点击），终态由 2.5s 轮询 `GET /api/chat/approvals`（executing 列表 + 全量快照）落到「已批准并执行」（含 result 摘要）或「已批准，但执行失败」（含 error 详情）；刷新/回放时 executing 记录覆盖归约出的 pending 卡恢复中间态；旧协议（响应无 `queued` 字段、同步返回 ok/result）按 `normalizeApproveResponse` 兜底直接显示结果；回放里 `approval_result` 显示审批结局与执行结果 |
 | M8 任务中心 | ✅ | 侧栏入口 + 右侧抽屉：任务列表（状态/进度/取消）、详情复用过程流组件渲染 `steps`、完成后 report + 建议清单（逐项确认：soft_write「确认执行」/ hard_write「去对话确认」，v1 统一落成来源会话里的结构化指令消息）；`start_background_task` 确认卡；`agent_task_summary` turn 渲染系统汇总卡 |
 | M8 回退与兼容 | ✅ | 探测 `GET /api/chat/skills` 失败 → legacy 模式（布局与行为与 M8 前完全一致）；agent 流 503（`loop_enabled=false`）时当轮回退旧 `/api/chat/stream` 假流式；delight/探针内嵌聊天、假设卡片、待聊确认、对话上下文引用等旧功能不动 |
 
@@ -61,18 +61,23 @@ web/desktop/
 - **事件委托**：`#chatLog` / `#chatApprovalsBody` / `#chatTaskCenterBody`
   统一走 `handleAgentSurfaceClick()`（审批 approve/reject/confirm-reject、
   skill 建议 accept/dismiss、后台任务确认卡、建议清单确认、任务详情打开）；
-  批准/拒绝后直接就地更新卡片状态，服务端随后把 `approval_result` 追加进
-  turn 回放数据，下一次轮询自动对齐。
+  拒绝就地更新卡片；批准按 approve 响应归类（`normalizeApproveResponse`）：
+  新协议 `queued` → 卡片转「执行中…」并登记 `executingApprovalIds`，终态由
+  `refreshChatApprovals()` 的 2.5s 轮询（pending + executing + 跟踪全量快照）
+  落到卡片与 toast；旧协议同步 ok/result → 直接显示结果。服务端随后把
+  `approval_result` 追加进 turn 回放数据，下一次轮询自动对齐。
 - **建议清单执行（v1）**：确认一条建议 = 切到来源会话并发送一条结构化指令
   消息（动作 + 参数 JSON），soft_write 由 agent 当回合直接执行，hard_write
   自然触发审批卡；不在前端直接调写接口。
 
 ## 测试
 
-`tests/js/desktop-chat-agent-core.test.mjs`（node:test，24 条）：SSE 分片/
+`tests/js/desktop-chat-agent-core.test.mjs`（node:test，29 条）：SSE 分片/
 CRLF/多行 data/坏帧容错、过程模型归约（thinking/tool_call/tool_result 配对、
 approval_request → approval_result 结局、step_limit、error）、折叠组件 markup
 （完成后默认折叠、live 展开、HTML 转义）、特殊工具卡（suggest_skill /
-start_background_task）、会话/任务/审批/skill 列表 markup。
+start_background_task）、会话/任务/审批/skill 列表 markup、异步审批协议
+（`normalizeApproveResponse` queued/幂等终态/旧协议兜底、executing 卡无按钮、
+`applyApprovalRecordToProcess` 中间态恢复与终态不降级）。
 
 运行：`node --test tests/js/*.test.mjs`

@@ -779,8 +779,14 @@ class RuntimeContext:
         try:
             # Keep a running guided-init task alive across rebuild — config
             # writes are gated during init, but this exemption prevents an
-            # in-flight init from being silently cancelled.
-            cancelled = await self.task_registry.cancel_all(exclude=frozenset({"guided_init"}))
+            # in-flight init from being silently cancelled. Chat approval
+            # executions are excluded too: they are user-confirmed writes
+            # (and update_config executions are themselves the reload
+            # caller), so cancelling them mid-dispatch would leave the
+            # approval stuck in ``executing``.
+            cancelled = await self.task_registry.cancel_all(
+                exclude=frozenset({"guided_init", "chat_approval_execute"})
+            )
             if cancelled:
                 logger.info(
                     "Hot-reload: cancelled %d background task(s) before rebuild",
@@ -1867,9 +1873,22 @@ class RuntimeContext:
 
         # M7: hard_write calls are parked in a durable approval store instead
         # of executing in-loop; the approve endpoint re-dispatches them.
-        new_chat_approval_store = ApprovalStore(
+        # The store instance is reused across rebuilds (same backing file):
+        # it is the single in-memory authority for the approval state
+        # machine, so a rebuild mid-execution can never resurrect stale
+        # states from a freshly reloaded copy (issue: approved/executing
+        # records regressing after a hot reload).
+        approval_store_path = (
             Path(str(getattr(new_config, "data_dir", "data") or "data")) / "chat_approvals.json"
         )
+        existing_approval_store = getattr(self, "chat_approval_store", None)
+        if (
+            existing_approval_store is not None
+            and getattr(existing_approval_store, "path", None) == approval_store_path
+        ):
+            new_chat_approval_store = existing_approval_store
+        else:
+            new_chat_approval_store = ApprovalStore(approval_store_path)
         new_agent_tool_context = AgentToolContext(
             database=self.database,
             soul_engine=new_soul_engine,

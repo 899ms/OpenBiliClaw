@@ -6,12 +6,17 @@ import core from "../../src/openbiliclaw/web/desktop/assets/js/chat-agent-core.j
 const {
   agentProcessMarkup,
   applyAgentEvent,
+  applyApprovalRecordToProcess,
+  approvalCardMarkup,
+  approvalCardModelFromRecord,
   approvalsPanelMarkup,
   buildAgentProcess,
   createAgentProcess,
   createSseParser,
   isAgentTaskSummaryTurn,
+  isApprovalTerminalStatus,
   isSoftWriteSuggestion,
+  normalizeApproveResponse,
   processStepCount,
   sessionListMarkup,
   skillPickerMarkup,
@@ -294,6 +299,116 @@ test("approvalsPanelMarkup renders pending approval cards", () => {
   assert.match(html, /需要你的批准/);
   assert.match(html, /data-approval-action="approve"/);
   assert.match(html, /影响：立即生效/);
+});
+
+// ── 异步审批执行（approve 只入队） ─────────────────────────────
+
+test("approvalCardMarkup renders executing state without action buttons", () => {
+  const html = approvalCardMarkup({
+    approvalId: "ap_1",
+    summary: "修改配置",
+    impact: "热重载",
+    status: "executing",
+    decision: "",
+    ok: null,
+    resultText: "",
+  });
+  assert.match(html, /执行中…/);
+  assert.doesNotMatch(html, /data-approval-action=/);
+  // 进行中不是失败态，不刷失败色。
+  assert.doesNotMatch(html, /agent-approval-status is-failed/);
+});
+
+test("normalizeApproveResponse classifies async queued replies", () => {
+  const first = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "executing" },
+    executed: false,
+    queued: true,
+    already_queued: false,
+    ok: null,
+    result: "",
+  });
+  assert.deepEqual(first, {
+    kind: "queued",
+    alreadyQueued: false,
+    approval: {
+      approvalId: "ap_1",
+      summary: "",
+      impact: "",
+      status: "executing",
+      decision: "",
+      ok: null,
+      resultText: "",
+    },
+  });
+
+  const duplicate = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "executing" },
+    executed: false,
+    queued: true,
+    already_queued: true,
+    ok: null,
+    result: "",
+  });
+  assert.equal(duplicate.kind, "queued");
+  assert.equal(duplicate.alreadyQueued, true);
+});
+
+test("normalizeApproveResponse surfaces idempotent terminal and legacy sync replies", () => {
+  const terminal = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "failed", error: "热重载超时" },
+    executed: false,
+    already_executed: true,
+    queued: false,
+    ok: false,
+    result: "",
+  });
+  assert.equal(terminal.kind, "settled");
+  assert.equal(terminal.ok, false);
+  assert.equal(terminal.resultText, "热重载超时");
+
+  // 旧协议：同步执行，响应没有 queued 字段，直接带 ok/result。
+  const legacy = normalizeApproveResponse({ ok: true, result: "已写入" });
+  assert.equal(legacy.kind, "settled");
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.resultText, "已写入");
+});
+
+test("applyApprovalRecordToProcess recovers executing and settles terminal states", () => {
+  const model = buildAgentProcess([
+    { type: "approval_request", step: 1, approval_id: "ap_1", tool_name: "update_config", arguments: {}, summary: "改配置", impact: "" },
+    { type: "final", step: 2, text: "等你批准" },
+  ]);
+  const approval = model.steps[0].toolCalls[0].approval;
+  assert.equal(approval.status, "pending");
+
+  // 刷新恢复：后端 executing 列表把回放里的 pending 卡标成执行中。
+  applyApprovalRecordToProcess(model, { approval_id: "ap_1", status: "executing" });
+  assert.equal(approval.status, "executing");
+
+  // 轮询到终态：写入结果摘要。
+  applyApprovalRecordToProcess(model, { approval_id: "ap_1", status: "executed", result: "已写入" });
+  assert.equal(approval.status, "executed");
+  assert.equal(approval.ok, true);
+  assert.equal(approval.resultText, "已写入");
+
+  // 已终态的回放不被过期快照降级。
+  applyApprovalRecordToProcess(model, { approval_id: "ap_1", status: "executing" });
+  assert.equal(approval.status, "executed");
+
+  // 未命中 id / 非记录输入安全返回 null。
+  assert.equal(applyApprovalRecordToProcess(model, { approval_id: "ap_x", status: "executing" }), null);
+  assert.equal(applyApprovalRecordToProcess(model, null), null);
+  assert.equal(isApprovalTerminalStatus("failed"), true);
+  assert.equal(isApprovalTerminalStatus("executing"), false);
+});
+
+test("approvalsPanelMarkup renders executing records without action buttons", () => {
+  const html = approvalsPanelMarkup([
+    { approval_id: "ap_9", tool_name: "update_config", summary: "改并发数", arguments: {}, status: "executing" },
+  ]);
+  assert.match(html, /执行中…/);
+  assert.doesNotMatch(html, /data-approval-action=/);
 });
 
 test("skillPickerMarkup marks current and default skills", () => {

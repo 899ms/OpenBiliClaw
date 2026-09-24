@@ -7692,6 +7692,13 @@ ${cardFeedbackBarHtml()}`;
     let chatSessionsSignature = "";
     let chatApprovalsSignature = "";
     let chatTasksSignature = "";
+    // 异步审批执行（approve 只入队）：本页批准、等待终态的审批 id，
+    // 以及后端 executing 记录（用于刷新/回放时把 pending 卡恢复成「执行中…」）。
+    const executingApprovalIds = new Set();
+    let approvalExecutingOverrides = new Map();
+    // 本页已观察到终态的记录：approval_result 事件落进 turn 回放前，
+    // 轮询重渲染也用这份快照保持终态展示。
+    const approvalTerminalOverrides = new Map();
 
     function agentChatEnabled() {
       return Boolean(chatAgentCore) && state.agentChat.mode === "agent";
@@ -7959,13 +7966,26 @@ ${cardFeedbackBarHtml()}`;
 
     // ── 流式 agent 对话 ──
 
+    function applyApprovalExecutingOverrides(process) {
+      // 刷新/回放时 approval_request 归约只到 pending；后端已在执行的审批
+      // 用 executing 列表把卡片恢复成「执行中…」，避免露出可重复点的按钮。
+      if (!process || !chatAgentCore) return process;
+      for (const record of approvalTerminalOverrides.values()) {
+        chatAgentCore.applyApprovalRecordToProcess(process, record);
+      }
+      for (const record of approvalExecutingOverrides.values()) {
+        chatAgentCore.applyApprovalRecordToProcess(process, record);
+      }
+      return process;
+    }
+
     function liveAgentChatMarkup() {
       const live = state.agentChat.live;
       if (!live || !chatAgentCore) return "";
       const parts = [];
       const hasProcess = live.process.steps.length || live.process.stepLimitText || live.process.errorText;
       if (hasProcess) {
-        parts.push(chatAgentCore.agentProcessMarkup(live.process, { live: !live.finished }));
+        parts.push(chatAgentCore.agentProcessMarkup(applyApprovalExecutingOverrides(live.process), { live: !live.finished }));
       }
       if (live.replyText) {
         parts.push(`<div class="chat-bubble agent"><div class="chat-markdown">${renderMarkdown(live.replyText)}</div></div>`);
@@ -7981,7 +8001,7 @@ ${cardFeedbackBarHtml()}`;
         ? `<div class="chat-bubble user" data-dialogue-turn-id="${turnId}" data-part="user">${escapeHtml(userText)}</div>`
         : "";
       const process = chatAgentCore.agentProcessMarkup(
-        chatAgentCore.buildAgentProcess(chatAgentCore.turnAgentEvents(turn)),
+        applyApprovalExecutingOverrides(chatAgentCore.buildAgentProcess(chatAgentCore.turnAgentEvents(turn))),
       );
       const failed = ["error", "failed"].includes(String(turn.status || "").toLowerCase());
       const reply = failed
@@ -8172,9 +8192,24 @@ ${cardFeedbackBarHtml()}`;
     // ── 审批卡 ──
 
     async function refreshChatApprovals() {
-      const payload = await requestJsonStrict(`${ENDPOINTS.chatApprovals}?status=pending`, { cache: "no-store" });
-      const items = asArray(payload?.items);
-      const signature = JSON.stringify(items);
+      // pending 列表之外同时拉 executing（回放恢复）与本页已批准记录的全量
+      // 快照（异步执行的终态跟踪），都挂在既有 2.5s 表面刷新节奏上。
+      const requests = [
+        requestJsonStrict(`${ENDPOINTS.chatApprovals}?status=pending`, { cache: "no-store" }),
+        requestJsonStrict(`${ENDPOINTS.chatApprovals}?status=executing`, { cache: "no-store" }),
+      ];
+      if (executingApprovalIds.size) {
+        requests.push(requestJsonStrict(`${ENDPOINTS.chatApprovals}?limit=100`, { cache: "no-store" }));
+      }
+      const [pendingPayload, executingPayload, allPayload] = await Promise.all(requests);
+      const items = asArray(pendingPayload?.items);
+      approvalExecutingOverrides = new Map(
+        asArray(executingPayload?.items)
+          .map((record) => [String(record?.approval_id || ""), record])
+          .filter(([id]) => id),
+      );
+      if (allPayload) trackQueuedApprovals(asArray(allPayload?.items));
+      const signature = JSON.stringify(items) + JSON.stringify([...approvalExecutingOverrides.keys()]);
       state.agentChat.approvals = items;
       renderChatBadges();
       if (state.agentChat.approvalsOpen && signature !== chatApprovalsSignature) {
@@ -8183,10 +8218,44 @@ ${cardFeedbackBarHtml()}`;
       }
     }
 
+    // 本页批准的审批：全量快照里到达终态就把各处卡片落成结果。
+    function trackQueuedApprovals(records) {
+      if (!chatAgentCore) return;
+      for (const approvalId of executingApprovalIds) {
+        const record = records.find((item) => String(item?.approval_id || "") === approvalId);
+        if (!record) continue;
+        const status = String(record.status || "");
+        if (!chatAgentCore.isApprovalTerminalStatus(status)) continue;
+        executingApprovalIds.delete(approvalId);
+        approvalTerminalOverrides.set(approvalId, record);
+        const model = chatAgentCore.approvalCardModelFromRecord(record);
+        if (!model) continue;
+        const ok = status === "executed" && model.ok !== false;
+        const detail = String(model.resultText || "").trim();
+        const label =
+          status === "rejected"
+            ? "已拒绝"
+            : status === "expired"
+              ? "已过期"
+              : ok
+                ? "已批准并执行"
+                : `已批准，但执行失败${detail ? `：${detail}` : ""}`;
+        const toneClass = status === "rejected" ? "is-rejected" : ok ? "is-ok" : "is-failed";
+        document
+          .querySelectorAll(`[data-agent-approval-id="${CSS.escape(approvalId)}"]`)
+          .forEach((card) => setApprovalCardStatus(card, label, toneClass));
+        if (state.agentChat.live) chatAgentCore.applyApprovalRecordToProcess(state.agentChat.live.process, record);
+        showToast(ok ? "已批准并执行" : label);
+      }
+    }
+
     function renderChatApprovalsPanel() {
       const body = $("#chatApprovalsBody");
       if (!body || !chatAgentCore) return;
-      body.innerHTML = chatAgentCore.approvalsPanelMarkup(state.agentChat.approvals);
+      body.innerHTML = chatAgentCore.approvalsPanelMarkup([
+        ...state.agentChat.approvals,
+        ...approvalExecutingOverrides.values(),
+      ]);
     }
 
     function renderChatApprovalsPanelVisibility() {
@@ -8196,17 +8265,23 @@ ${cardFeedbackBarHtml()}`;
       if (state.agentChat.approvalsOpen) renderChatApprovalsPanel();
     }
 
-    function markApprovalCardDecided(card, label, toneClass) {
+    function setApprovalCardStatus(card, label, toneClass) {
       if (!card) return;
       card.dataset.decided = "true";
       card.querySelector(".agent-approval-reject")?.remove();
-      const actions = card.querySelector(".agent-approval-actions");
-      const status = document.createElement("p");
-      status.className = `agent-approval-status ${toneClass}`;
+      card.querySelector(".agent-approval-actions")?.remove();
+      let status = card.querySelector(".agent-approval-status");
+      if (!(status instanceof HTMLElement)) {
+        status = document.createElement("p");
+        card.appendChild(status);
+      }
+      status.className = `agent-approval-status ${toneClass}`.trim();
       status.setAttribute("role", "status");
       status.textContent = label;
-      if (actions) actions.replaceWith(status);
-      else card.appendChild(status);
+    }
+
+    function markApprovalCardDecided(card, label, toneClass) {
+      setApprovalCardStatus(card, label, toneClass);
     }
 
     async function handleAgentApprovalAction(button) {
@@ -8230,18 +8305,35 @@ ${cardFeedbackBarHtml()}`;
       button.disabled = true;
       try {
         if (action === "approve") {
-          const result = await requestJsonStrict(
-            `${ENDPOINTS.chatApprovals}/${encodeURIComponent(approvalId)}/approve`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+          const response = chatAgentCore.normalizeApproveResponse(
+            await requestJsonStrict(
+              `${ENDPOINTS.chatApprovals}/${encodeURIComponent(approvalId)}/approve`,
+              { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+            ),
           );
-          const ok = result?.ok !== false;
-          const detail = String(result?.result || result?.approval?.error || "").trim();
-          markApprovalCardDecided(
-            card,
-            ok ? "已批准并执行" : `已批准，但执行失败${detail ? `：${detail}` : ""}`,
-            ok ? "is-ok" : "is-failed",
-          );
-          showToast(ok ? "已批准并执行" : "已批准，但执行失败");
+          if (response.kind === "queued") {
+            // 异步执行协议：批准只入队，卡片进「执行中…」，终态由
+            // refreshChatApprovals 的 2.5s 轮询落到 executed/failed。
+            executingApprovalIds.add(approvalId);
+            if (state.agentChat.live) {
+              chatAgentCore.applyApprovalRecordToProcess(state.agentChat.live.process, {
+                approval_id: approvalId,
+                status: "executing",
+              });
+            }
+            setApprovalCardStatus(card, "执行中…", "");
+            showToast(response.alreadyQueued ? "这项改动已在执行中" : "已批准，正在执行…");
+          } else {
+            // 旧协议（同步返回 ok/result）或幂等终态应答：直接显示结果。
+            const ok = response.ok !== false;
+            const detail = String(response.resultText || "").trim();
+            markApprovalCardDecided(
+              card,
+              ok ? "已批准并执行" : `已批准，但执行失败${detail ? `：${detail}` : ""}`,
+              ok ? "is-ok" : "is-failed",
+            );
+            showToast(ok ? "已批准并执行" : "已批准，但执行失败");
+          }
         } else if (action === "confirm-reject") {
           const reason = card.querySelector(".agent-approval-reason")?.value?.trim() || "";
           await requestJsonStrict(

@@ -78,6 +78,20 @@ test("popup wires session switching, approvals, task center and summary cards", 
   assert.match(popupJs, /data-tasks-back/);
 });
 
+test("popup approval cards follow the async execute protocol (queued → executing → terminal)", () => {
+  // approve 响应按 queued 字段归类：新协议入队、旧协议同步结果兜底。
+  assert.match(popupJs, /normalizeApproveResponse\(await approveChatApproval\(approvalId\)\)/);
+  assert.match(popupJs, /response\.kind === "queued"/);
+  // 入队后卡片进入「执行中…」并登记跟踪，防止重复点击。
+  assert.match(popupJs, /markPopupApprovalCardExecuting\(card\)/);
+  assert.match(popupJs, /popupExecutingApprovals\.set\(approvalId/);
+  // 终态由 refreshChatApprovals 的轮询恢复（executing 列表 + 全量快照）。
+  assert.match(popupJs, /fetchChatApprovals\(\{ status: "executing" \}\)/);
+  assert.match(popupJs, /settlePopupTrackedApproval\(approvalId, turnId, record\)/);
+  // 刷新/回放用 executing 覆盖恢复中间态。
+  assert.match(popupJs, /applyApprovalRecordToRun\(run, record\)/);
+});
+
 test("popup agent styles keep the compact small-window form", () => {
   assert.match(popupHtml, /\.chat-subtabs\s*\{/);
   assert.match(popupHtml, /\.chat-subpanel\s*\{[\s\S]*?overflow:\s*hidden;/);

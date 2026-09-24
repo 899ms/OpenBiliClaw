@@ -493,7 +493,7 @@ data_dir = "data"  # 记忆 JSON 文件存储在 data/memory/ 下
 6. **核心记忆裁剪**：`get_core_memory()` 只暴露稳定摘要（读生效画像 AI ⊕ overrides），不把整层原始 JSON 直接塞进 prompt
 7. **统一 Prompt 注入 + 稳定/易变拆分**：`render_core_memory_blocks()`（委托 `chat_core_memory` 视图）把核心记忆拆成 system 侧稳定块与 user 侧易变块，`LLMService` 全注入族共享该拆分——觉察/洞察刷新不再打碎 system 前缀缓存；`render_core_memory_prompt()` 保留为拼接兼容包装
 8. **插件事件兼容**：事件层白名单已扩到插件采集事件，避免 `/api/events` 在 `snapshot`、`scroll`、`hover`、`seek` 等行为上拒收
-9. **反馈状态独立持久化**：`feedback_state.json` 单独保存反馈处理游标，以及 `feedback_owner_version` / `feedback_owner_cutover_at` 升级边界；写入使用 tmp + fsync + `os.replace`，让 cursor 与 owner fence 同时发布，避免把运行状态塞进 `preference.json` 或 `soul.json`
+9. **反馈状态独立持久化**：`feedback_state.json` 单独保存反馈处理游标，以及 `feedback_owner_version` / `feedback_owner_cutover_at` 升级边界；写入使用 tmp + fsync + `os.replace`，让 cursor 与 owner fence 同时发布，避免把运行状态塞进 `preference.json` 或 `soul.json`；tmp 文件名带 pid + uuid 唯一后缀，多个写者（如 feedback scheduler 与其他 owner）并发保存时不再因共享 tmp 名竞态报 FileNotFoundError，孤儿 tmp 写在 finally 中清理
 10. **聊天候选与正式画像分层**：聊天提取出的 `insight_candidates.json` 先作为中间状态保留，不直接覆盖 `soul.json`
 11. **插件聊天回合独立持久化**：`chat_turns` 只保存 side panel durable turn 的请求、回复和状态，解决 Chrome side panel reload / discard 时 DOM 和 JS 内存丢失的问题；它不替代事件层学习，完成后的 dialogue/cognition 仍按后端流程受控进入画像链路
 12. **候选池运行状态分层**：`discovery_runtime.json` 只负责刷新与通知游标，不与 `feedback_state.json`、`insight_candidates.json` 或画像数据混存

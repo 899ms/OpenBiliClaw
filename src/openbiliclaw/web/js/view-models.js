@@ -1026,6 +1026,17 @@ export function getMobileChatSession(scope = "chat") {
   };
 }
 
+/**
+ * Message-list state for the chat view's first paint. The empty-state copy
+ * must only appear after the first history fetch settles (total=0); before
+ * that a loading indicator stands in so a slow backend does not read as lost
+ * history.
+ */
+export function getChatHistoryViewState({ historyLoaded = false, turnCount = 0, sending = false } = {}) {
+  if (turnCount > 0 || sending) return "turns";
+  return historyLoaded ? "empty" : "loading";
+}
+
 // ── Cognition Updates ────────────────────────────────────────
 
 export function normalizeCognitionUpdateCard(item) {

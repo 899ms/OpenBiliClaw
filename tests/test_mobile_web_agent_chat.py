@@ -98,3 +98,55 @@ def test_mobile_agent_styles_keep_long_lists_bounded() -> None:
     assert ".agent-drawer-list {" in css
     assert "overscroll-behavior: contain;" in css
     assert ".agent-task-row {" in css
+
+
+def test_mobile_chat_shows_loading_indicator_until_first_history_settles() -> None:
+    chat = CHAT_JS.read_text(encoding="utf-8")
+
+    # First paint goes through the shared view-state helper: loading until the
+    # first history fetch settles, empty copy only after total=0.
+    assert "getChatHistoryViewState" in chat
+    assert 'historyViewState === "loading"' in chat
+    assert 'historyViewState === "empty"' in chat
+    assert "chat-history-loading" in chat
+    assert "let historyLoaded = false;" in chat
+    # Entering the view paints immediately (spinner) before the fetch returns.
+    assert "render();\n  loadHistory();" in chat
+    # Switching sessions re-arms the loading state instead of flashing the
+    # empty copy while the new session's history is in flight.
+    assert "turns = [];\n  historyLoaded = false;" in chat
+
+
+def test_mobile_chat_history_loading_styles_exist() -> None:
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert ".chat-history-loading {" in css
+    assert ".chat-history-loading-text {" in css
+
+
+def test_mobile_approval_cards_follow_the_async_execute_protocol() -> None:
+    """approve 只入队（queued → executing → 终态轮询），旧协议同步结果兜底。"""
+
+    chat = CHAT_JS.read_text(encoding="utf-8")
+
+    # approve 响应按 queued 字段归类。
+    assert "normalizeApproveResponse(await approveChatApproval(approvalId))" in chat
+    assert 'response.kind === "queued"' in chat
+    # 入队后卡片进入「执行中…」并登记跟踪，防止重复点击。
+    assert "markApprovalCardExecuting(card)" in chat
+    assert "executingApprovals.set(approvalId" in chat
+    # 终态由 refreshApprovals 的 2.5s 轮询恢复（executing 列表 + 全量快照）。
+    assert 'fetchChatApprovals({ status: "executing" })' in chat
+    assert "settleTrackedApproval(approvalId, turnId, record)" in chat
+    # 刷新/回放用 executing 覆盖恢复中间态。
+    assert "applyApprovalRecordToRun(run, record)" in chat
+
+    shared = SHARED_AGENT_CHAT.read_text(encoding="utf-8")
+
+    assert 'executing: "执行中…"' in shared
+    assert "function normalizeApproveResponse(payload)" in shared
+    assert "function applyApprovalRecordToRun(run, record)" in shared
+
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert '.agent-approval-status[data-tone="executing"]' in css

@@ -207,11 +207,14 @@ if (!agentChat) {
 }
 const {
   applyAgentEvent,
+  applyApprovalRecordToRun,
   agentEventsFromTurn,
   agentRunFromEvents,
   createAgentRun,
   isAgentTaskActive,
   isAgentTaskSummaryTurn,
+  isApprovalTerminalStatus,
+  normalizeApproveResponse,
   renderAgentRunMarkup,
   renderAgentTaskDetailMarkup,
   renderAgentTaskRowMarkup,
@@ -717,6 +720,13 @@ let popupChatSubtab = "chat";
 let popupChatSessions = [];
 let popupPendingApprovals = [];
 let popupApprovalsExpanded = false;
+// 异步审批执行（approve 只入队）：本页批准、等待终态的审批（id → turnId），
+// 以及后端 executing 记录（刷新/回放时把 pending 卡恢复成「执行中…」）。
+const popupExecutingApprovals = new Map();
+let popupApprovalExecutingOverrides = new Map();
+// 本页已观察到终态的记录：approval_result 事件落进 turn 回放前，
+// 轮询重渲染也用这份快照保持终态展示。
+const popupApprovalTerminalOverrides = new Map();
 let popupAgentTasks = [];
 let popupAgentTaskDetail = null;
 let popupTasksPollTimer = null;
@@ -5938,9 +5948,15 @@ function renderDialogueContextBar() {
 function popupAgentRunFor(turn) {
   if (!turn?.turn_id) return null;
   const live = popupAgentRuns.get(turn.turn_id);
-  if (live) return live;
   const events = agentEventsFromTurn(turn);
-  return events.length > 0 ? agentRunFromEvents(events) : null;
+  const run = live || (events.length > 0 ? agentRunFromEvents(events) : null);
+  // 回放只归约 approval_request → pending；用 executing 列表恢复中间态，
+  // 避免刷新后露出可重复点击的批准按钮。
+  if (run) {
+    for (const record of popupApprovalTerminalOverrides.values()) applyApprovalRecordToRun(run, record);
+    for (const record of popupApprovalExecutingOverrides.values()) applyApprovalRecordToRun(run, record);
+  }
+  return run;
 }
 
 function popupAgentRunHasContent(run) {
@@ -6053,11 +6069,45 @@ function renderChatSkillSelect() {
 async function refreshChatApprovals() {
   if (!state.online) return;
   try {
-    popupPendingApprovals = await fetchChatApprovals({ status: "pending" });
+    // pending 之外同时拉 executing（回放恢复中间态），并在有本页批准的
+    // 审批时拉全量快照跟踪到终态；挂在既有 2.5s 历史刷新节奏上。
+    const [pending, executing] = await Promise.all([
+      fetchChatApprovals({ status: "pending" }),
+      fetchChatApprovals({ status: "executing" }),
+    ]);
+    popupPendingApprovals = pending;
+    popupApprovalExecutingOverrides = new Map(executing.map((record) => [record.approval_id, record]));
+    if (popupExecutingApprovals.size) {
+      const all = await fetchChatApprovals({ status: "", limit: 100 });
+      for (const [approvalId, turnId] of [...popupExecutingApprovals]) {
+        const record = all.find((item) => item.approval_id === approvalId);
+        if (!record || !isApprovalTerminalStatus(record.status)) continue;
+        popupExecutingApprovals.delete(approvalId);
+        settlePopupTrackedApproval(approvalId, turnId, record);
+      }
+    }
   } catch {
     // 503 (approval gate unwired) or offline: keep the last snapshot.
   }
   renderChatApprovals();
+}
+
+// 轮询发现本页批准的审批到达终态：更新 run 模型、重绘过程流并提示结果。
+function settlePopupTrackedApproval(approvalId, turnId, record) {
+  const ok = record.status === "executed";
+  popupApprovalTerminalOverrides.set(approvalId, record);
+  for (const run of popupAgentRuns.values()) {
+    const approval = run.approvals.find((item) => item.approval_id === approvalId);
+    if (approval) {
+      approval.status = record.status;
+      if (record.resultText) approval.resultText = record.resultText;
+    }
+  }
+  if (turnId) updatePopupAgentRunDom(turnId);
+  setChatStatus(
+    ok ? "已批准并执行。" : `批准了，但执行失败${record.resultText ? `：${record.resultText}` : "。"}`,
+    ok ? "success" : "error",
+  );
 }
 
 function renderChatApprovals() {
@@ -6066,13 +6116,14 @@ function renderChatApprovals() {
     elements.chatApprovalsCount.textContent = String(count);
   }
   if (elements.chatApprovalsToggle instanceof HTMLButtonElement) {
-    elements.chatApprovalsToggle.hidden = count === 0 && !popupApprovalsExpanded;
+    elements.chatApprovalsToggle.hidden = count === 0 && popupApprovalExecutingOverrides.size === 0 && !popupApprovalsExpanded;
     elements.chatApprovalsToggle.classList.toggle("is-expanded", popupApprovalsExpanded);
     elements.chatApprovalsToggle.setAttribute("aria-expanded", String(popupApprovalsExpanded));
   }
   if (elements.chatApprovalsList instanceof HTMLElement) {
     elements.chatApprovalsList.hidden = !popupApprovalsExpanded;
-    elements.chatApprovalsList.innerHTML = popupPendingApprovals
+    // 列表同时展示执行中的审批（无按钮，只显示「执行中…」状态）。
+    elements.chatApprovalsList.innerHTML = [...popupPendingApprovals, ...popupApprovalExecutingOverrides.values()]
       .map((approval) => renderApprovalCardMarkup(approval, { compact: true }))
       .join("");
   }
@@ -6289,19 +6340,27 @@ async function handlePopupApprovalAction(button) {
   for (const btn of card.querySelectorAll("button")) btn.disabled = true;
   try {
     if (action === "approve") {
-      const result = await approveChatApproval(approvalId);
-      const ok = result?.ok !== false;
-      settlePopupApprovalCard(card, ok ? "已批准并执行" : "批准了但执行失败", ok);
-      setChatStatus(ok ? "已批准并执行。" : "批准了，但执行失败。", ok ? "success" : "error");
+      const response = normalizeApproveResponse(await approveChatApproval(approvalId));
+      if (response.kind === "queued") {
+        // 异步执行协议：批准只入队，卡片进「执行中…」，终态交给
+        // refreshChatApprovals 的 2.5s 轮询落到 executed/failed。
+        markPopupApprovalCardExecuting(card);
+        popupExecutingApprovals.set(approvalId, findPopupApprovalTurnId(approvalId));
+        setPopupRunApprovalStatus(approvalId, "executing");
+        setChatStatus(response.alreadyQueued ? "这项改动已在执行中。" : "已批准，正在执行…", "info");
+      } else {
+        // 旧协议（同步返回 ok/result）或幂等终态应答：直接显示结果。
+        const ok = response.ok !== false;
+        settlePopupApprovalCard(card, ok ? "已批准并执行" : `批准了但执行失败：${response.resultText || ""}`, ok);
+        setPopupRunApprovalStatus(approvalId, ok ? "executed" : "failed", response.resultText);
+        setChatStatus(ok ? "已批准并执行。" : "批准了，但执行失败。", ok ? "success" : "error");
+      }
     } else if (action === "reject-submit") {
       const reason = card.querySelector(".agent-approval-reason")?.value?.trim() || "";
       await rejectChatApproval(approvalId, reason);
       settlePopupApprovalCard(card, "已拒绝，不会执行。", true);
+      setPopupRunApprovalStatus(approvalId, "rejected");
       setChatStatus("已拒绝这个操作。", "info");
-    }
-    for (const run of popupAgentRuns.values()) {
-      const approval = run.approvals.find((item) => item.approval_id === approvalId);
-      if (approval) approval.status = action === "approve" ? "executed" : "rejected";
     }
     void refreshChatApprovals();
   } catch (error) {
@@ -6310,10 +6369,41 @@ async function handlePopupApprovalAction(button) {
   }
 }
 
+function findPopupApprovalTurnId(approvalId) {
+  for (const [turnId, run] of popupAgentRuns) {
+    if (run.approvals.some((item) => item.approval_id === approvalId)) return turnId;
+  }
+  return "";
+}
+
+function setPopupRunApprovalStatus(approvalId, status, resultText = "") {
+  for (const run of popupAgentRuns.values()) {
+    const approval = run.approvals.find((item) => item.approval_id === approvalId);
+    if (approval) {
+      approval.status = status;
+      if (resultText) approval.resultText = resultText;
+    }
+  }
+}
+
+function markPopupApprovalCardExecuting(card) {
+  card.dataset.status = "executing";
+  const status = card.querySelector(".agent-approval-status");
+  if (status instanceof HTMLElement) {
+    status.textContent = "执行中…";
+    status.dataset.tone = "executing";
+  }
+  card.querySelector(".agent-approval-actions")?.remove();
+  card.querySelector(".agent-approval-reject")?.remove();
+}
+
 function settlePopupApprovalCard(card, message, ok) {
   card.dataset.status = ok ? "executed" : "failed";
   const status = card.querySelector(".agent-approval-status");
-  if (status instanceof HTMLElement) status.textContent = message;
+  if (status instanceof HTMLElement) {
+    status.textContent = message;
+    status.dataset.tone = ok ? "executed" : "failed";
+  }
   card.querySelector(".agent-approval-actions")?.remove();
   card.querySelector(".agent-approval-reject")?.remove();
 }
