@@ -176,3 +176,20 @@ class TestStreamAgentReply:
             await _collect(dialogue.stream_agent_reply(loop, "你好"))
 
         assert dialogue.history == []
+
+    async def test_system_prompt_carries_agent_ground_rules(self) -> None:
+        loop, llm = _loop([LLMResponse(content="好的")])
+        dialogue = _dialogue(object())
+
+        await _collect(dialogue.stream_agent_reply(loop, "你好"))
+
+        system = llm.calls[0]["messages"][0]["content"]
+        # 工具纪律: never narrate/fabricate tool calls in prose (issue 4).
+        assert "工具纪律" in system
+        assert "严禁编造工具调用" in system
+        # 记忆归属: shared memory base, no unfounded session claims (issue 5).
+        assert "记忆归属" in system
+        assert "跨会话共享" in system
+        # 会话边界: "本对话/第一回合" means the current session (issue 6).
+        assert "会话边界" in system
+        assert "当前会话" in system

@@ -15,6 +15,8 @@ import asyncio
 import json
 import logging
 import os
+import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from openbiliclaw.sources.event_format import default_signal_strength_for_event
@@ -314,14 +316,24 @@ class MemoryManager:
                 )
             ),
         }
-        temporary_path = self._feedback_state_path.with_suffix(
-            f"{self._feedback_state_path.suffix}.tmp"
+        # Unique tmp name per write: the feedback scheduler and other
+        # owners can save concurrently, and a shared ``*.tmp`` name raced —
+        # the loser hit FileNotFoundError when its os.replace ran after the
+        # winner had already renamed the tmp file away.
+        temporary_path = self._feedback_state_path.with_name(
+            f"{self._feedback_state_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
-        with open(temporary_path, "w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary_path, self._feedback_state_path)
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, self._feedback_state_path)
+        finally:
+            # After a successful replace the tmp file is gone; on failure,
+            # remove the orphaned tmp so retries never inherit stale bytes.
+            with suppress(OSError):
+                temporary_path.unlink()
 
     def load_account_sync_state(self) -> dict[str, object]:
         """Load account-side sync cursor state from disk."""

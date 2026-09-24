@@ -667,7 +667,7 @@ XHS / 抖音 / YouTube / 知乎 / Reddit / Linux.do / V2EX / 微博八个插件�
 
 ### Config recovery boundary
 
-热重载取消边界：`BackgroundTaskRegistry.cancel_all()/cancel()` 与 `restart_background_tasks()` 都用 `asyncio.wait(..., timeout=1.5)`，而不是会继续等待 coroutine 真正结束的 `wait_for(gather(...))`。第三方 provider / loop 若吞掉 `CancelledError`，配置保存仍在 deadline 内返回；未退出任务继续留在 registry 和 `app.state` 中供后续关闭重试，并且不会启动同名 refresh / account-sync / auto-update loop，避免旧新 runtime 同时写库。正常协作取消的任务仍在新组件发布前完成清理。
+热重载取消边界：`BackgroundTaskRegistry.cancel_all()/cancel()` 与 `restart_background_tasks()` 都用 `asyncio.wait(..., timeout=1.5)`，而不是会继续等待 coroutine 真正结束的 `wait_for(gather(...))`。第三方 provider / loop 若吞掉 `CancelledError`，配置保存仍在 deadline 内返回；未退出任务继续留在 registry 和 `app.state` 中供后续关闭重试，并且不会启动同名 refresh / account-sync / auto-update loop，避免旧新 runtime 同时写库。正常协作取消的任务仍在新组件发布前完成清理。豁免名单为 `guided_init` 与 `chat_approval_execute`：后者是用户已确认的 L2 写入执行（update_config 的执行本身就是热重载发起人），取消它会把审批记录卡在 `executing`，因此总是放行到终态。热重载还会复用同一 `ApprovalStore` 实例（backing 文件路径不变时），保证审批状态机只有一份内存权威。
 
 对话结算 worker 不在上述 registry 内，由 `RuntimeContext.rebuild_from_config()`
 先保持 admission 开放并 drain old；25 分钟 drain 超时不再被吞掉：runtime 恢复

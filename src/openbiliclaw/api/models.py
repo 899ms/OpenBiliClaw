@@ -2034,6 +2034,11 @@ class ChatTurnIn(BaseModel):
             "inventory_settles_allowed",
             # Server-owned agent-loop replay log (written on stream completion).
             "agent_events",
+            # Server-owned streaming markers (written at POST /api/chat/turns):
+            # the durable fallback worker uses them to re-run the agent loop
+            # for streaming turns instead of the legacy single-hop reply.
+            "agent_stream",
+            "agent_skill",
             # Server-owned background-task summary card (M6): written only by
             # AgentTaskManager when a task terminates; clients must not forge
             # a summary card for an arbitrary task.

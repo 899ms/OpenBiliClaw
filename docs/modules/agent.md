@@ -30,7 +30,7 @@ M9 交付移动 Web（`web/js/views/chat.js`）与插件 popup（`extension/popu
 | M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
 | M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
 | M6 任务中心（durable 后台任务） | ✅ | `agent/tasks.py`：`AgentTaskRunner` 在 `BackgroundTaskRegistry` 登记的 asyncio task 里跑**只读** AgentLoop（`filter_by_permission("read")` ∩ skill 白名单），事件逐步落 `agent_tasks.steps`；写动作只经 `propose_suggestion` 元工具产出结构化建议清单，完成后往来源会话写汇总消息；交互侧另有 `start_background_task` 元工具（同 suggest_skill 确认卡模式）。见下文「任务中心（M6）」 |
-| M7 L2 审批门 | ✅ | `agent/approvals.py`：loop 拦截 hard_write 调用 → `approval_request` SSE 事件 + durable 审批记录（JSON 文件存储，免迁移）；`/api/chat/approvals` 端点批准（二次 dispatch 真执行，幂等）/拒绝；审计落 `profile_update_ledger`。见下文「L2 审批门（M7）」 |
+| M7 L2 审批门 | ✅ | `agent/approvals.py`：loop 拦截 hard_write 调用 → `approval_request` SSE 事件 + durable 审批记录（JSON 文件存储，免迁移）；`/api/chat/approvals` 端点批准（立即返回 + 后台任务二次 dispatch 真执行，幂等）/拒绝；审计落 `profile_update_ledger`。见下文「L2 审批门（M7）」 |
 
 ## 模块结构
 
@@ -208,7 +208,12 @@ source=builtin|custom）与 `SkillCatalog`（`get` / `default` /
 字段（空 = 默认口味伙伴，未知名返回 422）。选中 skill 后：loop 的工具集 =
 `agent_tool_registry.subset(skill.tools)` + `suggest_skill` 元工具；system
 prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
-（`_layer_skill_system_prompt()`，dialogue.py）。会话中切换就是下一回合带
+（`_layer_skill_system_prompt()`，dialogue.py）⊕ **Agent 工作纪律**
+（`_AGENT_LOOP_GROUND_RULES`，所有 skill 共享的三条硬约束：① 工具纪律——
+需要数据必须实际发起 tool_call，严禁在正文描述/编造工具调用与结果，没调
+工具就不得声称查过/改过；② 记忆归属——记忆/画像/历史来自跨会话共享底座，
+无明确依据不得断言行事发生在本对话；③ 会话边界——「本对话/第一回合」指
+当前会话，上下文窗口只是当前会话近期）。会话中切换就是下一回合带
 新的 `skill` 值；**agent 建议切换**走 `suggest_skill` 元工具
 （`agent/tools/skill_tools.py`）：模型输出工具调用（`skill` + `reason`），
 前端把该 `tool_call` 事件渲染成切换卡片，用户确认后以下一回合的 `skill`
@@ -240,12 +245,17 @@ prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
 | `step_limit_reached` | `type` / `step` / `text` | 达到步数上限时发一次，**随后必跟一个 `final`**（无工具收尾汇报） |
 | `final` | `type` / `step` / `text` | 最终答复，每个 run 恰好一个；发完后流进入收尾 |
 | `done` | `reply` / `turn_id` / `skill` | 终端事件（端点级，非 loop 事件）；`reply` 即 `final.text`，`skill` 是本回合实际生效的 skill 名 |
-| `error` | `error` | LLM 异常等失败的唯一事件（安全文案），发出后流结束；带 `turn_id` 时 turn 置为 `failed` |
+| `error` | `error` | 失败的唯一事件（安全文案），发出后流结束；LLM 异常时带 `turn_id` 的 turn 置为 `failed`。租约准入超时（热重载窗口，30 秒预算）时文案为「系统正在重载配置，请稍后再试」，此时 loop 未开始、turn **保持 pending** 并由兜底 worker 在 lane 恢复后重跑 agent loop 完成 |
 
 `step` 从 1 开始编号。turn 落库时关键步骤（含 thinking / tool_call /
 tool_result / approval_request / step_limit_reached / final）以相同 dict 结构写入
 `chat_turns.payload.agent_events`（JSON 数组，免迁移），历史回放直接读
 `GET /api/chat/turns/{turn_id}` 的 `payload.agent_events`。
+streaming turn 创建时服务端在 payload 写入 `agent_stream`（+ 可选 `agent_skill`）
+标记（属客户端不可伪造的保留键）：交互流断连后由 durable 兜底 worker
+完成的这类 turn 会**重跑同一多跳 loop**（同 skill、同工具子集）并把事件流
+落进 `agent_events`，回放行为与交互路径一致；agent loop 未接线的降级
+runtime 才退回 legacy 单跳回复。
 
 ### L2 审批门（M7）
 
@@ -254,23 +264,34 @@ hard_write 工具（create_source / toggle_source / update_config）在 agent lo
 「待批准动作」登记进 `ApprovalStore`（`agent/approvals.py`），流出
 `approval_request` 事件，并把「此操作需用户批准，已提交审批 #id」作为
 `tool_result` 回填给模型——**当前回合正常结束**，不在 SSE 流中间挂起等待。
-用户批准后，approve 端点用登记时的原 arguments 二次 `registry.dispatch`
-执行真写入，并把一条 `approval_result` 事件追加进来源 turn 的
-`payload.agent_events`，使历史回放能看到审批结局。
+用户批准后，approve 端点把记录迁移到 `executing` 并**立即返回**，
+真实执行由 `BackgroundTaskRegistry` 登记的后台任务（`chat_approval_execute`，
+热重载 `cancel_all` 豁免）完成：用登记时的原 arguments 二次 `registry.dispatch`
+执行真写入，完成后迁移终态、写审计台账，并把一条 `approval_result` 事件追加进
+来源 turn 的 `payload.agent_events`，使历史回放能看到审批结局。执行解耦是
+刻意的：update_config 会触发热重载的 lane 排空，可能等待数分钟，绝不能在
+HTTP 请求内同步执行；前端轮询 `GET /api/chat/approvals` 观察
+`executing → executed / failed` 的进展。
 
 **存储**：`ApprovalStore` 是单 JSON 文件存储（`{data_dir}/chat_approvals.json`，
 tmp + os.replace 原子写，进程内 threading.Lock 串行化），刻意不动
-`storage/database.py`（免迁移）；`path=None` 时为纯内存（测试）。记录字段：
-approval_id（`ap_*`）/ tool_name / arguments / summary（做什么）/ reason
-（为什么，取参数的 `reason`）/ impact（影响说明，来自 `Tool.impact_hint`）/
+`storage/database.py`（免迁移）；`path=None` 时为纯内存（测试）。生产接线
+（`api/runtime_context.py`）在热重载间**复用同一 store 实例**（ backing 文件
+路径相同即保留），保证状态机只有一份内存权威；读路径（get/list）只在惰性
+过期真的改变了记录时才落盘，避免热重载窗口内并存的旧实例把文件写回旧态。
+记录字段：approval_id（`ap_*`）/ tool_name / arguments / summary（做什么）/
+reason（为什么，取参数的 `reason`）/ impact（影响说明，来自 `Tool.impact_hint`）/
 session / session_id / turn_id / status / 时间戳 / result / error。
 
-**状态机**：`pending → approved → executed`、`pending → rejected`、
+**状态机**：`pending → approved → executing → executed`（执行成功）/
+`failed`（执行失败，终态，`error` 携带原因）、`pending → rejected`、
 `pending → expired`（默认 24h TTL，读取/写入时惰性过期）。幂等：重复 approve
-已 approved/executed 的记录直接返回现状（**不重执行**）；重复 reject 同理且
-不再写审计。`mark_executed` 只接受 approved 态，从机制上禁止二次执行；端点侧
-另有一把 asyncio 锁把 approve→execute→mark 串成原子段。approve 后进程崩溃
-会留下 approved 未执行的记录，再次 approve 可重试执行（仅崩溃场景）。
+已 approved/executing/executed/failed 的记录直接返回现状（**不重执行、不重复
+入队**）；重复 reject 同理且不再写审计。`mark_executing` 只接受 approved 态、
+`mark_executed` 只接受 executing 态，从机制上禁止二次执行；端点侧另有一把
+asyncio 锁把 approve→mark_executing→入队串成原子段（锁内不含 dispatch）。
+崩溃恢复：进程在 `executing` 期间退出时，加载会把记录降回 `approved`
+（副作用是否发生不确定，由用户重新 approve 重试，绝不自动重跑）。
 
 **审计**：每次真实决策（批准执行成功/失败、拒绝）经 `ProfileLedger`
 （`soul/ledger.py`）写 `profile_update_ledger` 一行：`write_point` =

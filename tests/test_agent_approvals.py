@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -90,21 +93,90 @@ class TestApprovalStore:
         approved = store.approve(record.approval_id)
         assert approved.status == "approved"
         assert approved.decided_at
-        # Re-approve is a no-op, before and after execution.
+        # Re-approve is a no-op at every post-pending state.
         assert store.approve(record.approval_id).status == "approved"
+        executing = store.mark_executing(record.approval_id)
+        assert executing.status == "executing"
+        assert store.approve(record.approval_id).status == "executing"
         executed = store.mark_executed(record.approval_id, ok=True, result="done")
         assert executed.status == "executed"
         assert store.approve(record.approval_id).status == "executed"
 
-    def test_mark_executed_requires_approved(self) -> None:
+    def test_mark_executing_requires_approved_and_is_idempotent(self) -> None:
+        store = ApprovalStore()
+        record = _submit(store)
+        with pytest.raises(ApprovalConflictError):
+            store.mark_executing(record.approval_id)
+        store.approve(record.approval_id)
+        executing = store.mark_executing(record.approval_id)
+        assert executing.status == "executing"
+        # Already executing returns the record unchanged (no double queue).
+        assert store.mark_executing(record.approval_id).status == "executing"
+        store.mark_executed(record.approval_id, ok=True)
+        with pytest.raises(ApprovalConflictError):
+            store.mark_executing(record.approval_id)
+
+    def test_mark_executed_requires_executing(self) -> None:
         store = ApprovalStore()
         record = _submit(store)
         with pytest.raises(ApprovalConflictError):
             store.mark_executed(record.approval_id, ok=True)
         store.approve(record.approval_id)
-        store.mark_executed(record.approval_id, ok=False, error="boom")
+        # approved alone is not enough: execution must have been queued.
         with pytest.raises(ApprovalConflictError):
             store.mark_executed(record.approval_id, ok=True)
+        store.mark_executing(record.approval_id)
+        failed = store.mark_executed(record.approval_id, ok=False, error="boom")
+        assert failed.status == "failed"
+        assert failed.error == "boom"
+        assert failed.executed_at
+        with pytest.raises(ApprovalConflictError):
+            store.mark_executed(record.approval_id, ok=True)
+
+    def test_failed_is_terminal_and_approve_idempotent(self) -> None:
+        store = ApprovalStore()
+        record = _submit(store)
+        store.approve(record.approval_id)
+        store.mark_executing(record.approval_id)
+        store.mark_executed(record.approval_id, ok=False, error="dispatch down")
+        assert store.approve(record.approval_id).status == "failed"
+        with pytest.raises(ApprovalConflictError):
+            store.reject(record.approval_id)
+
+    def test_interrupted_executing_recovers_to_approved_on_load(self, tmp_path: Path) -> None:
+        path = tmp_path / "chat_approvals.json"
+        store = ApprovalStore(path)
+        record = _submit(store)
+        store.approve(record.approval_id)
+        store.mark_executing(record.approval_id)
+        # Simulate a crash mid-execution: the file persists "executing".
+
+        reloaded = ApprovalStore(path)
+        loaded = reloaded.get(record.approval_id)
+        assert loaded is not None
+        assert loaded.status == "approved"
+        # The demotion is persisted, and the user can retry the execution.
+        assert ApprovalStore(path).get(record.approval_id).status == "approved"  # type: ignore[union-attr]
+        reloaded.mark_executing(record.approval_id)
+        settled = reloaded.mark_executed(record.approval_id, ok=True, result="done")
+        assert settled.status == "executed"
+
+    def test_stale_instance_reads_do_not_clobber_newer_state(self, tmp_path: Path) -> None:
+        path = tmp_path / "chat_approvals.json"
+        store = ApprovalStore(path)
+        record = _submit(store)
+        store.approve(record.approval_id)
+        # A second instance (e.g. mid-hot-reload) loads the "approved" state...
+        stale = ApprovalStore(path)
+        assert stale.get(record.approval_id).status == "approved"  # type: ignore[union-attr]
+        # ...while the live instance drives the record to a terminal state.
+        store.mark_executing(record.approval_id)
+        store.mark_executed(record.approval_id, ok=True, result="done")
+        # Reads on the stale instance must not rewrite the file.
+        stale.get(record.approval_id)
+        stale.list()
+        reloaded = ApprovalStore(path)
+        assert reloaded.get(record.approval_id).status == "executed"  # type: ignore[union-attr]
 
     def test_reject_then_approve_conflicts(self) -> None:
         store = ApprovalStore()
@@ -121,6 +193,7 @@ class TestApprovalStore:
         store = ApprovalStore()
         record = _submit(store)
         store.approve(record.approval_id)
+        store.mark_executing(record.approval_id)
         store.mark_executed(record.approval_id, ok=True, result="ok")
         with pytest.raises(ApprovalConflictError):
             store.reject(record.approval_id)
@@ -407,6 +480,29 @@ def _approval_app(
     return app
 
 
+def _wait_for_approval_status(
+    client: Any,
+    approval_id: str,
+    statuses: set[str],
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Poll the list endpoint until the record reaches one of ``statuses``."""
+    deadline = time.monotonic() + timeout
+    item: dict[str, Any] | None = None
+    while True:
+        payload = client.get("/api/chat/approvals", params={"limit": 100}).json()
+        item = next(
+            (entry for entry in payload["items"] if entry["approval_id"] == approval_id),
+            None,
+        )
+        if item is not None and item["status"] in statuses:
+            return item
+        if time.monotonic() > deadline:
+            raise AssertionError(f"approval {approval_id} did not reach {statuses}: {item}")
+        time.sleep(0.01)
+
+
 class TestApprovalApi:
     def _seed_recipe(self, app: Any) -> str:
         database = app.state.runtime_context.database
@@ -457,13 +553,20 @@ class TestApprovalApi:
             assert item["tool_name"] == "toggle_source"
             assert item["arguments"]["id"] == recipe_id
 
+            # Approve returns immediately with the execution queued, not the
+            # outcome — the dispatch runs as a background task.
             approved = client.post(f"/api/chat/approvals/{record.approval_id}/approve")
             assert approved.status_code == 200
             body = approved.json()
-            assert body["executed"] is True
-            assert body["ok"] is True
-            assert "已禁用" in body["result"]
-            assert body["approval"]["status"] == "executed"
+            assert body["executed"] is False
+            assert body["queued"] is True
+            assert body["ok"] is None
+            assert body["approval"]["status"] == "executing"
+
+            settled = _wait_for_approval_status(client, record.approval_id, {"executed", "failed"})
+            assert settled["status"] == "executed"
+            assert "已禁用" in settled["result"]
+            assert settled["error"] == ""
 
             recipe = database.get_all_recipes()[0]
             assert recipe["enabled"] is False or recipe["enabled"] == 0
@@ -474,6 +577,7 @@ class TestApprovalApi:
             assert again.status_code == 200
             assert again.json()["already_executed"] is True
             assert again.json()["executed"] is False
+            assert again.json()["queued"] is False
 
         ledger_rows = database.query_profile_ledger(write_point="agent.approval.toggle_source")
         assert len(ledger_rows) == 1
@@ -482,6 +586,102 @@ class TestApprovalApi:
         assert row["held_id"] == record.approval_id
         assert row["outcome"] == "success"
         assert recipe_id in row["before_summary"]
+
+    def test_approve_during_executing_does_not_double_execute(self, tmp_path: Path) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        calls: list[dict[str, Any]] = []
+
+        async def _blocking_handler(args: dict[str, Any]) -> str:
+            calls.append(args)
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            return "已禁用订阅"
+
+        registry = ToolRegistry(
+            [
+                Tool(
+                    name="toggle_source",
+                    description="启用或禁用订阅",
+                    permission_level="hard_write",
+                    parameters={"type": "object", "properties": {"id": {"type": "string"}}},
+                    handler=_blocking_handler,
+                )
+            ]
+        )
+        app = _approval_app(tmp_path, registry=registry)
+        store: ApprovalStore = app.state.runtime_context.chat_approval_store
+        record = store.submit(
+            tool_name="toggle_source",
+            arguments={"id": "src-1"},
+            summary="toggle_source(id='src-1')",
+        )
+
+        try:
+            with TestClient(app) as client:
+                first = client.post(f"/api/chat/approvals/{record.approval_id}/approve")
+                assert first.status_code == 200
+                assert first.json()["queued"] is True
+                assert started.wait(timeout=2), "background execution should start"
+
+                # The HTTP request returned while the tool is still running.
+                in_flight = client.get("/api/chat/approvals").json()["items"][0]
+                assert in_flight["status"] == "executing"
+
+                # A duplicate approve during execution queues nothing.
+                duplicate = client.post(f"/api/chat/approvals/{record.approval_id}/approve")
+                assert duplicate.status_code == 200
+                assert duplicate.json()["queued"] is True
+                assert duplicate.json()["already_queued"] is True
+
+                release.set()
+                settled = _wait_for_approval_status(client, record.approval_id, {"executed"})
+                assert settled["result"] == "已禁用订阅"
+        finally:
+            release.set()
+        assert calls == [{"id": "src-1"}]
+
+    def test_approve_execution_failure_settles_failed(self, tmp_path: Path) -> None:
+        def _failing_handler(args: dict[str, Any]) -> str:
+            raise RuntimeError("dispatch exploded")
+
+        registry = ToolRegistry(
+            [
+                Tool(
+                    name="toggle_source",
+                    description="启用或禁用订阅",
+                    permission_level="hard_write",
+                    parameters={"type": "object", "properties": {"id": {"type": "string"}}},
+                    handler=_failing_handler,
+                )
+            ]
+        )
+        app = _approval_app(tmp_path, registry=registry)
+        ctx = app.state.runtime_context
+        database = ctx.database
+        store: ApprovalStore = ctx.chat_approval_store
+        record = store.submit(
+            tool_name="toggle_source",
+            arguments={"id": "src-1"},
+            summary="toggle_source(id='src-1')",
+            turn_id="turn-fail",
+        )
+
+        with TestClient(app) as client:
+            approved = client.post(f"/api/chat/approvals/{record.approval_id}/approve")
+            assert approved.status_code == 200
+            settled = _wait_for_approval_status(client, record.approval_id, {"failed"})
+            assert settled["error"]
+            assert settled["executed_at"]
+            # failed is terminal: re-approve is idempotent, never re-runs.
+            again = client.post(f"/api/chat/approvals/{record.approval_id}/approve")
+            assert again.json()["already_executed"] is True
+            assert again.json()["ok"] is False
+
+        ledger_rows = database.query_profile_ledger(write_point="agent.approval.toggle_source")
+        assert len(ledger_rows) == 1
+        assert ledger_rows[0]["outcome"] == "failed"
 
     def test_approve_unknown_and_conflict_paths(self, tmp_path: Path) -> None:
         app = _approval_app(tmp_path)
@@ -584,7 +784,9 @@ class TestApprovalApi:
 
             approved = client.post(f"/api/chat/approvals/{approval_id}/approve")
             assert approved.status_code == 200
-            assert approved.json()["ok"] is True
+            assert approved.json()["queued"] is True
+            settled = _wait_for_approval_status(client, approval_id, {"executed", "failed"})
+            assert settled["status"] == "executed"
             recipe = database.get_all_recipes()[0]
             assert recipe["enabled"] in (False, 0)
 

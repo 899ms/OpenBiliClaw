@@ -402,6 +402,11 @@ class SocraticDialogue:
                     system = _layer_skill_system_prompt(
                         system, skill, skill_switch_guide=skill_switch_guide
                     )
+                system = (
+                    f"{system}\n\n{_AGENT_LOOP_GROUND_RULES}"
+                    if system
+                    else (_AGENT_LOOP_GROUND_RULES)
+                )
                 reply = ""
                 async for event in agent_loop.run(
                     system_instruction=system,
@@ -691,3 +696,20 @@ def _layer_skill_system_prompt(
     if guide:
         blocks.append(guide)
     return "\n\n".join(block for block in blocks if block.strip())
+
+
+# Hard ground rules for the multi-hop agent loop, appended to the system
+# prompt of every agent turn (all skills). Kept deliberately short: small
+# models follow fewer, sharper rules better than long instruction lists.
+_AGENT_LOOP_GROUND_RULES = (
+    "【工作纪律（最高优先级，必须严格遵守）】\n"
+    "1. 工具纪律：需要查询或修改任何数据时，必须实际发起工具调用（tool_call）。"
+    "严禁只在回复正文里声称「我来查一下」「已查到」「已改好」而没有真的调用工具，"
+    "严禁编造工具调用过程或结果。没有实际调用工具，就不得声称查过或改过。\n"
+    "2. 记忆归属：你能读到的记忆、画像和历史来自跨会话共享的记忆底座，"
+    "不是本对话独有的。除非当前上下文有明确依据，不要把记忆说成「你在本对话里写的/说的」；"
+    "不确定来源时就如实说明不确定，不要断言。\n"
+    "3. 会话边界：上下文只包含当前会话（本对话）的近期内容，不是全部历史。"
+    "「本对话」「这次聊天」「第一回合」都指当前会话；"
+    "不要把当前会话的第一条当成全部历史的最早一条。"
+)

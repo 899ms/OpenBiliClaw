@@ -13,14 +13,28 @@ Storage is a single JSON document (atomic tmp-file + rename) so no
 The store is thread-safe (one lock around every mutation) and every state
 transition is idempotent or conflict-checked:
 
-    pending ──approve──▶ approved ──mark_executed──▶ executed
-    pending ──reject───▶ rejected
+    pending ──approve──▶ approved ──mark_executing──▶ executing ──mark_executed──▶ executed
+                                                          │                         (ok)
+                                                          └──mark_executed──▶ failed
+    pending ──reject───▶ rejected                            (not ok)
     pending ──(ttl)────▶ expired          (lazy, on read/write)
 
-``approve`` on an already ``approved``/``executed`` record returns the
-record unchanged (idempotent); ``approved`` is the only state from which
-execution may start, and ``mark_executed`` only accepts ``approved``, so a
-repeated approve never re-executes the side effect.
+``approve`` on an already ``approved``/``executing``/``executed``/``failed``
+record returns the record unchanged (idempotent); ``approved`` is the only
+state from which execution may start, and ``mark_executed`` only accepts
+``executing``, so a repeated approve never re-executes the side effect.
+Execution runs in a background task (the approve endpoint returns as soon
+as the record reaches ``executing``); a crash that interrupts execution is
+recovered on load by demoting ``executing`` back to ``approved`` so the
+user can retry the approve.
+
+Two durability rules keep the single-file document consistent when a hot
+reload briefly overlaps two store instances:
+
+- reads (``get``/``list``) only persist when lazy expiry actually changed a
+  record, so a stale instance can never clobber newer states by reading;
+- production wiring reuses one store instance across runtime rebuilds
+  (``api/runtime_context.py``), keeping a single in-memory authority.
 """
 
 from __future__ import annotations
@@ -40,7 +54,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ApprovalStatus = Literal["pending", "approved", "rejected", "executed", "expired"]
+ApprovalStatus = Literal[
+    "pending", "approved", "executing", "rejected", "executed", "failed", "expired"
+]
+
+APPROVAL_STATUSES: frozenset[str] = frozenset(
+    {"pending", "approved", "executing", "rejected", "executed", "failed", "expired"}
+)
 
 DEFAULT_APPROVAL_TTL_HOURS = 24
 
@@ -90,7 +110,7 @@ class ApprovalRecord:
         if not isinstance(arguments, dict):
             payload["arguments"] = {}
         record = cls(**payload)
-        if record.status not in ("pending", "approved", "rejected", "executed", "expired"):
+        if record.status not in APPROVAL_STATUSES:
             record.status = "pending"
         return record
 
@@ -101,8 +121,8 @@ class ApprovalStore:
     ``path`` points at the backing JSON file; ``None`` keeps everything in
     memory (tests, headless components). ``now`` is injectable for expiry
     tests. All public methods are synchronous and lock-guarded; the API
-    layer executes approved actions *between* ``approve`` and
-    ``mark_executed``.
+    layer executes approved actions in a background task *between*
+    ``mark_executing`` and ``mark_executed``.
     """
 
     def __init__(
@@ -119,6 +139,11 @@ class ApprovalStore:
         self._records: dict[str, ApprovalRecord] = {}
         if self._path is not None:
             self._load()
+
+    @property
+    def path(self) -> Path | None:
+        """Backing JSON file (``None`` for in-memory stores)."""
+        return self._path
 
     def submit(
         self,
@@ -161,11 +186,14 @@ class ApprovalStore:
     def get(self, approval_id: str) -> ApprovalRecord | None:
         """Return one record by id (lazy expiry applied)."""
         with self._lock:
-            self._expire_stale_locked(self._now())
+            dirty = self._expire_stale_locked(self._now())
             record = self._records.get(approval_id.strip())
             if record is None:
+                if dirty:
+                    self._save_locked()
                 return None
-            self._save_locked()
+            if dirty:
+                self._save_locked()
             return record
 
     def list(
@@ -177,21 +205,22 @@ class ApprovalStore:
         """Return records newest-first, optionally filtered by status."""
         normalized = status.strip()
         with self._lock:
-            self._expire_stale_locked(self._now())
+            dirty = self._expire_stale_locked(self._now())
             records = [
                 record
                 for record in self._records.values()
                 if not normalized or record.status == normalized
             ]
-            self._save_locked()
+            if dirty:
+                self._save_locked()
         records.sort(key=lambda record: (record.created_at, record.approval_id), reverse=True)
         return records[: max(1, int(limit))]
 
     def approve(self, approval_id: str) -> ApprovalRecord:
-        """Move pending → approved. Idempotent for approved/executed."""
+        """Move pending → approved. Idempotent once past pending."""
         with self._lock:
             record = self._require_locked(approval_id)
-            if record.status in ("approved", "executed"):
+            if record.status in ("approved", "executing", "executed", "failed"):
                 return record
             if record.status != "pending":
                 raise ApprovalConflictError(record.approval_id, record.status, "approve")
@@ -218,6 +247,24 @@ class ApprovalStore:
             self._save_locked()
             return record
 
+    def mark_executing(self, approval_id: str) -> ApprovalRecord:
+        """Move approved → executing as the background execution is queued.
+
+        Idempotent for an already ``executing`` record so a duplicate
+        approve can observe the in-flight execution instead of queueing a
+        second one; every other state conflicts.
+        """
+        with self._lock:
+            record = self._require_locked(approval_id)
+            if record.status == "executing":
+                return record
+            if record.status != "approved":
+                raise ApprovalConflictError(record.approval_id, record.status, "mark_executing")
+            record.status = "executing"
+            record.updated_at = self._now().isoformat()
+            self._save_locked()
+            return record
+
     def mark_executed(
         self,
         approval_id: str,
@@ -226,16 +273,16 @@ class ApprovalStore:
         result: str = "",
         error: str = "",
     ) -> ApprovalRecord:
-        """Move approved → executed with the dispatch outcome.
+        """Move executing → executed (ok) or failed (not ok) with the outcome.
 
         Raises :class:`ApprovalConflictError` from any other state, so the
-        executor can never double-record an already-executed approval.
+        executor can never double-record an already-settled approval.
         """
         with self._lock:
             record = self._require_locked(approval_id)
-            if record.status != "approved":
+            if record.status != "executing":
                 raise ApprovalConflictError(record.approval_id, record.status, "mark_executed")
-            record.status = "executed"
+            record.status = "executed" if ok else "failed"
             record.result = str(result or "")
             record.error = "" if ok else str(error or "执行失败")
             record.executed_at = self._now().isoformat()
@@ -250,7 +297,9 @@ class ApprovalStore:
             raise KeyError(approval_id)
         return record
 
-    def _expire_stale_locked(self, now: datetime) -> None:
+    def _expire_stale_locked(self, now: datetime) -> bool:
+        """Expire stale pending records; return True when anything changed."""
+        dirty = False
         for record in self._records.values():
             if record.status != "pending" or not record.expires_at:
                 continue
@@ -263,6 +312,8 @@ class ApprovalStore:
             if now >= expires_at:
                 record.status = "expired"
                 record.updated_at = now.isoformat()
+                dirty = True
+        return dirty
 
     def _load(self) -> None:
         assert self._path is not None
@@ -281,11 +332,22 @@ class ApprovalStore:
         items = data.get("approvals") if isinstance(data, dict) else None
         if not isinstance(items, list):
             return
+        recovered = False
         for item in items:
             if not isinstance(item, dict) or not item.get("approval_id"):
                 continue
             record = ApprovalRecord.from_dict(item)
+            if record.status == "executing":
+                # Crash recovery: the background execution was interrupted
+                # mid-flight, so its side effect is not guaranteed to have
+                # completed. Demote back to approved; the user retries the
+                # approve to re-dispatch (retry semantics, never auto-rerun).
+                record.status = "approved"
+                record.updated_at = self._now().isoformat()
+                recovered = True
             self._records[record.approval_id] = record
+        if recovered:
+            self._save_locked()
 
     def _save_locked(self) -> None:
         if self._path is None:
