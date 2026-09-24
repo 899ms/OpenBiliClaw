@@ -98,3 +98,27 @@ def test_mobile_agent_styles_keep_long_lists_bounded() -> None:
     assert ".agent-drawer-list {" in css
     assert "overscroll-behavior: contain;" in css
     assert ".agent-task-row {" in css
+
+
+def test_mobile_chat_shows_loading_indicator_until_first_history_settles() -> None:
+    chat = CHAT_JS.read_text(encoding="utf-8")
+
+    # First paint goes through the shared view-state helper: loading until the
+    # first history fetch settles, empty copy only after total=0.
+    assert "getChatHistoryViewState" in chat
+    assert 'historyViewState === "loading"' in chat
+    assert 'historyViewState === "empty"' in chat
+    assert "chat-history-loading" in chat
+    assert "let historyLoaded = false;" in chat
+    # Entering the view paints immediately (spinner) before the fetch returns.
+    assert "render();\n  loadHistory();" in chat
+    # Switching sessions re-arms the loading state instead of flashing the
+    # empty copy while the new session's history is in flight.
+    assert "turns = [];\n  historyLoaded = false;" in chat
+
+
+def test_mobile_chat_history_loading_styles_exist() -> None:
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert ".chat-history-loading {" in css
+    assert ".chat-history-loading-text {" in css

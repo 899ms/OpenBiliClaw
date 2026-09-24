@@ -2,6 +2,10 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 修复：移动 Web 聊天历史首载加载指示（2026-09-25，fix/agent-loop-e2e-findings）
+
+- **移动端聊天历史首载不再误显示空态文案**：E2E 实测打开 `/m` 聊天页后约 14 秒一直显示空态文案「和 AI 聊聊你的兴趣和想法」且无任何加载指示（历史接口未返回前 `turns=[]` 走了空态分支），用户易误判为历史丢失。现 `web/js/view-models.js` 新增纯函数 `getChatHistoryViewState()` 统一首屏三态判定（`loading` / `empty` / `turns`）：首次历史拉取（`GET /api/chat/sessions/{id}`）settle 之前消息区显示 spinner +「正在加载聊天记录…」（`.chat-history-loading`，`role="status"`），接口返回空历史后才显示空态文案；`web/js/views/chat.js` 进入视图立即 `render()`、切换会话时重置 `historyLoaded`（避免切换瞬间闪空态）、离线或首次拉取失败也会退出加载态（2.5s 历史轮询恢复后自动对齐）。历史一次拉取 limit=100 与三路并行（历史/待聊/审批）的加载链路保持不变，首屏分页收敛留作后续优化。回归：`tests/js/mobile-chat-history-loading.test.mjs` 5 条（node:test 覆盖三态判定）+ `tests/test_mobile_web_agent_chat.py` 2 条静态接线断言。
+
 ## 聊一聊 Agent Loop M10：收尾集成与全量质量门（2026-09-23，feat/chat-agent-loop）
 
 - **桌面静态资源指纹补齐**：`_desktop_asset_version()` 指纹列表与 `?v=` 注入覆盖 M8 新增的 `web/desktop/assets/js/chat-agent-core.js`（此前只有 app.js / app.css / classic.css 与两个 shared 模块参与指纹，chat-agent-core.js 升级后可能被浏览器缓存旧版）；`test_desktop_web_index_cache_busts_static_assets` 补断言。

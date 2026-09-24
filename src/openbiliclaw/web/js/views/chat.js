@@ -57,6 +57,7 @@ import {
   getProbeMessageActions,
   getAvoidanceProbeMessageActions,
   getMobileChatSession,
+  getChatHistoryViewState,
   getCoverImageAttrs,
   getSourceLabel,
   buildContentUrl,
@@ -112,6 +113,7 @@ const {
 let $root = null;
 let loaded = false;
 let turns = [];
+let historyLoaded = false;
 let sending = false;
 let pendingTurnId = null;
 let pollTimer = null;
@@ -732,6 +734,7 @@ async function switchSession(sessionId) {
     globalThis.localStorage?.setItem(CHAT_SESSION_STORAGE_KEY, sessionId);
   } catch { /* storage unavailable */ }
   turns = [];
+  historyLoaded = false;
   lastHistorySignature = null;
   pendingTurnId = null;
   sending = false;
@@ -967,7 +970,14 @@ function render() {
 
   const dialogueTurns = selectDialogueTurns(turns);
   dialogueTurnsById.clear();
-  if (dialogueTurns.length === 0 && !sending) {
+  const historyViewState = getChatHistoryViewState({
+    historyLoaded,
+    turnCount: dialogueTurns.length,
+    sending,
+  });
+  if (historyViewState === "loading") {
+    messages.innerHTML = `<div class="chat-history-loading" role="status"><div class="spinner"></div><div class="chat-history-loading-text">正在加载聊天记录…</div></div>`;
+  } else if (historyViewState === "empty") {
     messages.innerHTML = `<div class="empty-state"><div class="empty-state-icon">\u{1F4AC}</div><div class="empty-state-text">\u548C AI \u804A\u804A\u4F60\u7684\u5174\u8DA3\u548C\u60F3\u6CD5</div></div>`;
   }
 
@@ -1709,7 +1719,15 @@ function updateBadgeCount() {
 
 // ── Load ─────────────────────────────────────────────────────
 async function loadHistory() {
-  if (!state.online || historyRefreshInFlight) return;
+  if (!state.online || historyRefreshInFlight) {
+    // Offline before the first snapshot: stop showing the loading indicator
+    // instead of spinning forever; the next online sync refetches anyway.
+    if (!state.online && !historyLoaded) {
+      historyLoaded = true;
+      render();
+    }
+    return;
+  }
   historyRefreshInFlight = true;
   const existingMessages = document.getElementById("chat-messages");
   const shouldStickToBottom =
@@ -1774,7 +1792,9 @@ async function loadHistory() {
     if ((dialogueContextSelection?.reply_to_turn_id || "") !== contextBefore) {
       changed = true;
     }
-    if (!changed) return;
+    const firstLoad = !historyLoaded;
+    historyLoaded = true;
+    if (!changed && !firstLoad) return;
     render();
     if (!shouldStickToBottom) {
       window.requestAnimationFrame(() => {
@@ -1790,6 +1810,12 @@ async function loadHistory() {
     // Keep the last durable snapshot while offline.
   } finally {
     historyRefreshInFlight = false;
+    // Even a failed first fetch must clear the loading indicator; the
+    // periodic sync repaints with real data once the backend responds.
+    if (!historyLoaded) {
+      historyLoaded = true;
+      render();
+    }
   }
 }
 
@@ -1854,6 +1880,9 @@ export function initChatView(root) {
     void refreshSessions().then(render);
     void refreshAgentTasks().then(render);
   }
+  // Paint immediately so the first entry shows the history loading indicator
+  // instead of an empty message list while the fetch is in flight.
+  render();
   loadHistory();
 }
 
