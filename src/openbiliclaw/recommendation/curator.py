@@ -407,7 +407,7 @@ class PoolCurator:
         candidates: list[DiscoveredContent],
         context: ScoringContext,
     ) -> dict[str, float]:
-        """Return a bvid → rec_score mapping for the given candidates.
+        """Return a scoring_key → rec_score mapping for the given candidates.
 
         The returned dict can be passed as ``score_override`` to the
         engine's diversified batch selector.

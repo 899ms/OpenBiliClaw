@@ -1249,6 +1249,7 @@ item = DiscoveredContent(
 
 - `bvid`
 - `item_key` — 由 `make_item_key(source_platform, content_id, content_url)` 派生的平台 canonical identity；相同裸 `content_id` 在不同平台不会冲突
+- `scoring_key` — 推荐评分字典使用的只读 identity；优先返回 `item_key`，仅为缺少该字段的旧行回退到 `bvid`，因此非 B 站候选不会再因空 `bvid` 共用同一分数
 - `title`
 - `up_name`
 - `up_mid`

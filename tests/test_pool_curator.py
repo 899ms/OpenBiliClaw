@@ -355,7 +355,7 @@ def test_feedback_dislike_franchise_no_penalty_when_franchise_key_empty() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_score_candidates_returns_all_bvids() -> None:
+def test_score_candidates_returns_all_scoring_keys() -> None:
     db, _ = _make_db()
     curator = PoolCurator(db)
     candidates = [
@@ -990,3 +990,27 @@ def test_score_candidates_cross_platform_no_collision() -> None:
     assert len(scores) == 3, f"expected 3 distinct scores, got {len(scores)}: {scores}"
     # The high-relevance item must outscore the low-relevance item.
     assert scores[yt_high.scoring_key] > scores[yt_low.scoring_key]
+
+
+async def test_score_candidates_async_cross_platform_no_collision() -> None:
+    """The async scorer uses the same platform-qualified identity contract."""
+    db, _ = _make_db()
+    curator = PoolCurator(db)
+    candidates = [
+        DiscoveredContent(
+            content_id=content_id,
+            source_platform=platform,
+            relevance_score=relevance,
+            source_strategy="search",
+        )
+        for content_id, platform, relevance in (
+            ("yt_abc", "youtube", 0.9),
+            ("yt_xyz", "youtube", 0.3),
+            ("tw_123", "twitter", 0.6),
+        )
+    ]
+
+    scores = await curator.score_candidates_async(candidates, ScoringContext())
+
+    assert set(scores) == {candidate.scoring_key for candidate in candidates}
+    assert scores[candidates[0].scoring_key] > scores[candidates[1].scoring_key]
