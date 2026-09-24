@@ -289,17 +289,25 @@
   }
 
   // ── Approvals ────────────────────────────────────────────────
+  // 状态机 pending → approved → executing → executed / failed（approve 端点
+  // 异步执行：响应只表示已入队，终态靠轮询 GET /api/chat/approvals 恢复）。
   const APPROVAL_STATUS_LABELS = {
     pending: "待批准",
     approved: "已批准",
-    executed: "已执行",
+    executing: "执行中…",
+    executed: "已批准并执行",
     rejected: "已拒绝",
     expired: "已过期",
     failed: "执行失败",
   };
+  const APPROVAL_TERMINAL_STATUSES = new Set(["executed", "failed", "rejected", "expired"]);
 
   function approvalStatusLabel(status) {
     return APPROVAL_STATUS_LABELS[String(status || "")] || String(status || "未知");
+  }
+
+  function isApprovalTerminalStatus(status) {
+    return APPROVAL_TERMINAL_STATUSES.has(String(status || ""));
   }
 
   /** Normalize a GET /api/chat/approvals record into the run approval shape. */
@@ -327,6 +335,55 @@
   function normalizeApprovalList(payload) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
     return items.map(normalizeApprovalRecord).filter(Boolean);
+  }
+
+  /**
+   * Classify a ``POST /api/chat/approvals/{id}/approve`` response.
+   *
+   * New protocol (async execution): the response carries ``queued`` and the
+   * record sits in ``executing`` until a background task settles it; the
+   * frontend polls ``GET /api/chat/approvals`` for the terminal state.
+   * ``already_executed`` responses are the idempotent terminal reply.
+   * Legacy backends executed synchronously and returned ``ok``/``result``
+   * without a ``queued`` field — treat those as settled right away.
+   */
+  function normalizeApproveResponse(payload) {
+    const record = payload && typeof payload === "object" ? payload : {};
+    const approval = normalizeApprovalRecord(record.approval);
+    if (!("queued" in record)) {
+      return {
+        kind: "settled",
+        ok: record.ok !== false,
+        resultText: String(record.result || approval?.resultText || ""),
+        approval,
+      };
+    }
+    if (record.already_executed === true) {
+      return {
+        kind: "settled",
+        ok: record.ok !== false,
+        resultText: String(record.result || approval?.resultText || ""),
+        approval,
+      };
+    }
+    return { kind: "queued", alreadyQueued: record.already_queued === true, approval };
+  }
+
+  /**
+   * Merge a ``GET /api/chat/approvals`` record into a run's approval entry
+   * (poll tracking + replay recovery of the intermediate ``executing`` state).
+   * A terminal replay (``approval_result`` event) is authoritative and never
+   * downgraded by a stale list snapshot.
+   */
+  function applyApprovalRecordToRun(run, record) {
+    const normalized = normalizeApprovalRecord(record);
+    if (!normalized || !run || !Array.isArray(run.approvals)) return null;
+    const approval = run.approvals.find((item) => item.approval_id === normalized.approval_id);
+    if (!approval) return null;
+    if (isApprovalTerminalStatus(approval.status)) return approval;
+    approval.status = normalized.status;
+    if (normalized.resultText) approval.resultText = normalized.resultText;
+    return approval;
   }
 
   // ── Tasks ────────────────────────────────────────────────────
@@ -637,8 +694,11 @@
     normalizeChatSkillList,
     skillDisplayTitle,
     approvalStatusLabel,
+    isApprovalTerminalStatus,
     normalizeApprovalRecord,
     normalizeApprovalList,
+    normalizeApproveResponse,
+    applyApprovalRecordToRun,
     agentTaskStatusLabel,
     isAgentTaskActive,
     normalizeAgentTask,

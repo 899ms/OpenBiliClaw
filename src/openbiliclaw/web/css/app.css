@@ -3146,7 +3146,9 @@ body.auth-locked #tab-bar {
 }
 
 .agent-approval-status { font-size: 11px; color: var(--text-secondary); font-weight: 400; }
-.agent-approval-status[data-tone="pending"] { color: var(--brand); }
+.agent-approval-status[data-tone="pending"],
+.agent-approval-status[data-tone="approved"],
+.agent-approval-status[data-tone="executing"] { color: var(--brand); }
 .agent-approval-status[data-tone="executed"] { color: #22a06b; }
 .agent-approval-status[data-tone="rejected"],
 .agent-approval-status[data-tone="failed"] { color: var(--danger); }

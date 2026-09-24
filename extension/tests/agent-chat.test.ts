@@ -18,7 +18,10 @@ const {
   normalizeChatSkillList,
   skillDisplayTitle,
   approvalStatusLabel,
+  isApprovalTerminalStatus,
   normalizeApprovalList,
+  normalizeApproveResponse,
+  applyApprovalRecordToRun,
   agentTaskStatusLabel,
   isAgentTaskActive,
   normalizeAgentTask,
@@ -257,6 +260,109 @@ test("approval list normalization maps records and failure states", () => {
   assert.equal(items[0].status, "pending");
   assert.equal(items[1].status, "failed");
   assert.equal(approvalStatusLabel("expired"), "已过期");
+});
+
+// ── 异步审批执行（approve 只入队，终态靠轮询恢复） ─────────────
+
+test("approval statuses label the executing intermediate state", () => {
+  assert.equal(approvalStatusLabel("executing"), "执行中…");
+  assert.equal(approvalStatusLabel("executed"), "已批准并执行");
+  assert.equal(approvalStatusLabel("failed"), "执行失败");
+  assert.equal(isApprovalTerminalStatus("executed"), true);
+  assert.equal(isApprovalTerminalStatus("failed"), true);
+  assert.equal(isApprovalTerminalStatus("executing"), false);
+  assert.equal(isApprovalTerminalStatus("pending"), false);
+});
+
+test("executing approval cards show the running state without action buttons", () => {
+  const markup = renderApprovalCardMarkup({
+    approval_id: "ap_1",
+    tool_name: "update_config",
+    arguments: {},
+    summary: "改配置",
+    impact: "热重载",
+    status: "executing",
+    resultText: "",
+  });
+  assert.match(markup, /data-status="executing"/);
+  assert.match(markup, /执行中…/);
+  assert.doesNotMatch(markup, /data-agent-approval-action="approve"/);
+});
+
+test("normalizeApproveResponse classifies async queued replies", () => {
+  const first = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "executing" },
+    executed: false,
+    queued: true,
+    already_queued: false,
+    ok: null,
+    result: "",
+  });
+  assert.equal(first.kind, "queued");
+  assert.equal(first.alreadyQueued, false);
+  assert.equal(first.approval.status, "executing");
+
+  const duplicate = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "executing" },
+    executed: false,
+    queued: true,
+    already_queued: true,
+    ok: null,
+    result: "",
+  });
+  assert.equal(duplicate.kind, "queued");
+  assert.equal(duplicate.alreadyQueued, true);
+});
+
+test("normalizeApproveResponse surfaces idempotent terminal and legacy sync replies", () => {
+  const terminal = normalizeApproveResponse({
+    approval: { approval_id: "ap_1", status: "failed", error: "热重载超时" },
+    executed: false,
+    already_executed: true,
+    queued: false,
+    ok: false,
+    result: "",
+  });
+  assert.equal(terminal.kind, "settled");
+  assert.equal(terminal.ok, false);
+  assert.equal(terminal.resultText, "热重载超时");
+
+  // 旧协议：同步执行，响应没有 queued 字段，直接带 ok/result。
+  const legacy = normalizeApproveResponse({ ok: true, result: "已写入" });
+  assert.equal(legacy.kind, "settled");
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.resultText, "已写入");
+});
+
+test("applyApprovalRecordToRun recovers executing and settles terminal states", () => {
+  const run = createAgentRun();
+  applyAgentEvent(run, "approval_request", {
+    step: 1,
+    approval_id: "ap_1",
+    tool_name: "update_config",
+    arguments: {},
+    summary: "改配置",
+    impact: "",
+  });
+  const approval = run.approvals[0];
+  assert.equal(approval.status, "pending");
+
+  // 刷新恢复：后端 executing 列表把回放里的 pending 卡标成执行中。
+  applyApprovalRecordToRun(run, { approval_id: "ap_1", status: "executing" });
+  assert.equal(approval.status, "executing");
+
+  // 轮询到终态：写入结果摘要。
+  applyApprovalRecordToRun(run, { approval_id: "ap_1", status: "executed", result: "已写入" });
+  assert.equal(approval.status, "executed");
+  assert.equal(approval.resultText, "已写入");
+
+  // 已终态的回放不被过期快照降级。
+  applyApprovalRecordToRun(run, { approval_id: "ap_1", status: "executing" });
+  assert.equal(approval.status, "executed");
+
+  // 未命中 id / 非记录输入安全返回 null。
+  assert.equal(applyApprovalRecordToRun(run, { approval_id: "ap_x", status: "executing" }), null);
+  assert.equal(applyApprovalRecordToRun(run, null), null);
 });
 
 test("task helpers label statuses and detect summary turns", () => {

@@ -296,11 +296,12 @@
         executed: approval.ok === false ? "已批准，但执行失败" : "已批准并执行",
         failed: "已批准，但执行失败",
         approved: "已批准，执行中…",
+        executing: "执行中…",
         rejected: "已拒绝",
         expired: "已过期",
       }[status] || status;
     const statusClass =
-      status === "rejected" ? "is-rejected" : status === "executed" && approval.ok !== false ? "is-ok" : status === "pending" ? "" : "is-failed";
+      status === "rejected" ? "is-rejected" : status === "executed" && approval.ok !== false ? "is-ok" : status === "pending" || status === "approved" || status === "executing" ? "" : "is-failed";
     const actions = decided
       ? `<p class="agent-approval-status ${statusClass}" role="status">${escapeHtml(statusLabel)}</p>${
           approval.resultText
@@ -499,24 +500,77 @@
     }${text(task.error) ? `<p class="agent-process-error">${escapeHtml(text(task.error))}</p>` : ""}${suggestionListMarkup(suggestions, { source: text(task.task_id), handled: options.handledSuggestions })}</div>`;
   }
 
+  const APPROVAL_TERMINAL_STATUSES = new Set(["executed", "failed", "rejected", "expired"]);
+
+  function isApprovalTerminalStatus(status) {
+    return APPROVAL_TERMINAL_STATUSES.has(text(status));
+  }
+
+  /** GET /api/chat/approvals 记录 → 审批卡模型。 */
+  function approvalCardModelFromRecord(item) {
+    if (!isRecord(item)) return null;
+    const status = text(item.status) || "pending";
+    return {
+      approvalId: text(item.approval_id),
+      summary: text(item.summary),
+      impact: text(item.impact),
+      status,
+      decision: "",
+      ok: status === "failed" ? false : status === "executed" ? true : null,
+      resultText: text(item.result || item.error),
+    };
+  }
+
+  /**
+   * POST /api/chat/approvals/{id}/approve 响应归类。
+   * 新协议（异步执行）：响应带 queued 字段，只表示已入队（executing），
+   * 终态靠轮询 GET /api/chat/approvals；already_executed 为幂等终态应答。
+   * 旧协议（同步执行）：响应直接带 ok/result、没有 queued 字段。
+   */
+  function normalizeApproveResponse(payload) {
+    const record = isRecord(payload) ? payload : {};
+    const approval = approvalCardModelFromRecord(record.approval);
+    if (!("queued" in record) || record.already_executed === true) {
+      return {
+        kind: "settled",
+        ok: record.ok !== false,
+        resultText: text(record.result || approval?.resultText),
+        approval,
+      };
+    }
+    return { kind: "queued", alreadyQueued: record.already_queued === true, approval };
+  }
+
+  /**
+   * 把一条 approvals 列表记录合并进过程模型（轮询跟踪 + 回放恢复 executing
+   * 中间态）。已终态的回放（approval_result 事件）不被过期的列表快照降级。
+   */
+  function applyApprovalRecordToProcess(model, item) {
+    const record = approvalCardModelFromRecord(item);
+    if (!record || !record.approvalId || !isRecord(model)) return null;
+    for (const step of model.steps || []) {
+      for (const call of step.toolCalls || []) {
+        if (call.approval && call.approval.approvalId === record.approvalId) {
+          if (!isApprovalTerminalStatus(call.approval.status)) {
+            call.approval.status = record.status;
+            if (record.resultText) call.approval.resultText = record.resultText;
+            if (record.ok !== null) call.approval.ok = record.ok;
+          }
+          return call.approval;
+        }
+      }
+    }
+    return null;
+  }
+
   function approvalsPanelMarkup(approvals) {
     const list = Array.isArray(approvals) ? approvals : [];
     if (!list.length) return '<p class="chat-approvals-empty">没有待批准的改动。</p>';
     return list
       .map((item) => {
-        if (!isRecord(item)) return "";
-        return approvalCardMarkup(
-          {
-            approvalId: text(item.approval_id),
-            summary: text(item.summary),
-            impact: text(item.impact),
-            status: text(item.status) || "pending",
-            decision: "",
-            ok: null,
-            resultText: text(item.result || item.error),
-          },
-          { argumentsText: prettyJson(item.arguments) },
-        );
+        const model = approvalCardModelFromRecord(item);
+        if (!model) return "";
+        return approvalCardMarkup(model, { argumentsText: prettyJson(item.arguments) });
       })
       .join("");
   }
@@ -550,7 +604,9 @@
     SPECIAL_TOOL_SUGGEST_SKILL,
     agentProcessMarkup,
     applyAgentEvent,
+    applyApprovalRecordToProcess,
     approvalCardMarkup,
+    approvalCardModelFromRecord,
     approvalsPanelMarkup,
     backgroundTaskCardMarkup,
     buildAgentProcess,
@@ -558,7 +614,9 @@
     createSseParser,
     escapeHtml,
     isAgentTaskSummaryTurn,
+    isApprovalTerminalStatus,
     isSoftWriteSuggestion,
+    normalizeApproveResponse,
     prettyJson,
     processStepCount,
     sessionListMarkup,
