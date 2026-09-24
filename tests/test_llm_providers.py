@@ -1792,7 +1792,10 @@ async def test_openai_provider_responses_flavor_maps_params_and_usage(
     )
 
     assert captured["instructions"] == "be terse"
-    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["input"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "user", "content": "Return valid json."},
+    ]
     assert captured["max_output_tokens"] == 512
     assert captured["text"] == {"format": {"type": "json_object"}}
     assert captured["store"] is False
