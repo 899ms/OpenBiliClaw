@@ -4,6 +4,8 @@
 
 ## v0.3.224：自定义回复语气与设置页一键测试（2026-09-19）
 
+- **Responses 初始化 JSON 请求修复（issue #265）**：启用 JSON mode 时，OpenAI / OpenAI-compatible Responses 适配器确保 `input` 消息包含 JSON 输出指令，修复 system 被拆到 `instructions` 后部分端点拒绝偏好分析的 HTTP 400。已有 JSON 输入不重复追加，普通文本调用与调用方消息不变。
+
 ### 跨平台推荐评分键去碰撞
 
 - **推荐评分与排序统一使用 `DiscoveredContent.scoring_key`**：`PoolCurator` 的同步/异步评分、时效 shadow audit、MMR embedding、视觉/关键帧/弹幕加分、平台归一化与最终排序全部改用平台限定的 `item_key`，旧数据仅在缺失 `item_key` 时回退到 `bvid`。修复 YouTube、X、小红书等非 B 站候选因空 `bvid` 共享 `scores[""]`、互相覆盖的问题，同时避免键迁移期间 B 站视觉与弹幕加分失效。回归测试覆盖跨平台分数不碰撞、B 站封面加分排序、MMR 相似度缓存及各加分映射。
