@@ -92,6 +92,38 @@
     };
   }
 
+  // ── SSE 读看门狗 ─────────────────────────────────────────────
+  // fetch 流被代理空闲回收 / NAT 断流 / 系统挂起静默杀掉时 reader.read()
+  // 既不 resolve 也不 reject，看门狗在 timeoutMs 无字节后 abort 请求，
+  // 让 Promise 按既有错误路径落定。服务端心跳注释行（``: ping``）也算字节，
+  // 会喂活看门狗。
+
+  const SSE_READ_WATCHDOG_MS = 60_000;
+
+  function createSseReadWatchdog({ timeoutMs = SSE_READ_WATCHDOG_MS } = {}) {
+    const controller = new AbortController();
+    let timer = null;
+    const reset = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      if (!(timeoutMs > 0) || controller.signal.aborted) return;
+      timer = setTimeout(() => {
+        timer = null;
+        if (!controller.signal.aborted) {
+          controller.abort(new Error("SSE 读取超时：连接可能已中断"));
+        }
+      }, timeoutMs);
+    };
+    return {
+      signal: controller.signal,
+      reset,
+      cancel() {
+        if (timer !== null) clearTimeout(timer);
+        timer = null;
+      },
+    };
+  }
+
   // ── agent 事件 → 过程视图模型 ────────────────────────────────
   // 模型形状：
   // {
@@ -612,6 +644,8 @@
     buildAgentProcess,
     createAgentProcess,
     createSseParser,
+    createSseReadWatchdog,
+    SSE_READ_WATCHDOG_MS,
     escapeHtml,
     isAgentTaskSummaryTurn,
     isApprovalTerminalStatus,

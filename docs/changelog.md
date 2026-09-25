@@ -2,6 +2,14 @@
 
 > 按里程碑记录各阶段交付内容。每次分支合回 main 时追加条目。
 
+## 修复：移动端聊一聊 SSE 僵尸流假死（2026-09-25，fix/mobile-stream-watchdog）
+
+- **服务端 SSE 心跳**：`/api/chat/agent/stream` 与旧 `/api/chat/stream` 的事件流统一经 `_sse_heartbeat_wrap` 包装——相邻事件静默超过 10 秒（`_SSE_HEARTBEAT_INTERVAL_SECONDS`，含首字节前的 LLM 首跳）即发一行 SSE 注释 `: ping`。此前事件间完全静默，代理缓冲 / NAT idle / 网络切换把连接掐死不报错时客户端永久挂起。心跳推进用 shielded task 包住内部迭代，超时不会取消在飞的 LLM 调用；三端 SSE 解析器本就跳过注释行。回归：`test_chat_agent_stream_api.py::test_agent_stream_emits_heartbeat_during_silent_gap`（慢 LLM 静默期断言收到 ping 且事件完好）。
+- **流式链路诊断端点**：新增 `GET /api/chat/agent/ping`，每秒发一个 `event: ping`（`{"seq": N}`）共 10 个，无状态、不调 LLM；用户可直接在手机浏览器打开验证代理链路是否保流式（序号停在 10 之前 = 中间环节断流/缓冲）。回归：`test_chat_agent_ping_endpoint_streams_numbered_events`。
+- **三端 SSE 读看门狗**：`web/shared/agent-chat.js` 与桌面 `chat-agent-core.js` 新增 `createSseReadWatchdog()`（默认 60s，收到任何字节含心跳注释即重置计时，超时 abort 请求）。此前三端的 `reader.read()` 无超时无 AbortController（其它请求都有 withTimeout，唯独 SSE 没有），僵尸流让 Promise 永不 settle——移动端 `sending=true` 永久锁死发送键。现移动 `web/js/api.js`（`streamAgentChatTurn` / `streamChatTurnLegacy`）、桌面 `app.js`（`streamAgentChatTurn` / `streamChatTurn`）、popup `popup-api.js`（两处）全部接入看门狗，断流后走既有 catch 路径显示「连接中断了，可以重试」并复位输入状态；turn 从 `streamingTurnIds` 清除后由 2.5s 历史轮询重新驱动（durable 兜底会重跑 agent loop 补答）。回归：`tests/js/sse-read-watchdog.test.mjs` 6 条（看门狗单元 + 停顿流 reject + 心跳喂活完成）、`tests/js/desktop-chat-agent-core.test.mjs` +3、`extension/tests/popup-api.test.ts` +2。
+- **移动端恢复钩子**：`web/js/views/chat.js` 新增 `visibilitychange` 回前台立即触发一次历史检查（iOS 锁屏/切后台 JS 挂起、系统杀连接后不再等下一个轮询 tick）；`startChatTurn` 补 30s 建 turn 超时（弱网不再挂在建 turn 阶段）。
+- **文档同步**：`docs/modules/api.md`（SSE 心跳 + ping 诊断端点）。
+
 ## 修复：聊一聊 agent loop 真实环境 E2E 发现（2026-09-25，fix/agent-loop-e2e-findings）
 
 - **approve 端点解耦异步执行（严重）**：`POST /api/chat/approvals/{id}/approve` 此前在请求内同步 dispatch，update_config 走热重载 lane 排空实测卡 148s～10min+，HTTP 挂死。现端点只做 `pending→approved→executing` 快速迁移并立即返回（`queued=true`，`ok=null`），真实执行由 `BackgroundTaskRegistry` 登记的后台任务（`chat_approval_execute`，已加入热重载 `cancel_all` 豁免名单，否则 update_config 的执行会被自己触发的 reload 取消）完成，终态迁移 + 审计台账 + `approval_result` 回放事件都在后台落定；执行中重复 approve 返回 `already_queued=true` 不重复入队，终态后重复 approve 返回 `already_executed=true` 不重执行。前端轮询 `GET /api/chat/approvals` 观察 `executing → executed / failed`。回归：`tests/test_agent_approvals.py` API 三用例（异步执行与审计、executing 中不双执行、失败落 failed 终态）。

@@ -124,6 +124,7 @@ let userScrolledUp = false;
 const CHAT_HISTORY_REFRESH_INTERVAL_MS = 2500;
 let historyRefreshTimer = null;
 let historyRefreshInFlight = false;
+let visibilityResumeBound = false;
 let lastHistorySignature = null;
 let pendingConfirmationRefreshTimer = null;
 let dialogueStatus = { message: "", tone: "info" };
@@ -1913,6 +1914,20 @@ function startChatHistorySync() {
   }, CHAT_HISTORY_REFRESH_INTERVAL_MS);
 }
 
+// iOS suspends JS while locked/backgrounded and the OS may kill the SSE
+// connection without ever settling reader.read(); on resume, immediately
+// re-check history so a turn stuck in ``streamingTurnIds`` is re-driven by
+// the durable polling path instead of waiting for the next interval tick.
+function bindVisibilityResume() {
+  if (visibilityResumeBound) return;
+  visibilityResumeBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (state.activeTab !== "chat" || !state.online) return;
+    void loadHistory();
+  });
+}
+
 async function refreshAfterChatTurn() {
   try {
     const [profileResult, activityResult] = await Promise.allSettled([
@@ -1959,6 +1974,7 @@ export async function loadNotifications({ includeDelights = false } = {}) {
 export function initChatView(root) {
   $root = root;
   startChatHistorySync();
+  bindVisibilityResume();
   if (!loaded) {
     loaded = true;
     loadNotifications();

@@ -13,6 +13,8 @@ const {
   buildAgentProcess,
   createAgentProcess,
   createSseParser,
+  createSseReadWatchdog,
+  SSE_READ_WATCHDOG_MS,
   isAgentTaskSummaryTurn,
   isApprovalTerminalStatus,
   isSoftWriteSuggestion,
@@ -64,6 +66,32 @@ test("SSE parser flushes a trailing event without blank line on end()", () => {
   parser.feed('event: error\ndata: {"error":"boom"}');
   parser.end();
   assert.deepEqual(seen, [["error", { error: "boom" }]]);
+});
+
+// ── SSE 读看门狗 ──────────────────────────────────────────────
+
+test("SSE read watchdog aborts after a silent window", async () => {
+  const watchdog = createSseReadWatchdog({ timeoutMs: 20 });
+  const aborted = new Promise((resolve) => watchdog.signal.addEventListener("abort", resolve));
+  watchdog.reset();
+  await aborted;
+  assert.equal(watchdog.signal.aborted, true);
+});
+
+test("SSE read watchdog reset postpones and cancel disarms", async () => {
+  const watchdog = createSseReadWatchdog({ timeoutMs: 40 });
+  watchdog.reset();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  watchdog.reset(); // 心跳/字节到达 → 重新计时
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(watchdog.signal.aborted, false);
+  watchdog.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(watchdog.signal.aborted, false);
+});
+
+test("SSE read watchdog default window is 60s", () => {
+  assert.equal(SSE_READ_WATCHDOG_MS, 60_000);
 });
 
 // ── 过程模型 ──────────────────────────────────────────────────

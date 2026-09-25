@@ -8,6 +8,7 @@ SSE event per ``AgentEvent``; durable turns persist the loop's events into
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -472,3 +473,66 @@ def test_durable_fallback_reruns_agent_loop_for_orphaned_streaming_turn(
         ]
         assert len(dialogue.agent_calls) == 1
         assert dialogue.legacy_calls == []
+
+
+def _parse_sse_tolerant(body: str) -> list[tuple[str, dict[str, Any]]]:
+    """Parse SSE frames while skipping heartbeat comment blocks (``: ping``)."""
+    frames = [
+        block for block in body.split("\n\n") if block.strip() and not block.strip().startswith(":")
+    ]
+    return _parse_sse("\n\n".join(frames))
+
+
+class SlowAgentDialogue(FakeAgentDialogue):
+    """Dialogue double with a silent gap between two agent events."""
+
+    def __init__(self, gap_seconds: float) -> None:
+        super().__init__([])
+        self._gap_seconds = gap_seconds
+
+    async def stream_agent_reply(self, *args: Any, **kwargs: Any) -> Any:
+        self.agent_calls.append({"args": args, "kwargs": kwargs})
+        yield AgentEvent(type="thinking", step=1, text="先想想")
+        await asyncio.sleep(self._gap_seconds)
+        yield AgentEvent(type="final", step=2, text="想好了")
+
+
+def test_agent_stream_emits_heartbeat_during_silent_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silence longer than the heartbeat interval yields ``: ping`` comments.
+
+    The real events must still arrive intact around the heartbeat lines.
+    """
+    monkeypatch.setattr(app_module, "_SSE_HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    app = _app(tmp_path, SlowAgentDialogue(gap_seconds=0.3))
+
+    with TestClient(app) as client:
+        response = client.post("/api/chat/agent/stream", json={"message": "你好"})
+
+    assert response.status_code == 200
+    assert ": ping" in response.text
+    events = _parse_sse_tolerant(response.text)
+    assert [event for event, _data in events] == ["thinking", "final", "done"]
+    assert events[2][1]["reply"] == "想好了"
+
+
+def test_chat_agent_ping_endpoint_streams_numbered_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``GET /api/chat/agent/ping`` is a stateless SSE liveness probe."""
+    monkeypatch.setattr(app_module, "_SSE_PING_INTERVAL_SECONDS", 0.01)
+    app = _app(tmp_path, FakeAgentDialogue([]))
+
+    with TestClient(app) as client:
+        response = client.get("/api/chat/agent/ping")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse(response.text)
+    assert [event for event, _data in events] == ["ping"] * app_module._SSE_PING_EVENT_COUNT
+    assert [data["seq"] for _event, data in events] == list(
+        range(1, app_module._SSE_PING_EVENT_COUNT + 1)
+    )

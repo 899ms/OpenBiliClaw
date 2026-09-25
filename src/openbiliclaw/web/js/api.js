@@ -357,6 +357,10 @@ export async function fetchActivityFeed({ limit, before } = {}) {
 }
 
 // ── Chat ────────────────────────────────────────────────────
+// Weak-network budget for creating the durable turn row before streaming
+// starts; without it a stalled POST left the composer locked forever.
+const CHAT_TURN_CREATE_TIMEOUT_MS = 30_000;
+
 export async function startChatTurn({
   turnId = "",
   session = "popup",
@@ -381,7 +385,7 @@ export async function startChatTurn({
   if (replyToTurnId) payload.reply_to_turn_id = replyToTurnId;
   if (sessionId) payload.session_id = sessionId;
   if (skill) payload.skill = skill;
-  return requestJson("/chat/turns", json(payload));
+  return requestJson("/chat/turns", { ...json(payload), timeoutMs: CHAT_TURN_CREATE_TIMEOUT_MS });
 }
 
 export async function fetchChatTurn(turnId, { signal, timeoutMs = 10_000 } = {}) {
@@ -434,24 +438,32 @@ function agentChatShared() {
   return shared;
 }
 
-async function readSseStream(response, onEvent) {
+async function readSseStream(response, onEvent, watchdog) {
   const parser = agentChatShared().createAgentSseParser(onEvent);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parser.push(decoder.decode(value, { stream: true }));
+  try {
+    while (true) {
+      // Rearm on every read: any incoming byte (incl. server ``: ping``
+      // heartbeat comments) proves the connection is still alive.
+      watchdog?.reset();
+      const { done, value } = await reader.read();
+      if (done) break;
+      parser.push(decoder.decode(value, { stream: true }));
+    }
+  } finally {
+    watchdog?.cancel();
   }
   parser.end();
 }
 
-async function postSse(path, body) {
+async function postSse(path, body, { signal } = {}) {
   const response = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", [CSRF_HEADER]: "1" },
     body: JSON.stringify(body),
+    signal,
   });
   if (!response.ok) {
     let details = null;
@@ -479,6 +491,7 @@ export async function streamAgentChatTurn({
   session = "popup",
   message,
   onEvent,
+  watchdogMs,
 } = {}) {
   const body = { message };
   if (turnId) body.turn_id = turnId;
@@ -486,7 +499,10 @@ export async function streamAgentChatTurn({
   if (skill) body.skill = skill;
   if (session) body.session = session;
   let donePayload = null;
-  const response = await postSse("/chat/agent/stream", body);
+  const watchdog = agentChatShared().createSseReadWatchdog(
+    watchdogMs > 0 ? { timeoutMs: watchdogMs } : undefined,
+  );
+  const response = await postSse("/chat/agent/stream", body, { signal: watchdog.signal });
   await readSseStream(response, (name, data) => {
     if (name === "done") donePayload = data;
     if (name === "error") {
@@ -496,7 +512,7 @@ export async function streamAgentChatTurn({
       throw err;
     }
     onEvent?.(name, data);
-  });
+  }, watchdog);
   return donePayload;
 }
 
@@ -511,6 +527,7 @@ export async function streamChatTurnLegacy({
   message,
   onContent,
   onDone,
+  watchdogMs,
 } = {}) {
   const body = {
     turn_id: turnId,
@@ -522,12 +539,15 @@ export async function streamChatTurnLegacy({
     message,
   };
   let donePayload = null;
-  const response = await postSse("/chat/stream", body);
+  const watchdog = agentChatShared().createSseReadWatchdog(
+    watchdogMs > 0 ? { timeoutMs: watchdogMs } : undefined,
+  );
+  const response = await postSse("/chat/stream", body, { signal: watchdog.signal });
   await readSseStream(response, (name, data) => {
     if (name === "content") onContent?.(String(data?.delta || ""));
     else if (name === "tool_call") onContent?.(`\n\n🔧 调用工具：${String(data?.name || "工具")}\n`);
     else if (name === "done") donePayload = data;
-  });
+  }, watchdog);
   if (donePayload) onDone?.(donePayload);
   return donePayload;
 }

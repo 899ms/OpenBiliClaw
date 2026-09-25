@@ -104,6 +104,41 @@
     };
   }
 
+  // ── SSE read watchdog ────────────────────────────────────────
+  const SSE_READ_WATCHDOG_MS = 60_000;
+
+  /**
+   * Read watchdog for SSE fetch streams. Pass ``signal`` to fetch() and call
+   * ``reset()`` around every ``reader.read()``; when no byte arrives within
+   * ``timeoutMs`` the request is aborted, so a silently dropped connection
+   * (proxy idle timeout, NAT drop, iOS backgrounding) rejects instead of
+   * hanging forever. Server heartbeat comment lines (``: ping``) count as
+   * bytes and keep the watchdog fed. ``cancel()`` disarms it for good.
+   */
+  function createSseReadWatchdog({ timeoutMs = SSE_READ_WATCHDOG_MS } = {}) {
+    const controller = new AbortController();
+    let timer = null;
+    const reset = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      if (!(timeoutMs > 0) || controller.signal.aborted) return;
+      timer = setTimeout(() => {
+        timer = null;
+        if (!controller.signal.aborted) {
+          controller.abort(new Error("SSE 读取超时：连接可能已中断"));
+        }
+      }, timeoutMs);
+    };
+    return {
+      signal: controller.signal,
+      reset,
+      cancel() {
+        if (timer !== null) clearTimeout(timer);
+        timer = null;
+      },
+    };
+  }
+
   // ── Run model (过程流状态) ────────────────────────────────────
   function createAgentRun() {
     return {
@@ -685,6 +720,8 @@
   global.OpenBiliClawAgentChat = {
     escapeHtml,
     createAgentSseParser,
+    createSseReadWatchdog,
+    SSE_READ_WATCHDOG_MS,
     createAgentRun,
     applyAgentEvent,
     agentRunFromEvents,
