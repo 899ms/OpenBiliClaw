@@ -1100,6 +1100,38 @@ def test_validate_runtime_config_requires_orcarouter_api_key() -> None:
         validate_runtime_config(config)
 
 
+def test_build_config_supports_requesty_provider() -> None:
+    config = _build_config(
+        {
+            "llm": {
+                "default_provider": "requesty",
+                "requesty": {
+                    "api_key": "rqsty-test",
+                    "model": "openai/gpt-4o-mini",
+                    "base_url": "https://router.eu.requesty.ai/v1",
+                },
+            }
+        }
+    )
+
+    assert config.llm.default_provider == "requesty"
+    assert config.llm.requesty.api_key == "rqsty-test"
+    assert config.llm.requesty.model == "openai/gpt-4o-mini"
+    assert config.llm.requesty.base_url == "https://router.eu.requesty.ai/v1"
+
+
+def test_validate_runtime_config_requires_requesty_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="requesty",
+            requesty=LLMProviderConfig(api_key="", model="openai/gpt-4o-mini"),
+        )
+    )
+
+    with pytest.raises(ConfigError, match="llm.requesty.api_key"):
+        validate_runtime_config(config)
+
+
 def test_build_config_supports_openai_compatible_provider() -> None:
     """v0.3.32+ — generic OpenAI-protocol-compatible provider with its
     own [llm.openai_compatible] block. Distinct from [llm.openai]."""

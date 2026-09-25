@@ -148,6 +148,7 @@
           <option value="gemini">Gemini（Google）</option>
           <option value="openrouter">OpenRouter</option>
           <option value="orcarouter">OrcaRouter</option>
+          <option value="requesty">Requesty</option>
           <option value="openai_compatible">OpenAI 兼容接口（自建 / 第三方）</option>
         </select>
 
@@ -298,6 +299,7 @@
       gemini: ["https://aistudio.google.com/app/apikey", "Google AI Studio"],
       openrouter: ["https://openrouter.ai/keys", "OpenRouter"],
       orcarouter: ["https://www.orcarouter.ai/keys", "OrcaRouter"],
+      requesty: ["https://app.requesty.ai/api-keys", "Requesty"],
       openai_compatible: ["", ""],
     };
     const DEFAULT_MODELS = {
@@ -307,6 +309,7 @@
       gemini: "gemini-2.5-flash",
       openrouter: "openai/gpt-5-nano",
       orcarouter: "openai/gpt-4o",
+      requesty: "openai/gpt-4o-mini",
       openai_compatible: "",
     };
     const MODEL_DISCOVERY_PROVIDERS = new Set([
@@ -314,6 +317,7 @@
       "deepseek",
       "openrouter",
       "orcarouter",
+      "requesty",
       "ollama",
       "openai_compatible",
     ]);

@@ -98,3 +98,22 @@ def test_orcarouter_provider_exposed_across_web_surfaces() -> None:
     assert 'orcarouter: ["https://www.orcarouter.ai/keys", "OrcaRouter"]' in setup_html
     assert 'orcarouter: "openai/gpt-4o"' in setup_html
     assert '"orcarouter"' in setup_html
+
+
+def test_requesty_provider_exposed_across_web_surfaces() -> None:
+    """Requesty must be selectable in the desktop settings and the first-run
+    setup wizard, with matching key-link and default-model wiring."""
+    desktop_html = (ROOT / "src/openbiliclaw/web/desktop/index.html").read_text(encoding="utf-8")
+    desktop_js = (ROOT / "src/openbiliclaw/web/desktop/assets/js/app.js").read_text(
+        encoding="utf-8"
+    )
+    setup_html = (ROOT / "src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
+
+    assert '<option value="requesty">Requesty</option>' in desktop_html
+    assert '<option value="requesty">Requesty</option>' in setup_html
+    assert 'requesty: "Requesty"' in desktop_js
+    assert (
+        'requesty: { model: "openai/gpt-4o-mini", base_url: "https://router.requesty.ai/v1" }'
+    ) in desktop_js
+    assert 'requesty: ["https://app.requesty.ai/api-keys", "Requesty"]' in setup_html
+    assert 'requesty: "openai/gpt-4o-mini"' in setup_html

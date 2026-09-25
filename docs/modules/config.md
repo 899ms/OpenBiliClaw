@@ -273,7 +273,7 @@ base_url = "https://api.deepseek.com"
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `name` | string | 实例 ID | 设置页显示名称，可重复 |
-| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `orcarouter` / `openai_compatible` |
+| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `orcarouter` / `requesty` / `openai_compatible` |
 | `enabled` | bool | `true` | 是否允许注册和引用；停用实例不能留在任何链里 |
 | `api_key` | string | `""` | 此实例自己的凭据；API 默认只回显掩码 |
 | `model` | string | `""` | 此实例固定使用的聊天模型 |
@@ -372,6 +372,19 @@ base_url = "https://api.deepseek.com"
 | `reasoning_effort` | string | `"medium"` | 保留以对齐统一配置面；网关把推理参数原样转发给上游路由，非推理模型会以 HTTP 400 拒绝，因此适配器**不发送** `reasoning_effort` / `reasoning`，推理模型使用自身默认档位 |
 
 > OrcaRouter 没有 embedding 接口；需要向量化时在 `[llm.embedding]` 独立配置 Ollama / Gemini / OpenAI 等。
+
+#### Requesty（`provider_type = "requesty"`）
+
+[Requesty](https://www.requesty.ai) 是 OpenAI 协议兼容的 LLM 网关，一个 Key 即可路由 OpenAI / Anthropic / Google / DeepSeek 等多家模型。它继承 OpenAI 系 adapter 的超时 / 重试 / 错误归一化 / JSON mode / per-call model 语义。API Key 在 https://app.requesty.ai/api-keys 创建，文档见 https://docs.requesty.ai 。
+
+| 键 | 类型 | 默认值 | 说明 |
+|----|------|--------|------|
+| `api_key` | string | `""` | Requesty API Key |
+| `model` | string | `"openai/gpt-4o-mini"` | 模型名（`<vendor>/<model>`，或 `GET /v1/models/managed` 返回的托管策略 ID） |
+| `base_url` | string | `"https://router.requesty.ai/v1"` | Requesty API 地址；数据需留在欧盟时可改为 `https://router.eu.requesty.ai/v1` |
+| `reasoning_effort` | string | `"medium"` | 保留以对齐统一配置面；适配器**不发送** `reasoning_effort` / `reasoning`，推理模型使用自身默认档位 |
+
+> 设置页「获取模型」会先列出 `GET /v1/models/managed` 的托管策略，再合并 `GET /v1/models` 的完整模型目录。Requesty 没有接入 embedding；需要向量化时在 `[llm.embedding]` 独立配置 Ollama / Gemini / OpenAI 等。
 
 #### OpenAI-compatible（`provider_type = "openai_compatible"`）
 

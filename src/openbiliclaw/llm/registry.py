@@ -18,6 +18,7 @@ from .ollama_provider import OllamaProvider
 from .openai_provider import DeepSeekProvider, OpenAIProvider
 from .openrouter_provider import OpenRouterProvider
 from .orcarouter_provider import OrcaRouterProvider
+from .requesty_provider import RequestyProvider
 
 if TYPE_CHECKING:
     from openbiliclaw.config import Config
@@ -66,6 +67,7 @@ def build_llm_registry(
         ("openrouter", _maybe_openrouter_provider(config, overrides)),
         ("orcarouter", _maybe_orcarouter_provider(config, overrides)),
         ("openai_compatible", _maybe_openai_compatible_provider(config, overrides)),
+        ("requesty", _maybe_requesty_provider(config, overrides)),
     ]
 
     for _name, provider in provider_specs:
@@ -221,6 +223,7 @@ def _build_instance_provider(
         "ollama": _maybe_ollama_provider,
         "openrouter": _maybe_openrouter_provider,
         "orcarouter": _maybe_orcarouter_provider,
+        "requesty": _maybe_requesty_provider,
         "openai_compatible": _maybe_openai_compatible_provider,
     }
     factory = factories.get(provider_type)
@@ -963,6 +966,25 @@ def _maybe_orcarouter_provider(
         proxy=_outbound_proxy(base_url),
         trust_env=_outbound_trust_env(base_url),
         reasoning_effort=config.llm.orcarouter.reasoning_effort,
+    )
+
+
+def _maybe_requesty_provider(
+    config: Config, overrides: dict[str, LLMProvider]
+) -> LLMProvider | None:
+    if "requesty" in overrides:
+        return overrides["requesty"]
+    if not config.llm.requesty.api_key.strip():
+        return None
+    base_url = config.llm.requesty.base_url or "https://router.requesty.ai/v1"
+    return RequestyProvider(
+        api_key=config.llm.requesty.api_key,
+        model=config.llm.requesty.model or "openai/gpt-4o-mini",
+        base_url=base_url,
+        timeout=float(config.llm.timeout),
+        proxy=_outbound_proxy(base_url),
+        trust_env=_outbound_trust_env(base_url),
+        reasoning_effort=config.llm.requesty.reasoning_effort,
     )
 
 

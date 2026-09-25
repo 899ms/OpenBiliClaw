@@ -91,6 +91,7 @@ SUPPORTED_PROVIDERS = (
     "openrouter",
     "orcarouter",
     "openai_compatible",
+    "requesty",
 )
 REMOTE_PROVIDERS = (
     "openai",
@@ -100,6 +101,7 @@ REMOTE_PROVIDERS = (
     "openrouter",
     "orcarouter",
     "openai_compatible",
+    "requesty",
 )
 
 # Providers whose backend has no embeddings endpoint. When a user picks
@@ -108,7 +110,7 @@ REMOTE_PROVIDERS = (
 # pulls the embedding model (otherwise embeddings silently fall back at
 # runtime to whatever the registry can find — see registry.py
 # build_embedding_service).
-PROVIDERS_WITHOUT_EMBED = ("claude", "deepseek", "openrouter", "orcarouter")
+PROVIDERS_WITHOUT_EMBED = ("claude", "deepseek", "openrouter", "orcarouter", "requesty")
 
 
 def ensure_local_no_proxy() -> str:
@@ -192,6 +194,7 @@ HUMAN_LLM_MENU: tuple[tuple[str, str, str], ...] = (
     ("claude", "Claude 官方", "claude-sonnet-4-6"),
     ("openrouter", "OpenRouter 聚合", "openai/gpt-5-nano"),
     ("orcarouter", "OrcaRouter 聚合", "openai/gpt-4o"),
+    ("requesty", "Requesty 聚合", "openai/gpt-4o-mini"),
 )
 
 HUMAN_OPENAI_COMPAT_PRESETS: tuple[str, ...] = (
@@ -214,6 +217,7 @@ PROVIDER_MODEL_DEFAULTS: dict[str, str] = {
     "claude": "claude-sonnet-4-6",
     "openrouter": "openai/gpt-5-nano",
     "orcarouter": "openai/gpt-4o",
+    "requesty": "openai/gpt-4o-mini",
     "ollama": "qwen2.5:7b",
 }
 
@@ -222,6 +226,7 @@ PROVIDER_BASE_URL_DEFAULTS: dict[str, str] = {
     "ollama": "http://127.0.0.1:11434/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "orcarouter": "https://api.orcarouter.ai/v1",
+    "requesty": "https://router.requesty.ai/v1",
 }
 
 
@@ -2093,6 +2098,7 @@ def _ensure_llm_instance(project_dir: Path, provider: str) -> str:
         "openrouter": "OpenRouter",
         "orcarouter": "OrcaRouter",
         "openai_compatible": "OpenAI-compatible",
+        "requesty": "Requesty",
     }
     update_config_secret(
         config_path,
@@ -3196,7 +3202,16 @@ config_path = Path("/app/runtime/config.toml")
 cookie_path = Path("/app/runtime/data/bilibili_cookie.json")
 data = tomllib.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
 llm = data.get("llm", {})
-remote = {"openai", "claude", "gemini", "deepseek", "openrouter", "orcarouter", "openai_compatible"}
+remote = {
+    "openai",
+    "claude",
+    "gemini",
+    "deepseek",
+    "openrouter",
+    "orcarouter",
+    "openai_compatible",
+    "requesty",
+}
 instances = llm.get("instances", {}) if isinstance(llm.get("instances"), dict) else {}
 chain = llm.get("default_chain", []) if isinstance(llm.get("default_chain"), list) else []
 try:

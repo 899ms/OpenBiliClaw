@@ -14,7 +14,7 @@
 
 - [Docker](https://docs.docker.com/get-docker/) 20.10+
 - [Docker Compose](https://docs.docker.com/compose/install/) V2（`docker compose` 命令）
-- 一个 LLM API Key（OpenAI / Claude / Gemini / DeepSeek / OpenRouter / OrcaRouter）—— **Embedding 用 compose 自带的 Ollama 不再需要单独申请**
+- 一个 LLM API Key（OpenAI / Claude / Gemini / DeepSeek / OpenRouter / OrcaRouter / Requesty）—— **Embedding 用 compose 自带的 Ollama 不再需要单独申请**
 
 ### 自带 Ollama embedding sidecar（bge-m3 已烤进镜像,离线开箱即用）
 
@@ -287,6 +287,7 @@ base_url = "https://relay.example.com/v1"
 | `claude` | ✅ | Anthropic 账户 | 高质量推理；无 embedding 接口，需独立配置 `[llm.embedding]` |
 | `openrouter` | ✅ | 想一个 Key 跑多家模型 | 按调用计费；embedding 不可靠，建议独立配置 Ollama / Gemini / OpenAI embedding |
 | `orcarouter` | ✅ | 一个 Key 跑 150+ 模型 + 网关级零信任安全 | 按调用计费；无 embedding 接口，需独立配置 `[llm.embedding]` |
+| `requesty` | ✅ | 想一个 Key 跑多家模型 | 按调用计费；无 embedding 接口，需独立配置 `[llm.embedding]` |
 | `ollama` | ❌ | 完全离线 / 不要 Key / 16GB+ 内存 | CPU 推理首次响应慢（10-60s）。Docker 里的 Ollama chat 实例必须把 `base_url` 设成 `http://host.docker.internal:11434/v1` 才能访问宿主机 |
 | OpenAI 协议兼容自建网关（高级） | ✅ 通常需要 | 自己有 vLLM / LMStudio / Azure / OneAPI / 团队 LLM 网关 | 使用 `provider_type="openai_compatible"`，必须显式配置 `base_url`。**普通用户不要选这个** |
 

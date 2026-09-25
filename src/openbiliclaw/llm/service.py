@@ -659,7 +659,13 @@ class LLMService:
             if callable(provider_type)
             else provider_name.lower()
         )
-        if provider_key not in {"openai", "openai_compatible", "openrouter", "orcarouter"}:
+        if provider_key not in {
+            "openai",
+            "openai_compatible",
+            "openrouter",
+            "orcarouter",
+            "requesty",
+        }:
             return False
 
         provider_obj: object | None = None

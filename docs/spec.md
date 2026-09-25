@@ -663,6 +663,7 @@ local Desktop Web / extension Settings → write-only /api/config → private bo
 │  │ OpenAI / Claude / Gemini │  │ EmbeddingService       │   │
 │  │ DeepSeek / Ollama /      │  │ L1 内存 + L2 SQLite    │   │
 │  │ OpenRouter / OrcaRouter  │  │ Ollama bge-m3 兜底可选  │   │
+│  │ Requesty                 │  │                        │   │
 │  └──────────────────────────┘  └────────────────────────┘   │
 │  可选视觉 / 弹幕预热：质心、关键帧、完整 document embedding；endpoint provenance + stable slot retry │
 │  Desktop bundle: official Ollama.app runtime (ollama + runner dylibs/assets) │
