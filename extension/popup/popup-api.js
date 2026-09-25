@@ -815,8 +815,12 @@ export async function streamChatTurn({
   onToolCall,
   onContent,
   onDone,
+  watchdogMs,
 } = {}) {
   const backendUrl = await getBackendBaseUrl();
+  const watchdog = agentChatShared().createSseReadWatchdog(
+    watchdogMs > 0 ? { timeoutMs: watchdogMs } : undefined,
+  );
   const response = await globalThis.fetch(`${backendUrl}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -829,8 +833,10 @@ export async function streamChatTurn({
       reply_to_turn_id: replyToTurnId,
       message,
     }),
+    signal: watchdog.signal,
   });
   if (!response.ok) {
+    watchdog.cancel();
     throw new Error(`chat stream failed: ${response.status}`);
   }
   const reader = response.body.getReader();
@@ -857,21 +863,27 @@ export async function streamChatTurn({
     currentEvent = "";
     currentData = "";
   };
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (line.startsWith("event:")) {
-        currentEvent = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        currentData = line.slice(5).trim();
-        dispatch();
+  try {
+    while (true) {
+      // 每轮读前重置看门狗：服务端心跳注释行也算字节，会喂活它。
+      watchdog.reset();
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (line.startsWith("event:")) {
+          currentEvent = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          currentData = line.slice(5).trim();
+          dispatch();
+        }
       }
     }
+  } finally {
+    watchdog.cancel();
   }
 }
 
@@ -941,7 +953,7 @@ function agentChatShared() {
   return shared;
 }
 
-async function postAuthenticatedSse(path, body) {
+async function postAuthenticatedSse(path, body, { signal } = {}) {
   const fetchImpl = globalThis.fetch.bind(globalThis);
   const backendUrl = await getBackendBaseUrl();
   const sessionToken = await ensurePopupSession({ fetchImpl });
@@ -951,6 +963,7 @@ async function postAuthenticatedSse(path, body) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     },
     fetchImpl,
     { sessionToken },
@@ -966,14 +979,21 @@ async function postAuthenticatedSse(path, body) {
   return response;
 }
 
-async function readAgentSseStream(response, onEvent) {
+async function readAgentSseStream(response, onEvent, watchdog) {
   const parser = agentChatShared().createAgentSseParser(onEvent);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parser.push(decoder.decode(value, { stream: true }));
+  try {
+    while (true) {
+      // Rearm on every read: any incoming byte (incl. server ``: ping``
+      // heartbeat comments) proves the connection is still alive.
+      watchdog?.reset();
+      const { done, value } = await reader.read();
+      if (done) break;
+      parser.push(decoder.decode(value, { stream: true }));
+    }
+  } finally {
+    watchdog?.cancel();
   }
   parser.end();
 }
@@ -983,7 +1003,8 @@ async function readAgentSseStream(response, onEvent) {
  * ``onEvent(eventName, data)`` receives every AgentEvent; resolves with the
  * terminal ``done`` payload or null. Throws with ``status === 503`` when the
  * loop is disabled so callers can fall back to the legacy stream; an SSE
- * ``error`` frame rejects with ``agentStreamError = true``.
+ * ``error`` frame rejects with ``agentStreamError = true``. A read watchdog
+ * aborts the request when no byte arrives within the watchdog window.
  */
 export async function streamAgentChatTurn({
   turnId = "",
@@ -992,6 +1013,7 @@ export async function streamAgentChatTurn({
   session = "popup",
   message,
   onEvent,
+  watchdogMs,
 } = {}) {
   const body = { message };
   if (turnId) body.turn_id = turnId;
@@ -999,7 +1021,10 @@ export async function streamAgentChatTurn({
   if (skill) body.skill = skill;
   if (session) body.session = session;
   let donePayload = null;
-  const response = await postAuthenticatedSse("/chat/agent/stream", body);
+  const watchdog = agentChatShared().createSseReadWatchdog(
+    watchdogMs > 0 ? { timeoutMs: watchdogMs } : undefined,
+  );
+  const response = await postAuthenticatedSse("/chat/agent/stream", body, { signal: watchdog.signal });
   await readAgentSseStream(response, (name, data) => {
     if (name === "done") donePayload = data;
     if (name === "error") {
@@ -1009,7 +1034,7 @@ export async function streamAgentChatTurn({
       throw error;
     }
     onEvent?.(name, data);
-  });
+  }, watchdog);
   return donePayload;
 }
 

@@ -463,6 +463,51 @@ _DIALOGUE_EXECUTION_DRAIN_TIMEOUT_SECONDS = 1500.0
 # requests hanging for minutes with zero feedback. 30s is generous for a
 # normal reload yet short enough for the client to surface the error event.
 _AGENT_STREAM_LEASE_TIMEOUT_SECONDS = 30.0
+# SSE heartbeat: idle gaps longer than this emit a ``: ping`` comment line so
+# proxies/NATs do not silently drop the connection and client read watchdogs
+# stay fed. All three frontend SSE parsers skip ``:`` comment lines.
+_SSE_HEARTBEAT_INTERVAL_SECONDS = 10.0
+# Diagnostics probe for ``GET /api/chat/agent/ping``: numbered ping events,
+# one per interval, no LLM involved.
+_SSE_PING_EVENT_COUNT = 10
+_SSE_PING_INTERVAL_SECONDS = 1.0
+
+
+async def _sse_heartbeat_wrap(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Yield ``: ping`` comment lines whenever ``stream`` goes silent.
+
+    A silently-dropped connection (proxy buffering, NAT idle timeout, mobile
+    network switch) otherwise hangs forever without an error; the heartbeat
+    keeps middleboxes from recycling the connection and feeds the client-side
+    read watchdog. The wrapped iterator is advanced in a shielded task so a
+    heartbeat timeout never cancels the in-flight LLM work.
+    """
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(anext(stream))
+            try:
+                item = await asyncio.wait_for(
+                    asyncio.shield(pending),
+                    timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            pending = None
+            yield item
+    except StopAsyncIteration:
+        return
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await pending
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            with suppress(asyncio.CancelledError, Exception):
+                await aclose()
 
 
 @dataclass(slots=True)
@@ -11380,7 +11425,7 @@ def create_app(
             yield sse("done", {"reply": reply})
 
         return StreamingResponse(
-            _event_stream(),
+            _sse_heartbeat_wrap(_event_stream()),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -11528,7 +11573,33 @@ def create_app(
             )
 
         return StreamingResponse(
-            _event_stream(),
+            _sse_heartbeat_wrap(_event_stream()),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/api/chat/agent/ping")
+    async def chat_agent_ping() -> StreamingResponse:
+        """SSE liveness probe for the chat stream pipeline (no LLM involved).
+
+        Emits ``_SSE_PING_EVENT_COUNT`` numbered ``ping`` events, one per
+        ``_SSE_PING_INTERVAL_SECONDS``. Open the URL directly in a browser to
+        verify the whole proxy chain keeps streaming: if the sequence stalls
+        before the last ``seq``, a middlebox is buffering or dropping the
+        connection.
+        """
+
+        async def _ping_stream() -> AsyncIterator[str]:
+            for seq in range(1, _SSE_PING_EVENT_COUNT + 1):
+                yield f'event: ping\ndata: {{"seq": {seq}}}\n\n'
+                if seq < _SSE_PING_EVENT_COUNT:
+                    await asyncio.sleep(_SSE_PING_INTERVAL_SECONDS)
+
+        return StreamingResponse(
+            _ping_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

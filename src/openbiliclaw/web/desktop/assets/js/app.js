@@ -6582,6 +6582,9 @@ ${cardFeedbackBarHtml()}`;
       onError,
     }) {
       const base = getApiBase() || DEFAULT_API_BASE;
+      const watchdog = chatAgentCore?.createSseReadWatchdog
+        ? chatAgentCore.createSseReadWatchdog()
+        : null;
       const response = await fetch(`${base}${ENDPOINTS.chatStream}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -6594,8 +6597,12 @@ ${cardFeedbackBarHtml()}`;
           reply_to_turn_id: replyToTurnId,
           message,
         }),
+        signal: watchdog?.signal,
       });
-      if (!response.ok) throw new Error(`chat stream failed: ${response.status}`);
+      if (!response.ok) {
+        watchdog?.cancel();
+        throw new Error(`chat stream failed: ${response.status}`);
+      }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -6620,21 +6627,27 @@ ${cardFeedbackBarHtml()}`;
         currentEvent = "";
         currentData = "";
       };
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || "";
-        for (const raw of lines) {
-          const line = raw.trim();
-          if (line.startsWith("event:")) {
-            currentEvent = line.slice(6).trim();
-          } else if (line.startsWith("data:")) {
-            currentData = line.slice(5).trim();
-            dispatch();
+      try {
+        while (true) {
+          // 每轮读前重置看门狗：服务端心跳注释行也算字节，会喂活它。
+          watchdog?.reset();
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (line.startsWith("event:")) {
+              currentEvent = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              currentData = line.slice(5).trim();
+              dispatch();
+            }
           }
         }
+      } finally {
+        watchdog?.cancel();
       }
     }
 
@@ -8045,12 +8058,17 @@ ${cardFeedbackBarHtml()}`;
       };
       if (sessionId && sessionId !== "default") body.session_id = sessionId;
       if (skill) body.skill = skill;
+      const watchdog = chatAgentCore?.createSseReadWatchdog
+        ? chatAgentCore.createSseReadWatchdog()
+        : null;
       const response = await fetch(`${base}${ENDPOINTS.chatAgentStream}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: watchdog?.signal,
       });
       if (!response.ok) {
+        watchdog?.cancel();
         const error = new Error(`agent stream failed: ${response.status}`);
         error.status = response.status;
         throw error;
@@ -8060,10 +8078,15 @@ ${cardFeedbackBarHtml()}`;
       const parser = chatAgentCore.createSseParser((name, data) => {
         handleAgentStreamEvent(name, data, live);
       });
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parser.feed(decoder.decode(value, { stream: true }));
+      try {
+        while (true) {
+          watchdog?.reset();
+          const { done, value } = await reader.read();
+          if (done) break;
+          parser.feed(decoder.decode(value, { stream: true }));
+        }
+      } finally {
+        watchdog?.cancel();
       }
       parser.end();
     }
