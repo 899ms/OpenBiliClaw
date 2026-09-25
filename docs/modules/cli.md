@@ -889,13 +889,14 @@ OpenBiliClaw 需要一个语言模型来理解你的兴趣、写推荐文案。
  5   Claude 官方                           默认 claude-sonnet-4-6。Anthropic console,按 token 付费,质量高
  6   OpenRouter 聚合                       默认 openai/gpt-5-nano。一个 Key 跑多家模型,按调用计费
  7   OrcaRouter 聚合                       默认 openai/gpt-4o。一个 Key 跑 150+ 模型,网关级零信任安全
+ 8   Requesty 聚合                         默认 openai/gpt-4o-mini。一个 Key 跑多家模型,按调用计费
 
 Tip:不确定就选 1 (DeepSeek),¥0.001/千 token 几乎免费,月度通常 ¥0.5-2。已经买了中转站 / OneAPI Key 选 2 (协议兼容)。本地 Ollama 仅用于向量检索(embedding),不作为聊天服务商;如需本地聊天模型请到设置页手动配置。
 
 请输入序号或名称（默认 1=DeepSeek） [1]:
 
 # (随后只问被选中那一项实际需要的字段——
-#  例如选 1/3/4/5/6/7: 只问 API Key + 模型名；
+#  例如选 1/3/4/5/6/7/8: 只问 API Key + 模型名；
 #  选 2: 进协议兼容 preset 子菜单，按需问 Base URL + API Key + 模型名)
 #
 # 注意（v0.3.176+）：本地 Ollama 已不再出现在聊天 provider 菜单里——随装的

@@ -46,6 +46,7 @@ CACHE_HIT_DISCOUNT: dict[str, float] = {
     "gemini": 0.25,
     "openrouter": 0.50,
     "orcarouter": 0.50,
+    "requesty": 0.50,
     "ollama": 0.0,  # local; cached or not, cost is 0
 }
 
@@ -133,6 +134,11 @@ PRICING: dict[str, dict[str, tuple[float, float]]] = {
         # Gateway pricing follows the upstream route. Use the default
         # ``openai/gpt-4o`` route as a conservative reference estimate.
         "default": (0.018, 0.072),
+    },
+    "requesty": {
+        # Gateway pricing follows the upstream route. Without knowing the
+        # route, use the same midrange estimate as OpenRouter.
+        "default": (0.005, 0.015),
     },
     "ollama": {
         "default": (0.0, 0.0),

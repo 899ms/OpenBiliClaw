@@ -27,6 +27,7 @@ from openbiliclaw.llm.ollama_provider import OllamaProvider
 from openbiliclaw.llm.openai_provider import DeepSeekProvider, OpenAIProvider
 from openbiliclaw.llm.openrouter_provider import OpenRouterProvider
 from openbiliclaw.llm.orcarouter_provider import OrcaRouterProvider
+from openbiliclaw.llm.requesty_provider import RequestyProvider
 
 
 def _openai_response(content: str = "ok") -> SimpleNamespace:
@@ -1404,6 +1405,124 @@ async def test_orcarouter_provider_inherits_per_call_model_override(
     assert response.content == "orcarouter-ok"
     assert captured["model"] == "anthropic/claude-opus-4.8"
     assert provider._model == "openai/gpt-4o"
+
+
+def test_requesty_provider_defaults() -> None:
+    provider = RequestyProvider(api_key="test-key")
+
+    assert provider.name == "requesty"
+    assert provider.base_url == "https://router.requesty.ai/v1"
+    assert provider._model
+    assert provider.supports_embedding is False
+    assert provider._extra_headers() == {}
+    assert provider._extra_body(reasoning_effort="medium") == {}
+    assert provider._openai_reasoning_effort("openai/gpt-4o-mini", "high") is None
+
+
+def test_requesty_provider_accepts_regional_base_url() -> None:
+    provider = RequestyProvider(
+        api_key="test-key",
+        model="openai/gpt-4o-mini",
+        base_url="https://router.eu.requesty.ai/v1",
+    )
+
+    assert provider.base_url == "https://router.eu.requesty.ai/v1"
+
+
+@pytest.mark.asyncio
+async def test_requesty_provider_omits_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RequestyProvider(api_key="test-key", model="openai/gpt-4o-mini")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("requesty-ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+    response = await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+    )
+
+    assert response.content == "requesty-ok"
+    assert "reasoning_effort" not in captured
+    assert "extra_body" not in captured
+
+
+@pytest.mark.asyncio
+async def test_requesty_provider_inherits_per_call_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RequestyProvider(api_key="test-key", model="openai/gpt-4o-mini")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("requesty-ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+    await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        model="anthropic/claude-sonnet-4-5",
+    )
+
+    assert captured["model"] == "anthropic/claude-sonnet-4-5"
+    assert provider._model == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_requesty_list_models_puts_managed_policies_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RequestyProvider(api_key="test-key")
+
+    async def fake_managed() -> object:
+        return {
+            "data": [
+                {"id": "smart-task", "api": "chat"},
+                {"id": "embed-policy", "api": "embedding"},
+                {"id": "openai/gpt-4o-mini"},
+                {"id": ""},
+            ]
+        }
+
+    async def fake_catalog() -> SimpleNamespace:
+        return SimpleNamespace(
+            data=[SimpleNamespace(id="openai/gpt-4o-mini"), SimpleNamespace(id="google/x")]
+        )
+
+    monkeypatch.setattr(provider, "_create_managed_model_list", fake_managed)
+    monkeypatch.setattr(provider, "_create_model_list", fake_catalog)
+
+    models = await provider.list_models()
+
+    assert models[:2] == ["openai/gpt-4o-mini", "smart-task"]
+    assert "embed-policy" not in models
+    assert "google/x" in models
+    assert len(models) == len(set(models))
+
+
+@pytest.mark.asyncio
+async def test_requesty_list_models_falls_back_when_managed_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RequestyProvider(api_key="test-key")
+    monkeypatch.setattr(provider, "_BASE_RETRY_DELAY", 0)
+
+    async def failing_managed() -> object:
+        raise RuntimeError("managed listing unavailable")
+
+    async def fake_catalog() -> SimpleNamespace:
+        return SimpleNamespace(data=[SimpleNamespace(id="openai/gpt-4o-mini")])
+
+    monkeypatch.setattr(provider, "_create_managed_model_list", failing_managed)
+    monkeypatch.setattr(provider, "_create_model_list", fake_catalog)
+
+    assert await provider.list_models() == ["openai/gpt-4o-mini"]
 
 
 @pytest.mark.skipif(not gemini_sdk_available(), reason="google-genai is not installed")

@@ -9819,6 +9819,7 @@ function bindSettings() {
     deepseek: "DeepSeek",
     openrouter: "OpenRouter",
     orcarouter: "OrcaRouter",
+    requesty: "Requesty",
     ollama: "Ollama",
     openai_compatible: "OpenAI-compatible",
   };
@@ -9829,6 +9830,7 @@ function bindSettings() {
     deepseek: { model: "deepseek-v4-flash", base_url: "https://api.deepseek.com" },
     openrouter: { model: "openai/gpt-5-nano", base_url: "https://openrouter.ai/api/v1" },
     orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
+    requesty: { model: "openai/gpt-4o-mini", base_url: "https://router.requesty.ai/v1" },
     ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
     openai_compatible: { model: "", base_url: "" },
   };
@@ -9837,6 +9839,7 @@ function bindSettings() {
     "deepseek",
     "openrouter",
     "orcarouter",
+    "requesty",
     "ollama",
     "openai_compatible",
   ]);
@@ -10626,6 +10629,9 @@ function bindSettings() {
     setVal("cfgOrcarouterKey", cfg.llm?.orcarouter?.api_key);
     setVal("cfgOrcarouterModel", cfg.llm?.orcarouter?.model);
     setVal("cfgOrcarouterBaseUrl", cfg.llm?.orcarouter?.base_url);
+    setVal("cfgRequestyKey", cfg.llm?.requesty?.api_key);
+    setVal("cfgRequestyModel", cfg.llm?.requesty?.model);
+    setVal("cfgRequestyBaseUrl", cfg.llm?.requesty?.base_url);
     setVal("cfgOpenaiCompatibleKey", cfg.llm?.openai_compatible?.api_key);
     setVal("cfgOpenaiCompatibleModel", cfg.llm?.openai_compatible?.model);
     setVal("cfgOpenaiCompatibleBaseUrl", cfg.llm?.openai_compatible?.base_url);

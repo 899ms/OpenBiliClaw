@@ -71,6 +71,7 @@ _SUPPORTED_CHAT_PROVIDERS = {
     "openrouter",
     "orcarouter",
     "openai_compatible",
+    "requesty",
 }
 _LLM_INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _TAILNET_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -84,6 +85,7 @@ _LLM_PROVIDER_DISPLAY_NAMES = {
     "openrouter": "OpenRouter",
     "orcarouter": "OrcaRouter",
     "openai_compatible": "OpenAI-compatible",
+    "requesty": "Requesty",
 }
 _MIN_POOL_TARGET_COUNT = 1
 _MAX_POOL_TARGET_COUNT = 600
@@ -233,6 +235,7 @@ _REMOTE_PROVIDER_FIELDS = {
     "deepseek": "llm.deepseek.api_key",
     "openrouter": "llm.openrouter.api_key",
     "orcarouter": "llm.orcarouter.api_key",
+    "requesty": "llm.requesty.api_key",
     # v0.3.32+ — generic OpenAI-protocol-compatible provider (Groq /
     # Together / Azure OpenAI / vLLM / self-hosted, etc.). Distinct from
     # ``openai`` so users can run both in parallel (chat = openai for
@@ -514,6 +517,8 @@ class LLMConfig:
     openai_compatible: LLMProviderConfig = field(default_factory=LLMProviderConfig)
     # OrcaRouter model-routing gateway (OpenAI-compatible, ``sk-orca-`` key).
     orcarouter: LLMProviderConfig = field(default_factory=LLMProviderConfig)
+    # Requesty LLM gateway (OpenAI-compatible).
+    requesty: LLMProviderConfig = field(default_factory=LLMProviderConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     # Per-module overrides (empty = use global default)
     soul: ModuleLLMConfig = field(default_factory=ModuleLLMConfig)
@@ -2273,6 +2278,7 @@ def _build_config(
         openrouter=_provider_config("openrouter"),
         openai_compatible=_provider_config("openai_compatible"),
         orcarouter=_provider_config("orcarouter"),
+        requesty=_provider_config("requesty"),
         embedding=EmbeddingConfig(
             **_filter_dataclass_kwargs(
                 EmbeddingConfig,
@@ -4764,6 +4770,7 @@ def _collect_config_issues(config: Config) -> list[ConfigIssue]:
         "openrouter": config.llm.openrouter,
         "openai_compatible": config.llm.openai_compatible,
         "orcarouter": config.llm.orcarouter,
+        "requesty": config.llm.requesty,
     }
 
     provider_config = provider_configs.get(provider_name)
@@ -5788,6 +5795,7 @@ def _render_config_toml(
         lines.extend(_render_provider_section("openrouter", config.llm.openrouter))
         lines.extend(_render_provider_section("orcarouter", config.llm.orcarouter))
         lines.extend(_render_provider_section("openai_compatible", config.llm.openai_compatible))
+        lines.extend(_render_provider_section("requesty", config.llm.requesty))
     lines.extend(
         [
             "[llm.embedding]",
@@ -6307,6 +6315,7 @@ def _render_provider_section(name: str, provider: LLMProviderConfig) -> list[str
         "openrouter",
         "orcarouter",
         "openai_compatible",
+        "requesty",
     }:
         lines.append(f"base_url = {_toml_string(provider.base_url)}")
     if name == "openai":

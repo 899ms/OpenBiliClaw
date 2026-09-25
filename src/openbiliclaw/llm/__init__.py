@@ -25,6 +25,7 @@ from .registry import (
     build_llm_registry,
     summarize_registry,
 )
+from .requesty_provider import RequestyProvider
 from .service import (
     LLMProviderExecutionError,
     LLMResponseContentError,
@@ -50,6 +51,7 @@ __all__ = [
     "OpenAIProvider",
     "OpenRouterProvider",
     "OrcaRouterProvider",
+    "RequestyProvider",
     "RegistryBuildError",
     "RegistrySummary",
     "LLMProviderExecutionError",

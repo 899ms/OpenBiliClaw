@@ -280,7 +280,7 @@ questions, then re-run bootstrap with those flags.
 
 v0.3.95+ embedding safety net (`should_auto_wire_embedding`): when
 `[llm.embedding].provider` would otherwise stay empty — e.g. the chat
-provider is Claude / DeepSeek / OpenRouter / OrcaRouter (which can't embed) and you
+provider is Claude / DeepSeek / OpenRouter / OrcaRouter / Requesty (which can't embed) and you
 never passed `--embedding-provider` — bootstrap auto-writes
 `provider=ollama, model=bge-m3` and pulls the model, so semantic dedup
 isn't silently disabled (the symptom is recommendations repeating
@@ -298,7 +298,7 @@ Tell the user, in plain Chinese (or the conversation's language):
 
 > 「OpenBiliClaw 需要一个语言模型来理解你的兴趣、写推荐文案。你可以选:」
 
-Present **seven top-level options**. Keep Base URL / model-name details
+Present **eight top-level options**. Keep Base URL / model-name details
 inside option 2's submenu; do not ask those advanced fields unless the
 user chooses an OpenAI-compatible gateway / preset path.
 
@@ -313,6 +313,7 @@ user chooses an OpenAI-compatible gateway / preset path.
 | 5. **Claude 官方** | `claude-sonnet-4-6`(1M ctx;可选 claude-haiku-4-5 便宜 / claude-opus-4-7 旗舰) | Anthropic console | ✅ 需要 | $3-$75/M,按 token,质量高 |
 | 6. **OpenRouter** | `openai/gpt-5-nano`(格式 `<vendor>/<model>`) | 一个 Key 跑多家 | ✅ 需要 | 按调用计费 |
 | 7. **OrcaRouter** | `openai/gpt-4o`(格式 `<vendor>/<model>`) | 一个 Key 跑 150+ 模型 / 网关级零信任安全 | ✅ 需要 | 按调用计费 |
+| 8. **Requesty** | `openai/gpt-4o-mini`(格式 `<vendor>/<model>`) | 一个 Key 跑多家模型 | ✅ 需要 | 按调用计费 |
 
 > **本地 Ollama 不在聊天 provider 菜单里**（v0.3.176+）：随装的 Ollama 只带
 > embedding 模型 `bge-m3`，小体积本地聊天模型达不到内容管线质量线。需要本地
@@ -321,7 +322,7 @@ user chooses an OpenAI-compatible gateway / preset path.
 
 > ⚠️ **不要把选项 3 (OpenAI 官方) 和选项 2 (协议兼容) 混淆**:走 OpenAI API 官方端点选 3;走任何"OpenAI 协议兼容"的第三方 / 自建服务选 2。
 
-**AI agent 决策建议**: **默认引导 #1 DeepSeek**(几毛钱搞定);用户明确说"我有中转站 Key / OneAPI / 通义 / 智谱 / Kimi / MiniMax / Yi / Azure / vLLM 等任何 OpenAI 兼容服务"→ 引导 #2(进子菜单后再细分);用户明确说"用 OpenAI / Gemini / Claude 官方"才走 #3-5;用户提到"OrcaRouter / 一个 Key 跑多家模型 + 安全网关"→ 引导 #7;Ollama 仅在用户明确要求"本地 / 离线"时用显式 `--provider ollama` 走离线路径。
+**AI agent 决策建议**: **默认引导 #1 DeepSeek**(几毛钱搞定);用户明确说"我有中转站 Key / OneAPI / 通义 / 智谱 / Kimi / MiniMax / Yi / Azure / vLLM 等任何 OpenAI 兼容服务"→ 引导 #2(进子菜单后再细分);用户明确说"用 OpenAI / Gemini / Claude 官方"才走 #3-5;用户提到"OrcaRouter / 一个 Key 跑多家模型 + 安全网关"→ 引导 #7;用户提到"Requesty"→ 引导 #8;Ollama 仅在用户明确要求"本地 / 离线"时用显式 `--provider ollama` 走离线路径。
 
 **选项 2 的核心场景:你买了第三方中转站 / OneAPI 的 Key**,想用人民币付钱跑 OpenAI / Claude / 国产模型 —— 这是国内绝大多数用户用这个选项的真正原因。子菜单 10 个 preset 中,**第 1 个就是中转站(默认)**:
 
@@ -436,7 +437,7 @@ flags from Step 3. DeepSeek has no embeddings endpoint, so recommend
 local Ollama bge-m3 unless the user explicitly wants Gemini / OpenAI
 embedding. `--embedding-provider ""` now means "do not enable embedding".
 
-#### Options 3-7 (OpenAI 官方 / Gemini / Claude / OpenRouter / OrcaRouter):
+#### Options 3-8 (OpenAI 官方 / Gemini / Claude / OpenRouter / OrcaRouter / Requesty):
 
 Substitute the right vendor name and Key URL:
 
@@ -445,6 +446,7 @@ Substitute the right vendor name and Key URL:
 - Claude: https://console.anthropic.com/ → Settings → API Keys
 - OpenRouter: https://openrouter.ai/keys
 - OrcaRouter: https://www.orcarouter.ai/keys
+- Requesty: https://app.requesty.ai/api-keys
 
 Run with `--provider <name> --llm-api-key <KEY>` plus the Step 3
 embedding flags. Don't ask for Base URL. Embedding is independent from

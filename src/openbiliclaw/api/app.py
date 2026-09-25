@@ -1093,6 +1093,7 @@ _RESETTABLE_CONFIG_FIELDS = {
     "llm.deepseek.api_key": ("llm", "deepseek", "api_key"),
     "llm.openrouter.api_key": ("llm", "openrouter", "api_key"),
     "llm.orcarouter.api_key": ("llm", "orcarouter", "api_key"),
+    "llm.requesty.api_key": ("llm", "requesty", "api_key"),
     "llm.openai_compatible.api_key": ("llm", "openai_compatible", "api_key"),
     "llm.embedding.api_key": ("llm", "embedding", "api_key"),
 }
@@ -19535,6 +19536,7 @@ def create_app(
                 openrouter=_provider_out(_legacy_provider_projection("openrouter")),
                 openai_compatible=_provider_out(_legacy_provider_projection("openai_compatible")),
                 orcarouter=_provider_out(_legacy_provider_projection("orcarouter")),
+                requesty=_provider_out(_legacy_provider_projection("requesty")),
                 embedding=EmbeddingConfigOut(
                     provider=cfg.llm.embedding.provider,
                     model=cfg.llm.embedding.model,
@@ -20484,6 +20486,7 @@ def create_app(
                 "openrouter",
                 "orcarouter",
                 "openai_compatible",
+                "requesty",
             }:
                 return "", None
             instance_id = normalized_type.replace("_", "-")
@@ -20561,6 +20564,7 @@ def create_app(
             "openrouter",
             "orcarouter",
             "openai_compatible",
+            "requesty",
         ):
             if provider_name in llm_data and isinstance(llm_data[provider_name], dict):
                 if bool(getattr(cfg.llm, "instance_routing", False)) and not native_payload:
@@ -20773,6 +20777,7 @@ def create_app(
             "orcarouter",
             "ollama",
             "openai_compatible",
+            "requesty",
         }:
             return ConfigModelDiscoveryResponse(
                 ok=False,

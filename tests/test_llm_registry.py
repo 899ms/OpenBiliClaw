@@ -175,6 +175,38 @@ def test_build_llm_registry_omits_orcarouter_without_api_key() -> None:
     assert "orcarouter" not in registry.available_providers
 
 
+def test_build_llm_registry_registers_requesty() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="requesty",
+            requesty=LLMProviderConfig(
+                api_key="rqsty-test",
+                model="openai/gpt-4o-mini",
+            ),
+        )
+    )
+
+    registry = build_llm_registry(config)
+
+    assert registry.default_provider == "requesty"
+    assert "requesty" in registry.available_providers
+    provider = registry.get("requesty")
+    assert provider.name == "requesty"
+    assert provider.base_url == "https://router.requesty.ai/v1"
+
+
+def test_build_llm_registry_omits_requesty_without_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="deepseek",
+            deepseek=LLMProviderConfig(api_key="sk-deepseek", model="deepseek-v4-flash"),
+        )
+    )
+    registry = build_llm_registry(config)
+
+    assert "requesty" not in registry.available_providers
+
+
 def test_build_llm_registry_registers_openai_compatible() -> None:
     """v0.3.32+ — openai_compatible is a first-class registered provider,
     distinct from openai. Both can coexist in the same registry."""

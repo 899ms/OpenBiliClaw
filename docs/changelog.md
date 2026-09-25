@@ -112,6 +112,7 @@
 ## v0.3.224：自定义回复语气与设置页一键测试（2026-09-19）
 
 - **Responses 初始化 JSON 请求修复（issue #265）**：启用 JSON mode 时，OpenAI / OpenAI-compatible Responses 适配器确保 `input` 消息包含 JSON 输出指令，修复 system 被拆到 `instructions` 后部分端点拒绝偏好分析的 HTTP 400。已有 JSON 输入不重复追加，普通文本调用与调用方消息不变。
+- **新增 Requesty 聚合 provider**：`provider_type="requesty"` 以 OpenAI 兼容协议接入 Requesty（`https://router.requesty.ai/v1`，欧盟区可改 `https://router.eu.requesty.ai/v1`），一个 Key 跑多家模型，默认 `openai/gpt-4o-mini`；复用统一超时 / 重试 / 错误归一化 / JSON mode 与 per-call model 覆盖，不发送推理参数；「获取模型」先列出 `GET /models/managed` 托管策略，再合并 `GET /models` 目录。后端 registry / 配置、API `/api/config`、CLI 向导与 `agent_bootstrap`（菜单第 8 项）、桌面 Web 设置页、首次运行 `/setup/` 向导、扩展 popup 与安装脚本提示均已接入；不进入任何自动排序或默认链，只有显式配置时才会调用。
 
 ### 跨平台推荐评分键去碰撞
 
