@@ -877,6 +877,18 @@ class DiscoveredContent:
                 self.content_url,
             )
 
+    @property
+    def scoring_key(self) -> str:
+        """Stable, unique identity for scoring dicts.
+
+        ``item_key`` is always populated for well-formed content (Bilibili and
+        cross-platform alike).  Falls back to ``bvid`` only for legacy rows
+        that predate the multi-source ``item_key`` field.  Using ``bvid``
+        directly causes all non-Bilibili items to collide at ``scores[""]``
+        because ``bvid`` defaults to the empty string for those platforms.
+        """
+        return self.item_key or self.bvid
+
     def to_cache_kwargs(self) -> dict[str, object]:
         """Build the kwargs dict for ``Database.cache_content()``.
 

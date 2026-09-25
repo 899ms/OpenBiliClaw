@@ -404,6 +404,10 @@ class OpenAIProvider(LLMProvider):
                 instructions = msg["content"]
             else:
                 input_messages.append(msg)
+        # Some Responses endpoints validate only input, excluding instructions.
+        # Keep the cached system prefix and caller-owned messages intact (#265).
+        if json_mode and not any("json" in msg["content"].lower() for msg in input_messages):
+            input_messages.append({"role": "user", "content": "Return valid json."})
         kwargs: dict[str, Any] = {
             "model": effective_model,
             "input": input_messages,
