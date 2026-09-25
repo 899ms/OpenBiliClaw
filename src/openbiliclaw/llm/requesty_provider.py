@@ -19,9 +19,12 @@ class RequestyProvider(OpenAIProvider):
     ``<vendor>/<model>`` form (e.g. ``openai/gpt-4o-mini``) or a managed
     policy id from ``GET /v1/models/managed`` (e.g. ``claude-sonnet-4-5``).
 
-    Reasoning params are not sent: the base adapter only emits
-    ``reasoning_effort`` for the official OpenAI endpoint, so requests stay
-    valid for non-reasoning routes and reasoning routes use their own default.
+    Reasoning params are intentionally never sent: the gateway forwards
+    ``reasoning_effort`` verbatim to the upstream route, where models without
+    a reasoning mode may reject it. Reasoning-capable routes pick up their
+    own model default when the field is omitted, so leaving it off is safe
+    for both families. ``_openai_reasoning_effort`` therefore always returns
+    ``None``.
     """
 
     # Requesty chat traffic does not double as the embedding backend; fall
@@ -48,6 +51,16 @@ class RequestyProvider(OpenAIProvider):
             trust_env=trust_env,
             reasoning_effort=reasoning_effort,
         )
+
+    def _openai_reasoning_effort(self, model: str, effort: str) -> str | None:
+        """Never emit ``reasoning_effort`` on the wire.
+
+        Requesty forwards the scalar to the upstream route, which can reject
+        it when the model has no reasoning mode. Reasoning-capable models
+        fall back to their own default when the field is omitted.
+        """
+        del model, effort
+        return None
 
     async def _create_managed_model_list(self) -> Any:
         return await self._client.get("/models/managed", cast_to=object)
